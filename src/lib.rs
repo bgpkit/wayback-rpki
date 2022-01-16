@@ -1,25 +1,42 @@
-use std::io::{BufRead, BufReader};
-use regex::Regex;
-use tracing::{debug, error, info, span, warn, Level};
-use rayon::prelude::*;
+#[macro_use]
+extern crate diesel;
 
-fn crawl_nic(nic_url: &str, crawl_all: bool) {
+mod db;
+
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
+use chrono::NaiveDate;
+use regex::Regex;
+use tracing::{info, Level};
+use rayon::prelude::*;
+use crate::db::{roa_history, RoaFile};
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct RoaEntry {
+    nic: String,
+    prefix: String,
+    asn: u32,
+    date: NaiveDate,
+}
+
+
+fn crawl_nic(nic: &str, nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
     let year_pattern: Regex = Regex::new(r#"<a href=".*"> (....)/</a>.*"#).unwrap();
     let month_day_pattern: Regex = Regex::new(r#"<a href=".*"> (..)/</a>.*"#).unwrap();
 
     // get all years
     let body = reqwest::blocking::get(nic_url).unwrap().text().unwrap();
-    let mut years: Vec<String> = year_pattern.captures_iter(body.as_str()).map(|cap|{
+    let years: Vec<String> = year_pattern.captures_iter(body.as_str()).map(|cap|{
         cap[1].to_owned()
     }).collect();
 
-    if crawl_all {
-        let roa_links = years.par_iter().map(|year| {
+    let roa_files = if crawl_all {
+        years.par_iter().map(|year| {
             info!("scraping data for {}/{} ...", &nic_url, &year);
             let year_url = format!("{}/{}", nic_url, year);
 
             let body = reqwest::blocking::get(year_url.as_str()).unwrap().text().unwrap();
-            let mut months: Vec<String> = month_day_pattern.captures_iter(body.as_str()).map(|cap|{
+            let months: Vec<String> = month_day_pattern.captures_iter(body.as_str()).map(|cap|{
                 cap[1].to_owned()
             }).collect();
 
@@ -27,46 +44,57 @@ fn crawl_nic(nic_url: &str, crawl_all: bool) {
                 info!("scraping data for {}/{} ...", &year_url, &month);
                 let month_url = format!("{}/{}", year_url, month);
                 let body = reqwest::blocking::get(month_url.as_str()).unwrap().text().unwrap();
-                let days: Vec<String> = month_day_pattern.captures_iter(body.as_str()).map(|cap|{
-                    format!("{}/{}/roas.csv", month_url, cap[1].to_owned())
+                let days: Vec<RoaFile> = month_day_pattern.captures_iter(body.as_str()).map(|cap|{
+                    let day = cap[1].to_owned();
+                    let url = format!("{}/{}/roas.csv", month_url, day);
+                    let file_date = chrono::NaiveDate::from_ymd(year.parse::<i32>().unwrap(), month.parse::<u32>().unwrap(), day.parse::<u32>().unwrap());
+                    RoaFile{
+                        nic: nic.to_owned(),
+                        url,
+                        file_date
+                    }
                 }).collect();
                 days
-            }).flat_map(|x|x).collect::<Vec<String>>()
-        }).flat_map(|x|x).collect::<Vec<String>>();
-
-        for link in &roa_links {
-            info!("{}", link);
-        }
+            }).flat_map(|x|x).collect::<Vec<RoaFile>>()
+        }).flat_map(|x|x).collect::<Vec<RoaFile>>()
     } else {
         let year = years.last().unwrap();
         let year_url = format!("{}/{}", nic_url, year);
         let body = reqwest::blocking::get(year_url.as_str()).unwrap().text().unwrap();
-        let mut months: Vec<String> = month_day_pattern.captures_iter(body.as_str()).map(|cap|{
+        let months: Vec<String> = month_day_pattern.captures_iter(body.as_str()).map(|cap|{
             cap[1].to_owned()
         }).collect();
         let month = months.last().unwrap();
         let month_url = format!("{}/{}", year_url, month);
         let body = reqwest::blocking::get(month_url.as_str()).unwrap().text().unwrap();
 
-        let roa_links: Vec<String> = month_day_pattern.captures_iter(body.as_str()).map(|cap|{
-            format!("{}/{}/roas.csv", month_url, cap[1].to_owned())
-        }).collect();
+        month_day_pattern.captures_iter(body.as_str()).map(|cap|{
+            let day = cap[1].to_owned();
+            let url = format!("{}/{}/roas.csv", month_url, day);
+            let file_date = chrono::NaiveDate::from_ymd(year.parse::<i32>().unwrap(), month.parse::<u32>().unwrap(), day.parse::<u32>().unwrap());
+            RoaFile{
+                nic: nic.to_owned(),
+                url,
+                file_date
+            }
+        }).collect::<Vec<RoaFile>>()
+    };
 
-        for link in &roa_links {
-            info!("{}", link);
-        }
-    }
+    roa_files
 }
 
-struct ROA {
-    prefix: String,
-    asn: u32,
-}
+fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
+    // parse csv url for auxiliary fields
+    let fields: Vec<&str> = csv_url.split("/").collect();
+    let nic = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
+    let year = fields[5].parse::<i32>().unwrap();
+    let month = fields[6].parse::<u32>().unwrap();
+    let day = fields[7].parse::<u32>().unwrap();
+    let date = NaiveDate::from_ymd(year, month, day);
 
-fn parse_roas_csv(csv_url: &str) -> Vec<ROA> {
     let response = reqwest::blocking::get(csv_url).unwrap();
     let reader = BufReader::new(response);
-    let mut roas = vec![];
+    let mut roas = HashSet::new();
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -80,7 +108,7 @@ fn parse_roas_csv(csv_url: &str) -> Vec<ROA> {
         let fields = line.split(",").collect::<Vec<&str>>();
         let asn = fields[1].strip_prefix("AS").unwrap().parse::<u32>().unwrap();
         let prefix = fields[2].to_owned();
-        roas.push(ROA{prefix, asn})
+        roas.insert(RoaEntry {prefix, asn, nic: nic.to_owned(), date});
     }
 
     roas
@@ -92,16 +120,18 @@ mod tests {
 
     #[test]
     fn test_crawl() {
-
         tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
-        crawl_nic("https://ftp.ripe.net/rpki/ripencc.tal", false);
+        let roa_files = crawl_nic("ripencc", "https://ftp.ripe.net/rpki/ripencc.tal", false);
+        for x in roa_files {
+            dbg!(x);
+        }
     }
 
     #[test]
     fn test_parse() {
         tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
         let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv");
-        for roa in &roas[..10] {
+        for roa in &roas.iter().take(10).collect::<Vec<&RoaEntry>>() {
             println!("{} {}", roa.asn, roa.prefix);
         }
     }
