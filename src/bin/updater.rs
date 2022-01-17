@@ -77,4 +77,6 @@ fn main() {
 
     let merged_table = RoasTable::merge_tables(tables);
     conn.insert_roa_history_entries(&merged_table.export_to_history());
+
+    info!("bootstrap finished");
 }
