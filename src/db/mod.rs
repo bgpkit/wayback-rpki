@@ -123,25 +123,29 @@ impl DbConnection {
 
 
                     if !skip_update{
-                        let mut merged_ranges = vec![];
-                        let mut i = 0;
-                        while i < new_ranges.len()-1 {
-                            let a_begin = bound_to_date(new_ranges[i].0, Duration::days(1));
-                            let mut a_end = bound_to_date(new_ranges[i].1, Duration::days(-1));
-                            let b_begin = bound_to_date(new_ranges[i+1].0, Duration::days(1));
-                            if a_end == b_begin - Duration::days(1) {
-                                a_end = bound_to_date(new_ranges[i+1].1, Duration::days(-1));
-                                merged_ranges.push((Bound::Included(a_begin), Bound::Included(a_end)));
-                                i += 1;
-                            } else {
-                                merged_ranges.push(new_ranges[i])
-                            }
+                        // let mut merged_ranges = vec![];
+                        // let mut i = 0;
+                        // if new_ranges.len() == 1{
+                        //     merged_ranges = new_ranges;
+                        // } else {
+                        //     while i < new_ranges.len()-1 {
+                        //         let a_begin = bound_to_date(new_ranges[i].0, Duration::days(1));
+                        //         let mut a_end = bound_to_date(new_ranges[i].1, Duration::days(-1));
+                        //         let b_begin = bound_to_date(new_ranges[i+1].0, Duration::days(1));
+                        //         if a_end == b_begin - Duration::days(1) {
+                        //             a_end = bound_to_date(new_ranges[i+1].1, Duration::days(-1));
+                        //             merged_ranges.push((Bound::Included(a_begin), Bound::Included(a_end)));
+                        //             i += 1;
+                        //         } else {
+                        //             merged_ranges.push(new_ranges[i])
+                        //         }
 
-                            i += 1;
-                        }
+                        //         i += 1;
+                        //     }
 
+                        // }
                         diesel::update(roa_history.filter(prefix.eq(&entry_prefix)))
-                            .set(date_ranges.eq(merged_ranges))
+                            .set(date_ranges.eq(new_ranges))
                             .execute(&self.conn).unwrap();
                     }
                 }
