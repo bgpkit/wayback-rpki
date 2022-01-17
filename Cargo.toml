@@ -38,3 +38,5 @@ chrono = "0.4.19"
 ipnetwork = "0.18.0"
 
 structopt = "0.3"
+
+indicatif = "0.16"

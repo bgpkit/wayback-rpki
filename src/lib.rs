@@ -2,10 +2,12 @@
 extern crate diesel;
 
 pub mod db;
+pub mod roas_table;
 
 pub use crate::db::*;
+pub use crate::roas_table::*;
 
-use std::collections::HashSet;
+use std::collections::{HashSet};
 use std::io::{BufRead, BufReader};
 use chrono::NaiveDate;
 use regex::Regex;

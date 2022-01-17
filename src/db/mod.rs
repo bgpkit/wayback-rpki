@@ -67,6 +67,11 @@ impl DbConnection {
         diesel::insert_into(roa_files).values(files).on_conflict_do_nothing().execute(&self.conn).unwrap();
     }
 
+    pub fn insert_roa_history_entries(&self, entries: &Vec<RoaHistoryEntry>) {
+        use crate::roa_history::dsl::*;
+        diesel::insert_into(roa_history).values(entries).on_conflict_do_nothing().execute(&self.conn).unwrap();
+    }
+
     pub fn insert_roa_entries(&self, entries: &HashSet<RoaEntry>) {
         use crate::roa_history::dsl::*;
 
@@ -251,7 +256,7 @@ mod tests {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         info!("start");
         let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
-        let mut files = conn.get_all_files("afrinic", true, false);
+        let files = conn.get_all_files("afrinic", true, false);
         for f in files {
             dbg!(f);
         }
