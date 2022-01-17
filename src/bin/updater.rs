@@ -1,6 +1,4 @@
-use std::sync::mpsc::channel;
 use std::thread;
-use diesel::dsl::all;
 use tracing::{info, Level};
 use wayback_rpki::*;
 use structopt::StructOpt;
@@ -65,14 +63,14 @@ fn main() {
         }
     });
 
-    let tables = all_files.par_chunks(opts.chunks).map_with(sender_pb.clone(), |s, files| {
+    let tables = all_files.par_chunks(opts.chunks).map_with(sender_pb, |s, files| {
         let mut roas_table = RoasTable::new();
         for file in files {
             let url: &str = file.url.as_str();
             // info!("processing {}", url);
             let roas = parse_roas_csv(url);
             roas.iter().for_each(|r|roas_table.insert_entry(r));
-            sender_pb.send(url.to_owned()).unwrap();
+            s.send(url.to_owned()).unwrap();
         }
         roas_table
     }).collect::<Vec<RoasTable>>();

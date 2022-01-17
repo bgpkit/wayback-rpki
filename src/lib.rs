@@ -11,7 +11,7 @@ use std::collections::{HashSet};
 use std::io::{BufRead, BufReader};
 use chrono::NaiveDate;
 use regex::Regex;
-use tracing::info;
+use tracing::{info, debug};
 use rayon::prelude::*;
 use crate::db::{roa_history, RoaFile};
 
@@ -114,7 +114,7 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
             continue
         }
         if line.contains("HTML"){
-            info!("file {} does not exist, skipping", csv_url);
+            debug!("file {} does not exist, skipping", csv_url);
             break
         }
 
