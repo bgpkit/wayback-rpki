@@ -5,6 +5,10 @@ authors = ["Mingwei Zhang <mingwei@bgpkit.com>"]
 edition = "2021"
 
 [[bin]]
+name = "wayback-rpki-files"
+path = "src/bin/files.rs"
+
+[[bin]]
 name = "wayback-rpki-updater"
 path = "src/bin/updater.rs"
 

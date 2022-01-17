@@ -111,6 +111,10 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
             // skip the first line
             continue
         }
+        if line.contains("HTML"){
+            info!("file {} does not exist, skipping", csv_url);
+            break
+        }
 
         let fields = line.split(",").collect::<Vec<&str>>();
         let asn = fields[1].strip_prefix("AS").unwrap().parse::<u32>().unwrap();

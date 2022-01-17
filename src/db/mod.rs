@@ -19,8 +19,8 @@ table! {
 #[derive(Debug, Queryable, Insertable)]
 #[table_name="roa_files"]
 pub struct RoaFile {
-    pub nic: String,
     pub url: String,
+    pub nic: String,
     pub file_date: chrono::NaiveDate,
     pub processed: bool,
 }
@@ -164,9 +164,22 @@ impl DbConnection {
         res
     }
 
-    pub fn get_all_files(&self, nic_str: &str) -> Vec<RoaFile> {
+    pub fn get_all_files(&self, nic_str: &str, only_unprocessed: bool, reversed: bool) -> Vec<RoaFile> {
         use crate::roa_files::dsl::*;
-        let files: Vec<RoaFile> = roa_files.filter(nic.eq(nic_str)).load::<RoaFile>(&self.conn).unwrap();
+        let mut files = if only_unprocessed {
+            roa_files
+                .filter(nic.eq(nic_str))
+                .filter(processed.eq(false))
+                .load::<RoaFile>(&self.conn).unwrap()
+        } else {
+            roa_files.filter(nic.eq(nic_str)).load::<RoaFile>(&self.conn).unwrap()
+        };
+
+        files.sort_by(|a, b| a.file_date.partial_cmp(&b.file_date).unwrap());
+        if reversed {
+            files.reverse();
+        }
+
         files
     }
 
@@ -175,6 +188,11 @@ impl DbConnection {
         diesel::update(roa_files.filter(url.eq(&file_url)))
             .set(processed.eq(value))
             .execute(&self.conn).unwrap();
+    }
+
+    pub fn delete_file(&self, file_url: &str) {
+        use crate::roa_files::dsl::*;
+        diesel::delete(roa_files.filter(url.eq(file_url))).execute(&self.conn).unwrap();
     }
 }
 
@@ -229,9 +247,7 @@ mod tests {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         info!("start");
         let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
-        let mut files = conn.get_all_files("ripencc");
-        files.sort_by(|a, b| a.file_date.partial_cmp(&b.file_date).unwrap());
-        files.reverse();
+        let mut files = conn.get_all_files("afrinic", true, false);
         for f in files {
             dbg!(f);
         }
@@ -242,13 +258,13 @@ mod tests {
     fn test_processed() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
-        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2011/01/21/roas.csv", true);
+        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/16/roas.csv", true);
     }
 
     #[test]
     fn test_unprocessed() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
-        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2011/01/21/roas.csv", false);
+        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/16/roas.csv", false);
     }
 }
