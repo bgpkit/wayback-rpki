@@ -163,6 +163,19 @@ impl DbConnection {
         let res = roa_history.load::<RoaHistoryEntry>(&self.conn).unwrap();
         res
     }
+
+    pub fn get_all_files(&self, nic_str: &str) -> Vec<RoaFile> {
+        use crate::roa_files::dsl::*;
+        let files: Vec<RoaFile> = roa_files.filter(nic.eq(nic_str)).load::<RoaFile>(&self.conn).unwrap();
+        files
+    }
+
+    pub fn mark_file_as_processed(&self, file_url: &str, value: bool) {
+        use crate::roa_files::dsl::*;
+        diesel::update(roa_files.filter(url.eq(&file_url)))
+            .set(processed.eq(value))
+            .execute(&self.conn).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -178,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_insert_files() {
-        tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
+        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         let roa_files = crawl_nic("https://ftp.ripe.net/rpki/ripencc.tal", false);
 
         let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
@@ -203,11 +216,39 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
+        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         info!("start");
         let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/13/roas.csv");
         let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
         conn.insert_roa_entries(&roas);
         info!("end");
+    }
+
+    #[test]
+    fn test_find_files() {
+        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+        info!("start");
+        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        let mut files = conn.get_all_files("ripencc");
+        files.sort_by(|a, b| a.file_date.partial_cmp(&b.file_date).unwrap());
+        files.reverse();
+        for f in files {
+            dbg!(f);
+        }
+        info!("end");
+    }
+
+    #[test]
+    fn test_processed() {
+        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2011/01/21/roas.csv", true);
+    }
+
+    #[test]
+    fn test_unprocessed() {
+        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2011/01/21/roas.csv", false);
     }
 }

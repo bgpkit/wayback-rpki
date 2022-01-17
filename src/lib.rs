@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_crawl() {
-        tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
+        tracing_subscriber::fmt() .with_max_level(tracing::Level::INFO) .init();
         let roa_files = crawl_nic("https://ftp.ripe.net/rpki/ripencc.tal", false);
         for x in roa_files {
             dbg!(x);
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
+        tracing_subscriber::fmt() .with_max_level(tracing::Level::INFO) .init();
         let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv");
         for roa in &roas.iter().take(10).collect::<Vec<&RoaEntry>>() {
             println!("{} {}", roa.asn, roa.prefix);
