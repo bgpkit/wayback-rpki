@@ -1,13 +1,15 @@
 #[macro_use]
 extern crate diesel;
 
-mod db;
+pub mod db;
+
+pub use crate::db::*;
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use chrono::NaiveDate;
 use regex::Regex;
-use tracing::{info, Level};
+use tracing::info;
 use rayon::prelude::*;
 use crate::db::{roa_history, RoaFile};
 
@@ -20,7 +22,10 @@ pub struct RoaEntry {
 }
 
 
-fn crawl_nic(nic: &str, nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
+pub fn crawl_nic(nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
+    let fields: Vec<&str> = nic_url.split("/").collect();
+    let nic = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
+
     let year_pattern: Regex = Regex::new(r#"<a href=".*"> (....)/</a>.*"#).unwrap();
     let month_day_pattern: Regex = Regex::new(r#"<a href=".*"> (..)/</a>.*"#).unwrap();
 
@@ -51,7 +56,8 @@ fn crawl_nic(nic: &str, nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
                     RoaFile{
                         nic: nic.to_owned(),
                         url,
-                        file_date
+                        file_date,
+                        processed: false
                     }
                 }).collect();
                 days
@@ -75,7 +81,8 @@ fn crawl_nic(nic: &str, nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
             RoaFile{
                 nic: nic.to_owned(),
                 url,
-                file_date
+                file_date,
+                processed: false
             }
         }).collect::<Vec<RoaFile>>()
     };
@@ -83,7 +90,7 @@ fn crawl_nic(nic: &str, nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
     roa_files
 }
 
-fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
+pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
     // parse csv url for auxiliary fields
     let fields: Vec<&str> = csv_url.split("/").collect();
     let nic = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
@@ -121,7 +128,7 @@ mod tests {
     #[test]
     fn test_crawl() {
         tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
-        let roa_files = crawl_nic("ripencc", "https://ftp.ripe.net/rpki/ripencc.tal", false);
+        let roa_files = crawl_nic("https://ftp.ripe.net/rpki/ripencc.tal", false);
         for x in roa_files {
             dbg!(x);
         }

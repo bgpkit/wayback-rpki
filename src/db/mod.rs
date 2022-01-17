@@ -12,6 +12,7 @@ table! {
         url -> Text,
         nic -> Text,
         file_date -> Date,
+        processed -> Bool,
     }
 }
 
@@ -21,6 +22,7 @@ pub struct RoaFile {
     pub nic: String,
     pub url: String,
     pub file_date: chrono::NaiveDate,
+    pub processed: bool,
 }
 
 table! {
@@ -177,7 +179,7 @@ mod tests {
     #[test]
     fn test_insert_files() {
         tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
-        let roa_files = crawl_nic("ripencc", "https://ftp.ripe.net/rpki/ripencc.tal", false);
+        let roa_files = crawl_nic("https://ftp.ripe.net/rpki/ripencc.tal", false);
 
         let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
         conn.insert_roa_files(&roa_files);

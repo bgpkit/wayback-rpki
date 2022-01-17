@@ -4,6 +4,10 @@ version = "0.0.1"
 authors = ["Mingwei Zhang <mingwei@bgpkit.com>"]
 edition = "2021"
 
+[[bin]]
+name = "wayback-rpki-updater"
+path = "src/bin/updater.rs"
+
 [dependencies]
 
 regex="1"
@@ -28,3 +32,5 @@ r2d2="0.8"
 
 chrono = "0.4.19"
 ipnetwork = "0.18.0"
+
+structopt = "0.3"
