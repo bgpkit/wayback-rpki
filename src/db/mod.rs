@@ -69,7 +69,7 @@ impl DbConnection {
 
     pub fn insert_roa_history_entries(&self, entries: &Vec<RoaHistoryEntry>) {
         use crate::roa_history::dsl::*;
-        entries.chunks(60000).for_each(|chunk|{
+        entries.chunks(5000).for_each(|chunk|{
             diesel::insert_into(roa_history).values(chunk).on_conflict_do_nothing().execute(&self.conn).unwrap();
         });
     }
