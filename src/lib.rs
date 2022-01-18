@@ -76,6 +76,7 @@ pub fn crawl_nic(nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
         let month_url = format!("{}/{}", year_url, month);
         let body = reqwest::blocking::get(month_url.as_str()).unwrap().text().unwrap();
 
+        // get each day
         month_day_pattern.captures_iter(body.as_str()).map(|cap|{
             let day = cap[1].to_owned();
             let url = format!("{}/{}/roas.csv", month_url, day);

@@ -1,4 +1,4 @@
-use std::collections::{Bound, HashSet};
+use std::collections::Bound;
 use std::str::FromStr;
 use chrono::{Duration, NaiveDate};
 use diesel::prelude::*;
@@ -74,7 +74,7 @@ impl DbConnection {
         });
     }
 
-    pub fn insert_roa_entries(&self, entries: &HashSet<RoaEntry>) {
+    pub fn insert_roa_entries<'a>(&self, entries: impl IntoIterator<Item=&'a RoaEntry>) {
         use crate::roa_history::dsl::*;
 
         for entry in entries {

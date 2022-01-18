@@ -3,14 +3,12 @@ name = "wayback-rpki"
 version = "0.0.1"
 authors = ["Mingwei Zhang <mingwei@bgpkit.com>"]
 edition = "2021"
+default-run="wayback-rpki"
 
 [[bin]]
-name = "wayback-rpki-files"
-path = "src/bin/files.rs"
-
-[[bin]]
-name = "wayback-rpki-updater"
+name = "wayback-rpki"
 path = "src/bin/updater.rs"
+
 
 [dependencies]
 
