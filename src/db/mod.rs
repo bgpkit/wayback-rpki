@@ -1,4 +1,5 @@
 use std::collections::Bound;
+use std::env;
 use std::str::FromStr;
 use chrono::{Duration, NaiveDate};
 use diesel::prelude::*;
@@ -57,8 +58,10 @@ fn bound_to_date(v: Bound<NaiveDate>, delta: Duration) -> NaiveDate{
 }
 
 impl DbConnection {
-    pub fn new(db_url: &str) -> DbConnection {
-        let conn = PgConnection::establish(db_url).unwrap();
+    pub fn new() -> DbConnection {
+        dotenv::dotenv().ok();
+        let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let conn = PgConnection::establish(db_url.as_str()).unwrap();
         DbConnection { conn }
     }
 
@@ -215,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_connection() {
-        let _conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        let _conn = DbConnection::new();
     }
 
     #[test]
@@ -223,20 +226,20 @@ mod tests {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         let roa_files = crawl_nic("https://ftp.ripe.net/rpki/ripencc.tal", false);
 
-        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        let conn = DbConnection::new();
         conn.insert_roa_files(&roa_files);
     }
 
     #[test]
     fn test_get_all_entry() {
-        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        let conn = DbConnection::new();
         let entries = conn.get_all();
         dbg!(&entries);
     }
 
     #[test]
     fn test_get_single_entry() {
-        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        let conn = DbConnection::new();
         let entry = conn.get_history_entry("192.168.0.0/24", 1234);
         dbg!(&entry);
         let entry = conn.get_history_entry("192.168.0.0/2", 1234);
@@ -248,7 +251,7 @@ mod tests {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         info!("start");
         let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/13/roas.csv");
-        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        let conn = DbConnection::new();
         conn.insert_roa_entries(&roas);
         info!("end");
     }
@@ -257,8 +260,8 @@ mod tests {
     fn test_find_files() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         info!("start");
-        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
-        let files = conn.get_all_files("afrinic", true, false);
+        let conn = DbConnection::new();
+        let files = conn.get_all_files("afrinic", false, false);
         for f in files {
             dbg!(f);
         }
@@ -268,14 +271,14 @@ mod tests {
     #[test]
     fn test_processed() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        let conn = DbConnection::new();
         conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/16/roas.csv", true);
     }
 
     #[test]
     fn test_unprocessed() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-        let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+        let conn = DbConnection::new();
         conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/16/roas.csv", false);
     }
 }

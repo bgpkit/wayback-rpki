@@ -39,7 +39,7 @@ fn main() {
 
         Opts::Bootstrap { nic, chunks, latest } => {
 
-            let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+            let conn = DbConnection::new();
             let all_files = conn.get_all_files(nic.as_str(), false, latest);
             info!("total of {} roa files to process", all_files.len());
 
@@ -89,7 +89,7 @@ fn main() {
 
             info!("searching for latest roas.csv files from {}", nic.as_str());
             let roa_files = crawl_nic(nic_url.as_str(), false);
-            let conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+            let conn = DbConnection::new();
             conn.insert_roa_files(&roa_files);
 
             let all_files = conn.get_all_files(nic.as_str(), true, false);
@@ -100,7 +100,7 @@ fn main() {
                 let roa_entries_vec = roa_entries.into_iter().collect::<Vec<RoaEntry>>();
                 info!("total of {} ROA entries to process", roa_entries_vec.len());
                 roa_entries_vec.par_chunks(2000).for_each(|entries|{
-                    let new_conn = DbConnection::new("postgres://bgpkit_admin:bgpkit@10.2.2.103/bgpkit_rpki");
+                    let new_conn = DbConnection::new();
                     new_conn.insert_roa_entries(entries);
                 });
                 conn.mark_file_as_processed(file.url.as_str(), true);
