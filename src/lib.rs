@@ -4,13 +4,11 @@ extern crate diesel;
 pub mod db;
 pub mod roas_table;
 
-use core::panicking::panic;
 pub use crate::db::*;
 pub use crate::roas_table::*;
 
 use std::collections::{HashSet};
 use std::io::{BufRead, BufReader};
-use std::num::ParseIntError;
 use std::str::FromStr;
 use chrono::NaiveDate;
 use ipnetwork::IpNetwork;
@@ -129,7 +127,7 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
         let prefix = fields[2].to_owned();
         let max_len = match fields[3].to_owned().parse::<u8>(){
             Ok(l) => {l}
-            Err(e) => { panic!("{}", line)}
+            Err(_e) => { panic!("{}", line)}
         };
 
         let parsed_prefix = IpNetwork::from_str(prefix.as_str()).unwrap();
