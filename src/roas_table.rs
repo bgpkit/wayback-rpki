@@ -1,5 +1,4 @@
 use std::collections::{Bound, HashMap};
-use std::str::FromStr;
 use chrono::{Duration, NaiveDate};
 use ipnetwork::IpNetwork;
 use crate::{RoaEntry, RoaHistoryEntry};
@@ -90,6 +89,7 @@ impl RoasTable {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
     use super::*;
 
     #[test]
