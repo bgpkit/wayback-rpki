@@ -124,15 +124,15 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
 
         let fields = line.split(",").collect::<Vec<&str>>();
         let asn = fields[1].strip_prefix("AS").unwrap().parse::<u32>().unwrap();
-        let prefix = fields[2].to_owned();
-        let max_len = match fields[3].to_owned().parse::<u8>(){
-            Ok(l) => {l}
-            Err(_e) => { panic!("{}", line)}
+        let prefix = IpNetwork::from_str(fields[2].to_owned().as_str()).unwrap();
+        let max_len_prefix = match fields[3].to_owned().parse::<u8>(){
+            Ok(l) => {
+                IpNetwork::new(prefix.network(), l).unwrap()
+            }
+            Err(_e) => { prefix }
         };
 
-        let parsed_prefix = IpNetwork::from_str(prefix.as_str()).unwrap();
-        let parsed_max_len_prefix = IpNetwork::new(parsed_prefix.network(), max_len).unwrap();
-        roas.insert(RoaEntry {prefix: parsed_prefix, asn, max_len_prefix: parsed_max_len_prefix, nic: nic.to_owned(), date});
+        roas.insert(RoaEntry {prefix, asn, max_len_prefix, nic: nic.to_owned(), date});
     }
 
     roas
