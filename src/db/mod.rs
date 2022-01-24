@@ -1,6 +1,5 @@
 use std::collections::Bound;
 use std::env;
-use std::str::FromStr;
 use chrono::{Duration, NaiveDate};
 use diesel::prelude::*;
 use diesel::table;
@@ -27,9 +26,10 @@ pub struct RoaFile {
 }
 
 table! {
-    roa_history (prefix, asn) {
+    roa_history (prefix, max_len_prefix, asn) {
         nic -> Text,
         prefix -> Cidr,
+        max_len_prefix -> Cidr,
         asn -> BigInt,
         date_ranges -> Array<Range<Date>>,
     }
@@ -40,6 +40,7 @@ table! {
 pub struct RoaHistoryEntry {
     pub nic: String,
     pub prefix: IpNetwork,
+    pub max_len_prefix: IpNetwork,
     pub asn: i64,
     pub date_ranges: Vec<(Bound<NaiveDate>, Bound<NaiveDate>)>
 }
@@ -81,14 +82,14 @@ impl DbConnection {
         use crate::roa_history::dsl::*;
 
         for entry in entries {
-            let e = self.get_history_entry(entry.prefix.as_str(), entry.asn as i64);
-            let entry_prefix = IpNetwork::from_str(entry.prefix.as_str()).unwrap();
+            let e = self.get_history_entry(&entry.prefix, &entry.max_len_prefix, entry.asn as i64);
             match e {
                 None => {
                     // we have not seen this prefix before
                     let entry = RoaHistoryEntry{
                         nic: entry.nic.clone(),
-                        prefix: entry_prefix,
+                        prefix: entry.prefix,
+                        max_len_prefix: entry.max_len_prefix,
                         asn: entry.asn as i64,
                         date_ranges: vec![(Bound::Included(entry.date), Bound::Included(entry.date))]
                     };
@@ -133,28 +134,12 @@ impl DbConnection {
 
 
                     if !skip_update{
-                        // let mut merged_ranges = vec![];
-                        // let mut i = 0;
-                        // if new_ranges.len() == 1{
-                        //     merged_ranges = new_ranges;
-                        // } else {
-                        //     while i < new_ranges.len()-1 {
-                        //         let a_begin = bound_to_date(new_ranges[i].0, Duration::days(1));
-                        //         let mut a_end = bound_to_date(new_ranges[i].1, Duration::days(-1));
-                        //         let b_begin = bound_to_date(new_ranges[i+1].0, Duration::days(1));
-                        //         if a_end == b_begin - Duration::days(1) {
-                        //             a_end = bound_to_date(new_ranges[i+1].1, Duration::days(-1));
-                        //             merged_ranges.push((Bound::Included(a_begin), Bound::Included(a_end)));
-                        //             i += 1;
-                        //         } else {
-                        //             merged_ranges.push(new_ranges[i])
-                        //         }
 
-                        //         i += 1;
-                        //     }
-
-                        // }
-                        diesel::update(roa_history.filter(prefix.eq(&entry_prefix)))
+                        diesel::update(
+                            roa_history.filter(prefix.eq(&entry.prefix))
+                                .filter(max_len_prefix.eq(&entry.max_len_prefix))
+                                .filter(asn.eq(&(entry.asn as i64)))
+                        )
                             .set(date_ranges.eq(new_ranges))
                             .execute(&self.conn).unwrap();
                     }
@@ -163,10 +148,10 @@ impl DbConnection {
         }
     }
 
-    pub fn get_history_entry(&self, prefix_str: &str, as_number: i64) -> Option<RoaHistoryEntry> {
+    pub fn get_history_entry(&self, prefix_net: &IpNetwork, max_len_prefix_net: &IpNetwork, as_number: i64) -> Option<RoaHistoryEntry> {
         use crate::roa_history::dsl::*;
 
-        match roa_history.find((&IpNetwork::from_str(prefix_str).unwrap(), as_number)).first::<RoaHistoryEntry>(&self.conn) {
+        match roa_history.find((prefix_net, max_len_prefix_net, as_number)).first::<RoaHistoryEntry>(&self.conn) {
             Ok(entry) => Some(entry),
             Err(_) => None
         }
@@ -235,15 +220,6 @@ mod tests {
         let conn = DbConnection::new();
         let entries = conn.get_all();
         dbg!(&entries);
-    }
-
-    #[test]
-    fn test_get_single_entry() {
-        let conn = DbConnection::new();
-        let entry = conn.get_history_entry("192.168.0.0/24", 1234);
-        dbg!(&entry);
-        let entry = conn.get_history_entry("192.168.0.0/2", 1234);
-        dbg!(&entry);
     }
 
     #[test]

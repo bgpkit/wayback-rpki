@@ -9,7 +9,9 @@ pub use crate::roas_table::*;
 
 use std::collections::{HashSet};
 use std::io::{BufRead, BufReader};
+use std::str::FromStr;
 use chrono::NaiveDate;
+use ipnetwork::IpNetwork;
 use regex::Regex;
 use tracing::{info, debug};
 use rayon::prelude::*;
@@ -18,7 +20,8 @@ use crate::db::{roa_history, RoaFile};
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RoaEntry {
     nic: String,
-    prefix: String,
+    prefix: IpNetwork,
+    max_len_prefix: IpNetwork,
     asn: u32,
     date: NaiveDate,
 }
@@ -122,7 +125,11 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
         let fields = line.split(",").collect::<Vec<&str>>();
         let asn = fields[1].strip_prefix("AS").unwrap().parse::<u32>().unwrap();
         let prefix = fields[2].to_owned();
-        roas.insert(RoaEntry {prefix, asn, nic: nic.to_owned(), date});
+        let max_len = fields[3].to_owned().parse::<u8>().unwrap();
+
+        let parsed_prefix = IpNetwork::from_str(prefix.as_str()).unwrap();
+        let parsed_max_len_prefix = IpNetwork::new(parsed_prefix.network(), max_len).unwrap();
+        roas.insert(RoaEntry {prefix: parsed_prefix, asn, max_len_prefix: parsed_max_len_prefix, nic: nic.to_owned(), date});
     }
 
     roas
@@ -146,7 +153,7 @@ mod tests {
         tracing_subscriber::fmt() .with_max_level(tracing::Level::INFO) .init();
         let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv");
         for roa in &roas.iter().take(10).collect::<Vec<&RoaEntry>>() {
-            println!("{} {}", roa.asn, roa.prefix);
+            println!("{} {} {}", roa.asn, roa.prefix, roa.max_len_prefix);
         }
     }
 }

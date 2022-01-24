@@ -1,4 +1,4 @@
-use std::thread;
+use std::{env, thread};
 use tracing::{info, Level};
 use wayback_rpki::*;
 use structopt::StructOpt;
@@ -8,7 +8,6 @@ use indicatif::{ProgressBar,ProgressStyle};
 #[derive(StructOpt, Debug)]
 #[structopt(name="wayback-rpki")]
 enum Opts {
-    // TODO: bootstrap still requires the `roa_files` table be populated beforehand.
     // bootstrapping `roa_history` table
     Bootstrap {
         /// NIC
@@ -34,6 +33,9 @@ enum Opts {
 fn main() {
     tracing_subscriber::fmt() .with_max_level(Level::INFO) .init();
     let opts: Opts = Opts::from_args();
+
+    // check db url
+    let _db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     match opts{
 
