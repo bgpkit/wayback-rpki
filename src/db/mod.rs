@@ -170,6 +170,7 @@ impl DbConnection {
         let mut files = if only_unprocessed {
             roa_files_2
                 .filter(tal.eq(tal_str))
+                .filter(processed.eq(false))
                 .load::<RoaFile>(&self.conn).unwrap()
         } else {
             roa_files_2.filter(tal.eq(tal_str)).load::<RoaFile>(&self.conn).unwrap()
