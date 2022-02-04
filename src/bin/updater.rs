@@ -52,18 +52,20 @@ fn main() {
             // let all_files = conn.get_all_files(tal.as_str(), false, latest);
             info!("total of {} roa files to process", all_files.len());
 
-            let (sender_pb, receiver_pb) = std::sync::mpsc::sync_channel::<String>(20);
+            let (sender_pb, receiver_pb) = std::sync::mpsc::sync_channel::<(String, i32)>(20);
 
             let total_files = all_files.len();
             // dedicated thread for showing progress of the parsing
             thread::spawn(move || {
+                let conn = DbConnection::new();
                 let sty = ProgressStyle::default_bar()
                     .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} [{eta_precise}] {msg}")
                     .progress_chars("##-");
                 let pb = ProgressBar::new(total_files as u64);
                 pb.set_style(sty);
-                for msg in receiver_pb.iter() {
-                    pb.set_message(msg);
+                for (url, count) in receiver_pb.iter() {
+                    conn.mark_file_as_processed(url.as_str(), true, count);
+                    pb.set_message(url);
                     pb.inc(1);
                 }
             });
@@ -74,8 +76,9 @@ fn main() {
                     let url: &str = file.url.as_str();
                     // info!("processing {}", url);
                     let roas = parse_roas_csv(url);
+                    let count = roas.len() as i32;
                     roas.iter().for_each(|r|roas_table.insert_entry(r));
-                    s.send(url.to_owned()).unwrap();
+                    s.send((url.to_owned(), count)).unwrap();
                 }
                 roas_table
             }).collect::<Vec<RoasTable>>();
