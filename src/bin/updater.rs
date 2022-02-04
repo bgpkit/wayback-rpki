@@ -88,11 +88,11 @@ fn main() {
         Opts::Update { tal } => {
             info!("start updating roas history for {}", tal.as_str());
             let tal_url = match tal.as_str() {
-                "ripencc"|"afrital"|"aptal"|"arin"|"lactal" => {
+                "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic" => {
                     format!("https://ftp.ripe.net/rpki/{}.tal", tal.as_str())
                 }
                 _ => {
-                    panic!(r#"can only be one of the following "ripencc"|"afrital"|"aptal"|"arin"|"lactal""#);
+                    panic!(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#);
                 }
             };
 
