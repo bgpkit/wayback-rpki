@@ -17,10 +17,6 @@ enum Opts {
         /// Number of parallel chunks
         #[structopt(short, long)]
         chunks: usize,
-
-        /// Latest first
-        #[structopt(short, long)]
-        latest: bool,
     },
     // find new ROA files and apply changes
     Update {
@@ -39,10 +35,21 @@ fn main() {
 
     match opts{
 
-        Opts::Bootstrap { tal, chunks, latest } => {
-
+        Opts::Bootstrap { tal, chunks} => {
             let conn = DbConnection::new();
-            let all_files = conn.get_all_files(tal.as_str(), false, latest);
+
+            let tal_url = match tal.as_str() {
+                "afrinic"|"lacnic"| "apnic"| "ripencc"| "arin" => {
+                    format!("https://ftp.ripe.net/rpki/{}.tal",tal.as_str())
+                }
+                _ => {
+                    panic!("unknown tal: {}", tal);
+                }
+            };
+
+            let all_files = crawl_tal(tal_url.as_str(), false);
+            conn.insert_roa_files_2(&all_files);
+            // let all_files = conn.get_all_files(tal.as_str(), false, latest);
             info!("total of {} roa files to process", all_files.len());
 
             let (sender_pb, receiver_pb) = std::sync::mpsc::sync_channel::<String>(20);
