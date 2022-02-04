@@ -74,7 +74,7 @@ fn main() {
             }).collect::<Vec<RoasTable>>();
 
             let merged_table = RoasTable::merge_tables(tables);
-            conn.insert_roa_history_entries(&merged_table.export_to_history());
+            conn.insert_roa_history_2_entries(&merged_table.export_to_history());
 
             info!("bootstrap finished");
         }
@@ -85,27 +85,28 @@ fn main() {
                     format!("https://ftp.ripe.net/rpki/{}.tal", tal.as_str())
                 }
                 _ => {
-                    patal!(r#"can only be one of the following "ripencc"|"afrital"|"aptal"|"arin"|"lactal""#);
+                    panic!(r#"can only be one of the following "ripencc"|"afrital"|"aptal"|"arin"|"lactal""#);
                 }
             };
 
             info!("searching for latest roas.csv files from {}", tal.as_str());
             let roa_files = crawl_tal(tal_url.as_str(), false);
             let conn = DbConnection::new();
-            conn.insert_roa_files(&roa_files);
+            conn.insert_roa_files_2(&roa_files);
 
             let all_files = conn.get_all_files(tal.as_str(), true, false);
             info!("start processing {} roas.csv files", all_files.len());
             for file in all_files {
                 info!("start processing {}", file.url.as_str());
                 let roa_entries = parse_roas_csv(file.url.as_str());
+                let count = roa_entries.len();
                 let roa_entries_vec = roa_entries.into_iter().collect::<Vec<RoaEntry>>();
                 info!("total of {} ROA entries to process", roa_entries_vec.len());
                 roa_entries_vec.par_chunks(2000).for_each(|entries|{
                     let new_conn = DbConnection::new();
                     new_conn.insert_roa_entries(entries);
                 });
-                conn.mark_file_as_processed(file.url.as_str(), true, roa_entries.len() as i32);
+                conn.mark_file_as_processed(file.url.as_str(), true, count as i32);
             }
             info!("roas history update process finished");
         }
