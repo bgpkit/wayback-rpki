@@ -15,21 +15,21 @@ use ipnetwork::IpNetwork;
 use regex::Regex;
 use tracing::{info, debug};
 use rayon::prelude::*;
-use crate::db::{roa_history, RoaFile};
+use crate::db::{roa_history_2, RoaFile};
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RoaEntry {
-    nic: String,
+    tal: String,
     prefix: IpNetwork,
-    max_len_prefix: IpNetwork,
+    max_len: i32,
     asn: u32,
     date: NaiveDate,
 }
 
 
-pub fn crawl_nic(nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
+pub fn crawl_tal(nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
     let fields: Vec<&str> = nic_url.split("/").collect();
-    let nic = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
+    let tal = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
 
     let year_pattern: Regex = Regex::new(r#"<a href=".*"> (....)/</a>.*"#).unwrap();
     let month_day_pattern: Regex = Regex::new(r#"<a href=".*"> (..)/</a>.*"#).unwrap();
@@ -59,9 +59,10 @@ pub fn crawl_nic(nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
                     let url = format!("{}/{}/roas.csv", month_url, day);
                     let file_date = chrono::NaiveDate::from_ymd(year.parse::<i32>().unwrap(), month.parse::<u32>().unwrap(), day.parse::<u32>().unwrap());
                     RoaFile{
-                        nic: nic.to_owned(),
+                        tal: tal.to_owned(),
                         url,
                         file_date,
+                        rows_count: 0,
                         processed: false
                     }
                 }).collect();
@@ -85,9 +86,10 @@ pub fn crawl_nic(nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
             let url = format!("{}/{}/roas.csv", month_url, day);
             let file_date = chrono::NaiveDate::from_ymd(year.parse::<i32>().unwrap(), month.parse::<u32>().unwrap(), day.parse::<u32>().unwrap());
             RoaFile{
-                nic: nic.to_owned(),
+                tal: tal.to_owned(),
                 url,
                 file_date,
+                rows_count: 0,
                 processed: false
             }
         }).collect::<Vec<RoaFile>>()
@@ -99,7 +101,7 @@ pub fn crawl_nic(nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
 pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
     // parse csv url for auxiliary fields
     let fields: Vec<&str> = csv_url.split("/").collect();
-    let nic = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
+    let tal = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
     let year = fields[5].parse::<i32>().unwrap();
     let month = fields[6].parse::<u32>().unwrap();
     let day = fields[7].parse::<u32>().unwrap();
@@ -125,14 +127,14 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
         let fields = line.split(",").collect::<Vec<&str>>();
         let asn = fields[1].strip_prefix("AS").unwrap().parse::<u32>().unwrap();
         let prefix = IpNetwork::from_str(fields[2].to_owned().as_str()).unwrap();
-        let max_len_prefix = match fields[3].to_owned().parse::<u8>(){
+        let max_len = match fields[3].to_owned().parse::<i32>(){
             Ok(l) => {
-                IpNetwork::new(prefix.network(), l).unwrap()
+                l
             }
-            Err(_e) => { prefix }
+            Err(_e) => { prefix.prefix() as i32 }
         };
 
-        roas.insert(RoaEntry {prefix, asn, max_len_prefix, nic: nic.to_owned(), date});
+        roas.insert(RoaEntry {prefix, asn, max_len, tal: tal.to_owned(), date});
     }
 
     roas
@@ -145,7 +147,7 @@ mod tests {
     #[test]
     fn test_crawl() {
         tracing_subscriber::fmt() .with_max_level(tracing::Level::INFO) .init();
-        let roa_files = crawl_nic("https://ftp.ripe.net/rpki/ripencc.tal", false);
+        let roa_files = crawl_tal("https://ftp.ripe.net/rpki/ripencc.tal", false);
         for x in roa_files {
             dbg!(x);
         }
@@ -156,7 +158,7 @@ mod tests {
         tracing_subscriber::fmt() .with_max_level(tracing::Level::INFO) .init();
         let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv");
         for roa in &roas.iter().take(10).collect::<Vec<&RoaEntry>>() {
-            println!("{} {} {}", roa.asn, roa.prefix, roa.max_len_prefix);
+            println!("{} {} {}", roa.asn, roa.prefix, roa.max_len);
         }
     }
 }

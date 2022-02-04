@@ -5,7 +5,7 @@ use crate::{RoaEntry, RoaHistoryEntry};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RoasTable {
-    roa_history_map: HashMap<(String, IpNetwork, IpNetwork, u32), Vec<NaiveDate>>
+    roa_history_map: HashMap<(String, IpNetwork, i32, u32), Vec<NaiveDate>>
 }
 
 impl RoasTable {
@@ -14,13 +14,13 @@ impl RoasTable {
     }
 
     pub fn insert_entry(&mut self, roa_entry: &RoaEntry) {
-        let id = (roa_entry.nic.to_owned(), roa_entry.prefix.to_owned(), roa_entry.max_len_prefix.to_owned(), roa_entry.asn);
+        let id = (roa_entry.tal.to_owned(), roa_entry.prefix.to_owned(), roa_entry.max_len.to_owned(), roa_entry.asn);
         let entry = self.roa_history_map.entry(id).or_insert(vec![]);
         entry.push(roa_entry.date);
     }
 
     pub fn merge_tables(tables: Vec<RoasTable>) -> RoasTable {
-        let mut merged_map: HashMap<(String, IpNetwork, IpNetwork, u32), Vec<NaiveDate>> = HashMap::new();
+        let mut merged_map: HashMap<(String, IpNetwork, i32, u32), Vec<NaiveDate>> = HashMap::new();
         for table in tables {
             for (key, value) in table.roa_history_map {
                 let vec = merged_map.entry(key).or_insert(vec![]);
@@ -69,15 +69,15 @@ impl RoasTable {
 
     pub fn export_to_history(&self) -> Vec<RoaHistoryEntry> {
         let mut entries = vec![];
-        for ((nic, prefix, max_len_prefix,  asn), dates) in &self.roa_history_map {
+        for ((tal, prefix, max_len,  asn), dates) in &self.roa_history_map {
             let mut new_dates = dates.clone();
             new_dates.sort();
             let date_ranges = Self::build_date_ranges(&new_dates);
             entries.push(
                 RoaHistoryEntry{
-                    nic: nic.clone(),
+                    tal: tal .clone(),
                     prefix: prefix.to_owned(),
-                    max_len_prefix: max_len_prefix.to_owned(),
+                    max_len: max_len.to_owned(),
                     asn: *asn as i64,
                     date_ranges
                 }
@@ -97,33 +97,33 @@ mod tests {
         let mut table = RoasTable::new();
 
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2021, 1, 1)
         });
 
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 2)
         });
 
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 1)
         });
 
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.2.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.2.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 1)
         });
@@ -133,25 +133,25 @@ mod tests {
     fn test_merge_tables() {
         let mut table = RoasTable::new();
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 1)
         });
 
         let mut table2 = RoasTable::new();
         table2.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.2.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.2.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 1)
         });
         table2.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 2)
         });
@@ -166,33 +166,33 @@ mod tests {
         tracing_subscriber::fmt() .with_max_level(tracing::Level::INFO) .init();
         let mut table = RoasTable::new();
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2021, 1, 1)
         });
 
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 4)
         });
 
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 2)
         });
 
         table.insert_entry(&RoaEntry{
-            nic: "test_nic".to_string(),
+            tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
-            max_len_prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
+            max_len: 24,
             asn: 1234,
             date: NaiveDate::from_ymd(2022, 1, 1)
         });

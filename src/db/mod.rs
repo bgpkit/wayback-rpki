@@ -8,41 +8,43 @@ use ipnetwork::IpNetwork;
 use crate::RoaEntry;
 
 table! {
-    roa_files (nic, file_date) {
+    roa_files_2 (tal, file_date) {
         url -> Text,
-        nic -> Text,
+        tal -> Text,
         file_date -> Date,
+        rows_count -> Integer,
         processed -> Bool,
     }
 }
 
 #[derive(Debug, Queryable, Insertable)]
-#[table_name="roa_files"]
+#[table_name="roa_files_2"]
 pub struct RoaFile {
     pub url: String,
-    pub nic: String,
+    pub tal: String,
     pub file_date: chrono::NaiveDate,
+    pub rows_count: i32,
     pub processed: bool,
 }
 
 table! {
-    roa_history (prefix, max_len_prefix, asn) {
-        nic -> Text,
+    roa_history_2 (prefix, asn, max_len) {
+        tal -> Text,
         prefix -> Cidr,
-        max_len_prefix -> Cidr,
         asn -> BigInt,
         date_ranges -> Array<Range<Date>>,
+        max_len -> Integer,
     }
 }
 
 #[derive(Debug, Queryable, Insertable)]
-#[table_name="roa_history"]
+#[table_name="roa_history_2"]
 pub struct RoaHistoryEntry {
-    pub nic: String,
+    pub tal: String,
     pub prefix: IpNetwork,
-    pub max_len_prefix: IpNetwork,
     pub asn: i64,
-    pub date_ranges: Vec<(Bound<NaiveDate>, Bound<NaiveDate>)>
+    pub date_ranges: Vec<(Bound<NaiveDate>, Bound<NaiveDate>)>,
+    pub max_len: i32,
 }
 
 pub struct DbConnection {
@@ -66,34 +68,34 @@ impl DbConnection {
         DbConnection { conn }
     }
 
-    pub fn insert_roa_files(&self, files: &Vec<RoaFile>) {
-        use self::roa_files::dsl::*;
-        diesel::insert_into(roa_files).values(files).on_conflict_do_nothing().execute(&self.conn).unwrap();
+    pub fn insert_roa_files_2(&self, files: &Vec<RoaFile>) {
+        use self::roa_files_2::dsl::*;
+        diesel::insert_into(roa_files_2).values(files).on_conflict_do_nothing().execute(&self.conn).unwrap();
     }
 
-    pub fn insert_roa_history_entries(&self, entries: &Vec<RoaHistoryEntry>) {
-        use crate::roa_history::dsl::*;
+    pub fn insert_roa_history_2_entries(&self, entries: &Vec<RoaHistoryEntry>) {
+        use crate::roa_history_2::dsl::*;
         entries.chunks(5000).for_each(|chunk|{
-            diesel::insert_into(roa_history).values(chunk).on_conflict_do_nothing().execute(&self.conn).unwrap();
+            diesel::insert_into(roa_history_2).values(chunk).on_conflict_do_nothing().execute(&self.conn).unwrap();
         });
     }
 
     pub fn insert_roa_entries<'a>(&self, entries: impl IntoIterator<Item=&'a RoaEntry>) {
-        use crate::roa_history::dsl::*;
+        use crate::roa_history_2::dsl::*;
 
         for entry in entries {
-            let e = self.get_history_entry(&entry.prefix, &entry.max_len_prefix, entry.asn as i64);
+            let e = self.get_history_entry(&entry.prefix, entry.max_len, entry.asn as i64);
             match e {
                 None => {
                     // we have not seen this prefix before
                     let entry = RoaHistoryEntry{
-                        nic: entry.nic.clone(),
+                        tal: entry.tal.clone(),
                         prefix: entry.prefix,
-                        max_len_prefix: entry.max_len_prefix,
+                        max_len: entry.max_len,
                         asn: entry.asn as i64,
                         date_ranges: vec![(Bound::Included(entry.date), Bound::Included(entry.date))]
                     };
-                    diesel::insert_into(roa_history).values(entry).on_conflict_do_nothing().execute(&self.conn).unwrap();
+                    diesel::insert_into(roa_history_2).values(entry).on_conflict_do_nothing().execute(&self.conn).unwrap();
                 }
                 Some(history) => {
                     let mut new_ranges: Vec<(Bound<NaiveDate>, Bound<NaiveDate>)> = vec![];
@@ -136,8 +138,8 @@ impl DbConnection {
                     if !skip_update{
 
                         diesel::update(
-                            roa_history.filter(prefix.eq(&entry.prefix))
-                                .filter(max_len_prefix.eq(&entry.max_len_prefix))
+                            roa_history_2.filter(prefix.eq(&entry.prefix))
+                                .filter(max_len.eq(&entry.max_len))
                                 .filter(asn.eq(&(entry.asn as i64)))
                         )
                             .set(date_ranges.eq(new_ranges))
@@ -148,30 +150,29 @@ impl DbConnection {
         }
     }
 
-    pub fn get_history_entry(&self, prefix_net: &IpNetwork, max_len_prefix_net: &IpNetwork, as_number: i64) -> Option<RoaHistoryEntry> {
-        use crate::roa_history::dsl::*;
+    pub fn get_history_entry(&self, prefix_net: &IpNetwork, max_len_val: i32, as_number: i64) -> Option<RoaHistoryEntry> {
+        use crate::roa_history_2::dsl::*;
 
-        match roa_history.find((prefix_net, max_len_prefix_net, as_number)).first::<RoaHistoryEntry>(&self.conn) {
+        match roa_history_2.find((prefix_net, as_number, max_len_val)).first::<RoaHistoryEntry>(&self.conn) {
             Ok(entry) => Some(entry),
             Err(_) => None
         }
     }
 
     pub fn get_all(&self) -> Vec<RoaHistoryEntry> {
-        use crate::roa_history::dsl::*;
-        let res = roa_history.load::<RoaHistoryEntry>(&self.conn).unwrap();
+        use crate::roa_history_2::dsl::*;
+        let res = roa_history_2.load::<RoaHistoryEntry>(&self.conn).unwrap();
         res
     }
 
-    pub fn get_all_files(&self, nic_str: &str, only_unprocessed: bool, reversed: bool) -> Vec<RoaFile> {
-        use crate::roa_files::dsl::*;
+    pub fn get_all_files(&self, tal_str: &str, only_unprocessed: bool, reversed: bool) -> Vec<RoaFile> {
+        use crate::roa_files_2::dsl::*;
         let mut files = if only_unprocessed {
-            roa_files
-                .filter(nic.eq(nic_str))
-                .filter(processed.eq(false))
+            roa_files_2
+                .filter(tal.eq(tal_str))
                 .load::<RoaFile>(&self.conn).unwrap()
         } else {
-            roa_files.filter(nic.eq(nic_str)).load::<RoaFile>(&self.conn).unwrap()
+            roa_files_2.filter(tal.eq(tal_str)).load::<RoaFile>(&self.conn).unwrap()
         };
 
         files.sort_by(|a, b| a.file_date.partial_cmp(&b.file_date).unwrap());
@@ -182,23 +183,23 @@ impl DbConnection {
         files
     }
 
-    pub fn mark_file_as_processed(&self, file_url: &str, value: bool) {
-        use crate::roa_files::dsl::*;
-        diesel::update(roa_files.filter(url.eq(&file_url)))
-            .set(processed.eq(value))
+    pub fn mark_file_as_processed(&self, file_url: &str, processed_v: bool, rows_count_v: i32) {
+        use crate::roa_files_2::dsl::*;
+        diesel::update(roa_files_2.filter(url.eq(&file_url)))
+            .set((processed.eq(processed_v), rows_count.eq(rows_count_v)))
             .execute(&self.conn).unwrap();
     }
 
     pub fn delete_file(&self, file_url: &str) {
-        use crate::roa_files::dsl::*;
-        diesel::delete(roa_files.filter(url.eq(file_url))).execute(&self.conn).unwrap();
+        use crate::roa_files_2::dsl::*;
+        diesel::delete(roa_files_2.filter(url.eq(file_url))).execute(&self.conn).unwrap();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use tracing::{info, Level};
-    use crate::{crawl_nic, parse_roas_csv};
+    use crate::{crawl_tal, parse_roas_csv};
     use super::*;
 
     #[test]
@@ -209,10 +210,10 @@ mod tests {
     #[test]
     fn test_insert_files() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-        let roa_files = crawl_nic("https://ftp.ripe.net/rpki/ripencc.tal", false);
+        let roa_files_2 = crawl_tal("https://ftp.ripe.net/rpki/afrinic.tal", false);
 
         let conn = DbConnection::new();
-        conn.insert_roa_files(&roa_files);
+        conn.insert_roa_files_2(&roa_files_2);
     }
 
     #[test]
@@ -226,7 +227,8 @@ mod tests {
     fn test_insert() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         info!("start");
-        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/13/roas.csv");
+        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv");
+        info!("{}", roas.len());
         let conn = DbConnection::new();
         conn.insert_roa_entries(&roas);
         info!("end");
@@ -248,13 +250,14 @@ mod tests {
     fn test_processed() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         let conn = DbConnection::new();
-        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/16/roas.csv", true);
+        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv");
+        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv", true, roas.len() as i32);
     }
 
     #[test]
     fn test_unprocessed() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         let conn = DbConnection::new();
-        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2022/01/16/roas.csv", false);
+        conn.mark_file_as_processed("https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv", false, 0);
     }
 }

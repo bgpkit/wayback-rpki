@@ -12,7 +12,7 @@ enum Opts {
     Bootstrap {
         /// NIC
         #[structopt(short, long)]
-        nic: String,
+        tal: String,
 
         /// Number of parallel chunks
         #[structopt(short, long)]
@@ -26,7 +26,7 @@ enum Opts {
     Update {
         /// NIC
         #[structopt(short, long)]
-        nic: String,
+        tal: String,
     }
 }
 
@@ -39,10 +39,10 @@ fn main() {
 
     match opts{
 
-        Opts::Bootstrap { nic, chunks, latest } => {
+        Opts::Bootstrap { tal, chunks, latest } => {
 
             let conn = DbConnection::new();
-            let all_files = conn.get_all_files(nic.as_str(), false, latest);
+            let all_files = conn.get_all_files(tal.as_str(), false, latest);
             info!("total of {} roa files to process", all_files.len());
 
             let (sender_pb, receiver_pb) = std::sync::mpsc::sync_channel::<String>(20);
@@ -78,23 +78,23 @@ fn main() {
 
             info!("bootstrap finished");
         }
-        Opts::Update { nic } => {
-            info!("start updating roas history for {}", nic.as_str());
-            let nic_url = match nic.as_str() {
-                "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic" => {
-                    format!("https://ftp.ripe.net/rpki/{}.tal", nic.as_str())
+        Opts::Update { tal } => {
+            info!("start updating roas history for {}", tal.as_str());
+            let tal_url = match tal.as_str() {
+                "ripencc"|"afrital"|"aptal"|"arin"|"lactal" => {
+                    format!("https://ftp.ripe.net/rpki/{}.tal", tal.as_str())
                 }
                 _ => {
-                    panic!(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#);
+                    patal!(r#"can only be one of the following "ripencc"|"afrital"|"aptal"|"arin"|"lactal""#);
                 }
             };
 
-            info!("searching for latest roas.csv files from {}", nic.as_str());
-            let roa_files = crawl_nic(nic_url.as_str(), false);
+            info!("searching for latest roas.csv files from {}", tal.as_str());
+            let roa_files = crawl_tal(tal_url.as_str(), false);
             let conn = DbConnection::new();
             conn.insert_roa_files(&roa_files);
 
-            let all_files = conn.get_all_files(nic.as_str(), true, false);
+            let all_files = conn.get_all_files(tal.as_str(), true, false);
             info!("start processing {} roas.csv files", all_files.len());
             for file in all_files {
                 info!("start processing {}", file.url.as_str());
@@ -105,7 +105,7 @@ fn main() {
                     let new_conn = DbConnection::new();
                     new_conn.insert_roa_entries(entries);
                 });
-                conn.mark_file_as_processed(file.url.as_str(), true);
+                conn.mark_file_as_processed(file.url.as_str(), true, roa_entries.len() as i32);
             }
             info!("roas history update process finished");
         }
