@@ -47,7 +47,7 @@ fn main() {
                 }
             };
 
-            let all_files = crawl_tal(tal_url.as_str(), false);
+            let all_files = crawl_tal(tal_url.as_str(), true);
             conn.insert_roa_files_2(&all_files);
             // let all_files = conn.get_all_files(tal.as_str(), false, latest);
             info!("total of {} roa files to process", all_files.len());
