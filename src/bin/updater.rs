@@ -1,4 +1,5 @@
 use std::{env, thread};
+use std::collections::HashMap;
 use tracing::{info, Level};
 use wayback_rpki::*;
 use structopt::StructOpt;
@@ -22,7 +23,7 @@ enum Opts {
     Update {
         /// NIC
         #[structopt(short, long)]
-        tal: String,
+        tal: Option<String>,
     }
 }
 
@@ -33,19 +34,20 @@ fn main() {
     // check db url
     let _db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
+    let tals_map = HashMap::from([
+        ("afrinic", "https://ftp.ripe.net/rpki/afrinic.tal"),
+        ("lacnic", "https://ftp.ripe.net/rpki/lacnic.tal"),
+        ("apnic", "https://ftp.ripe.net/rpki/apnic.tal"),
+        ("ripencc", "https://ftp.ripe.net/rpki/ripencc.tal"),
+        ("arin", "https://ftp.ripe.net/rpki/arin.tal"),
+    ]);
+
     match opts{
 
         Opts::Bootstrap { tal, chunks} => {
             let conn = DbConnection::new();
 
-            let tal_url = match tal.as_str() {
-                "afrinic"|"lacnic"| "apnic"| "ripencc"| "arin" => {
-                    format!("https://ftp.ripe.net/rpki/{}.tal",tal.as_str())
-                }
-                _ => {
-                    panic!("unknown tal: {}", tal);
-                }
-            };
+            let tal_url = tals_map.get(tal.as_str()).expect("unknown tal name").to_string();
 
             let all_files = crawl_tal(tal_url.as_str(), true);
             conn.insert_roa_files_2(&all_files);
@@ -89,36 +91,39 @@ fn main() {
             info!("bootstrap finished");
         }
         Opts::Update { tal } => {
-            info!("start updating roas history for {}", tal.as_str());
-            let tal_url = match tal.as_str() {
-                "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic" => {
-                    format!("https://ftp.ripe.net/rpki/{}.tal", tal.as_str())
+            let tal_urls: Vec<(String, String)> = match tal {
+                None => {
+                    tals_map.into_iter().map(|(k,v)|(k.to_string(), v.to_string())).collect()
                 }
-                _ => {
-                    panic!(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#);
+                Some(tal) => {
+                    let url = tals_map.get(tal.as_str()).expect(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#).to_string();
+                    vec![(tal,url)]
                 }
             };
 
-            info!("searching for latest roas.csv files from {}", tal.as_str());
-            let roa_files = crawl_tal(tal_url.as_str(), false);
-            let conn = DbConnection::new();
-            conn.insert_roa_files_2(&roa_files);
+            for (tal, tal_url) in tal_urls {
+                info!("start updating roas history for {}", tal.as_str());
+                info!("searching for latest roas.csv files from {}", tal.as_str());
+                let roa_files = crawl_tal(tal_url.as_str(), false);
+                let conn = DbConnection::new();
+                conn.insert_roa_files_2(&roa_files);
 
-            let all_files = conn.get_all_files(tal.as_str(), true, false);
-            info!("start processing {} roas.csv files", all_files.len());
-            for file in all_files {
-                info!("start processing {}", file.url.as_str());
-                let roa_entries = parse_roas_csv(file.url.as_str());
-                let count = roa_entries.len();
-                let roa_entries_vec = roa_entries.into_iter().collect::<Vec<RoaEntry>>();
-                info!("total of {} ROA entries to process", roa_entries_vec.len());
-                roa_entries_vec.par_chunks(2000).for_each(|entries|{
-                    let new_conn = DbConnection::new();
-                    new_conn.insert_roa_entries(entries);
-                });
-                conn.mark_file_as_processed(file.url.as_str(), true, count as i32);
+                let all_files = conn.get_all_files(tal.as_str(), true, false);
+                info!("start processing {} roas.csv files", all_files.len());
+                for file in all_files {
+                    info!("start processing {}", file.url.as_str());
+                    let roa_entries = parse_roas_csv(file.url.as_str());
+                    let count = roa_entries.len();
+                    let roa_entries_vec = roa_entries.into_iter().collect::<Vec<RoaEntry>>();
+                    info!("total of {} ROA entries to process", roa_entries_vec.len());
+                    roa_entries_vec.par_chunks(2000).for_each(|entries|{
+                        let new_conn = DbConnection::new();
+                        new_conn.insert_roa_entries(entries);
+                    });
+                    conn.mark_file_as_processed(file.url.as_str(), true, count as i32);
+                }
+                info!("roas history update process finished");
             }
-            info!("roas history update process finished");
         }
     }
 }
