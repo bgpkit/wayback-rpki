@@ -1,0 +1,8 @@
+# fly.toml file generated for roas-updater on 2022-10-22T21:12:44-07:00
+
+app = "roas-updater"
+kill_signal = "SIGINT"
+kill_timeout = 5
+processes = []
+
+[env]
