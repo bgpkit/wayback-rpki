@@ -101,7 +101,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2021, 1, 1)
+            date: NaiveDate::from_ymd_opt(2021, 1, 1).unwrap()
         });
 
         table.insert_entry(&RoaEntry{
@@ -109,7 +109,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 2)
+            date: NaiveDate::from_ymd_opt(2022, 1, 2).unwrap()
         });
 
         table.insert_entry(&RoaEntry{
@@ -117,7 +117,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 1)
+            date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap()
         });
 
         table.insert_entry(&RoaEntry{
@@ -125,7 +125,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.2.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 1)
+            date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap()
         });
     }
 
@@ -137,7 +137,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 1)
+            date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap()
         });
 
         let mut table2 = RoasTable::new();
@@ -146,14 +146,14 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.2.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 1)
+            date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap()
         });
         table2.insert_entry(&RoaEntry{
             tal: "test_nic".to_string(),
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 2)
+            date: NaiveDate::from_ymd_opt(2022, 1, 2).unwrap()
         });
 
         let new_table = RoasTable::merge_tables(vec![table, table2]);
@@ -170,7 +170,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2021, 1, 1)
+            date: NaiveDate::from_ymd_opt(2021, 1, 1).unwrap()
         });
 
         table.insert_entry(&RoaEntry{
@@ -178,7 +178,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 4)
+            date: NaiveDate::from_ymd_opt(2022, 1, 4).unwrap()
         });
 
         table.insert_entry(&RoaEntry{
@@ -186,7 +186,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 2)
+            date: NaiveDate::from_ymd_opt(2022, 1, 2).unwrap()
         });
 
         table.insert_entry(&RoaEntry{
@@ -194,7 +194,7 @@ mod tests {
             prefix: IpNetwork::from_str("0.0.1.0/24").unwrap(),
             max_len: 24,
             asn: 1234,
-            date: NaiveDate::from_ymd(2022, 1, 1)
+            date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap()
         });
 
         let history = table.export_to_history();
