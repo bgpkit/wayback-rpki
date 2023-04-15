@@ -212,7 +212,6 @@ impl DbConnection {
     ) -> Vec<RoaFile> {
         use crate::roa_files::dsl::*;
 
-        dbg!(tal_str);
         let mut files = if only_unprocessed {
             roa_files
                 .filter(tal.eq(tal_str))
