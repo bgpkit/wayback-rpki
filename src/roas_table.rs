@@ -161,7 +161,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2022, 1, 2).unwrap(),
         });
 
-        let new_table = RoasTable::merge_tables(vec![table, table2]);
+        let _new_table = RoasTable::merge_tables(vec![table, table2]);
     }
 
     #[test]
@@ -202,6 +202,6 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap(),
         });
 
-        let history = table.export_to_history();
+        let _history = table.export_to_history();
     }
 }
