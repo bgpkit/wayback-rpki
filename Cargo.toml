@@ -14,6 +14,7 @@ path = "src/bin/updater.rs"
 
 regex="1"
 reqwest = {version="0.11.9", features=["blocking"]}
+anyhow = "1"
 
 # json feature dependency
 serde = {version = "1", features = ["derive"]}
@@ -26,10 +27,10 @@ rayon = "1.5.1"
 
 # database dependency
 dotenv = "0.15.0"
-diesel = {version="1.4.8", features=["postgres", "r2d2", "chrono", "ipnetwork", "network-address", "numeric"]}
+diesel = {version= "2.0.3", features=["postgres", "r2d2", "chrono", "ipnetwork", "network-address", "numeric"]}
 
 # api
-actix-web = "3"
+actix-web = "4.3.1"
 r2d2="0.8"
 
 chrono = "0.4.19"
@@ -37,4 +38,4 @@ ipnetwork = "0.18.0"
 
 structopt = "0.3"
 
-indicatif = "0.16"
+indicatif = "0.17.3"
