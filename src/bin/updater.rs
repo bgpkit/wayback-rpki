@@ -9,9 +9,9 @@ use wayback_rpki::*;
 #[derive(StructOpt, Debug)]
 #[structopt(name = "wayback-rpki")]
 enum Opts {
-    // bootstrapping `roa_history` table
+    /// Bootstrapping `roa_history` table
     Bootstrap {
-        /// NIC
+        /// TAL: afrinic, apnic, arin, lacnic, ripencc
         #[structopt(short, long)]
         tal: String,
 
@@ -19,13 +19,12 @@ enum Opts {
         #[structopt(short, long)]
         chunks: usize,
     },
-    // find new ROA files and apply changes
+    /// Find new ROA files and apply changes
     Update {
-        /// NIC
+        /// TAL: afrinic, apnic, arin, lacnic, ripencc; default: all
         #[structopt(short, long)]
         tal: Option<String>,
     },
-    Cleanup {},
 }
 
 fn main() {
@@ -143,9 +142,6 @@ fn main() {
                 }
                 info!("roas history update process finished");
             }
-        }
-        Opts::Cleanup {} => {
-            todo!()
         }
     }
 }
