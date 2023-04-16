@@ -56,8 +56,8 @@ fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
 /// The ROA files URLs has the following format:
 /// https://ftp.ripe.net/ripe/rpki/ripencc.tal/2022/08/28/roas.csv
 pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> {
-    let fields: Vec<&str> = tal_url.split("/").collect();
-    let tal = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
+    let fields: Vec<&str> = tal_url.split('/').collect();
+    let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
 
     let min_date: NaiveDate = NaiveDate::from_ymd_opt(1000, 1, 1).unwrap();
     let after_date: NaiveDate = match after {
@@ -106,8 +106,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
                         })
                         .collect();
 
-                    let roa_files = days
-                        .into_iter()
+                    days.into_iter()
                         .map(|day| {
                             let url = format!("{}/{:02}/roas.csv", month_url, day);
                             let file_date = NaiveDate::from_ymd_opt(*year, *month, day).unwrap();
@@ -119,9 +118,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
                                 processed: false,
                             }
                         })
-                        .collect::<Vec<RoaFile>>();
-
-                    roa_files
+                        .collect::<Vec<RoaFile>>()
                 })
                 .flat_map(|x| x)
                 .collect::<Vec<RoaFile>>()
@@ -130,117 +127,11 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
         .collect::<Vec<RoaFile>>()
 }
 
-pub fn crawl_tal(nic_url: &str, crawl_all: bool) -> Vec<RoaFile> {
-    let fields: Vec<&str> = nic_url.split("/").collect();
-    let tal = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
-
-    let month_day_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d)/</a>.*"#).unwrap();
-
-    // get all years
-    let years: Vec<String> = __crawl_years(nic_url);
-
-    let roa_files = if crawl_all {
-        years
-            .par_iter()
-            .map(|year| {
-                info!("scraping data for {}/{} ...", &nic_url, &year);
-                let year_url = format!("{}/{}", nic_url, year);
-
-                let body = reqwest::blocking::get(year_url.as_str())
-                    .unwrap()
-                    .text()
-                    .unwrap();
-                let months: Vec<String> = month_day_pattern
-                    .captures_iter(body.as_str())
-                    .map(|cap| cap[1].to_owned())
-                    .collect();
-
-                months
-                    .par_iter()
-                    .map(|month| {
-                        info!("scraping data for {}/{} ...", &year_url, &month);
-                        let month_url = format!("{}/{}", year_url, month);
-                        let body = reqwest::blocking::get(month_url.as_str())
-                            .unwrap()
-                            .text()
-                            .unwrap();
-                        let days: Vec<RoaFile> = month_day_pattern
-                            .captures_iter(body.as_str())
-                            .map(|cap| {
-                                let day = cap[1].to_owned();
-                                let url = format!("{}/{}/roas.csv", month_url, day);
-                                let file_date = chrono::NaiveDate::from_ymd_opt(
-                                    year.parse::<i32>().unwrap(),
-                                    month.parse::<u32>().unwrap(),
-                                    day.parse::<u32>().unwrap(),
-                                )
-                                .unwrap();
-                                RoaFile {
-                                    tal: tal.to_owned(),
-                                    url,
-                                    file_date,
-                                    rows_count: 0,
-                                    processed: false,
-                                }
-                            })
-                            .collect();
-                        days
-                    })
-                    .flat_map(|x| x)
-                    .collect::<Vec<RoaFile>>()
-            })
-            .flat_map(|x| x)
-            .collect::<Vec<RoaFile>>()
-    } else {
-        // get latest month's data
-        // TODO: handle edge case where the latest month mismatch with local timezone
-        let year = years.last().unwrap();
-        let year_url = format!("{}/{}", nic_url, year);
-        let body = reqwest::blocking::get(year_url.as_str())
-            .unwrap()
-            .text()
-            .unwrap();
-        let months: Vec<String> = month_day_pattern
-            .captures_iter(body.as_str())
-            .map(|cap| cap[1].to_owned())
-            .collect();
-        let month = months.last().unwrap();
-        let month_url = format!("{}/{}", year_url, month);
-        let body = reqwest::blocking::get(month_url.as_str())
-            .unwrap()
-            .text()
-            .unwrap();
-
-        // get each day
-        month_day_pattern
-            .captures_iter(body.as_str())
-            .map(|cap| {
-                let day = cap[1].to_owned();
-                let url = format!("{}/{}/roas.csv", month_url, day);
-                let file_date = chrono::NaiveDate::from_ymd_opt(
-                    year.parse::<i32>().unwrap(),
-                    month.parse::<u32>().unwrap(),
-                    day.parse::<u32>().unwrap(),
-                )
-                .unwrap();
-                RoaFile {
-                    tal: tal.to_owned(),
-                    url,
-                    file_date,
-                    rows_count: 0,
-                    processed: false,
-                }
-            })
-            .collect::<Vec<RoaFile>>()
-    };
-
-    roa_files
-}
-
+/// Parse a RIPE ROA CSV file and return a set of ROA entries.
 pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
     // parse csv url for auxiliary fields
-    let fields: Vec<&str> = csv_url.split("/").collect();
-    let tal = fields[4].split(".").collect::<Vec<&str>>()[0].to_owned();
+    let fields: Vec<&str> = csv_url.split('/').collect();
+    let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
     let year = fields[5].parse::<i32>().unwrap();
     let month = fields[6].parse::<u32>().unwrap();
     let day = fields[7].parse::<u32>().unwrap();
@@ -263,7 +154,7 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
             break;
         }
 
-        let fields = line.split(",").collect::<Vec<&str>>();
+        let fields = line.split(',').collect::<Vec<&str>>();
         let asn = fields[1]
             .strip_prefix("AS")
             .unwrap()
@@ -292,14 +183,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_crawl() {
-        let roa_files = crawl_tal("https://ftp.ripe.net/rpki/ripencc.tal", false);
-        for x in roa_files {
-            dbg!(x);
-        }
-    }
-
-    #[test]
     fn test_parse() {
         let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv");
         for roa in &roas.iter().take(10).collect::<Vec<&RoaEntry>>() {
@@ -311,7 +194,7 @@ mod tests {
     fn test_crawl_after() {
         let after_date = NaiveDate::from_ymd_opt(2023, 3, 31).unwrap();
         let roa_files = crawl_tal_after("https://ftp.ripe.net/rpki/ripencc.tal", Some(after_date));
-        assert!(roa_files.len() > 0);
+        assert!(!roa_files.is_empty());
         assert_eq!(
             roa_files[0].file_date,
             after_date + chrono::Duration::days(1)
@@ -321,7 +204,7 @@ mod tests {
     #[test]
     fn test_crawl_after_bootstrap() {
         let roa_files = crawl_tal_after("https://ftp.ripe.net/rpki/ripencc.tal", None);
-        assert!(roa_files.len() > 0);
+        assert!(!roa_files.is_empty());
         assert_eq!(
             roa_files[0].file_date,
             NaiveDate::from_ymd_opt(2011, 1, 21).unwrap()

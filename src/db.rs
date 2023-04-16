@@ -252,21 +252,12 @@ impl DbConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{crawl_tal, parse_roas_csv};
+    use crate::parse_roas_csv;
     use tracing::{info, Level};
 
     #[test]
     fn test_connection() {
         let _conn = DbConnection::new();
-    }
-
-    #[test]
-    fn test_insert_files() {
-        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-        let roa_files = crawl_tal("https://ftp.ripe.net/rpki/afrinic.tal", false);
-
-        let mut conn = DbConnection::new();
-        conn.insert_roa_files(&roa_files);
     }
 
     #[test]

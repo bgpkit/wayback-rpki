@@ -52,7 +52,8 @@ fn main() {
                 .expect("unknown tal name")
                 .to_string();
 
-            let all_files = crawl_tal(tal_url.as_str(), true);
+            let all_files = crawl_tal_after(tal_url.as_str(), None);
+
             conn.insert_roa_files(&all_files);
             // let all_files = conn.get_all_files(tal.as_str(), false, latest);
             info!("total of {} roa files to process", all_files.len());
@@ -119,14 +120,13 @@ fn main() {
                 let mut conn = DbConnection::new();
 
                 // 1. get the latest files date for the given TAL
-                // 2. crawl and find all files *after* the latest date, i.e. the missing files
-                // 3. process the missing files and insert the results into the database
                 let latest_file = conn.get_latest_processed_file(tal.as_str()).unwrap();
-                let roa_files = crawl_tal_after(tal_url.as_str(), Some(latest_file.file_date));
 
-                // let roa_files = crawl_tal(tal_url.as_str(), false);
+                // 2. crawl and find all files *after* the latest date, i.e. the missing files
+                let roa_files = crawl_tal_after(tal_url.as_str(), Some(latest_file.file_date));
                 conn.insert_roa_files(&roa_files);
 
+                // 3. process the missing files and insert the results into the database
                 let all_files = conn.get_all_files(tal.as_str(), true, false);
                 info!("start processing {} roas.csv files", all_files.len());
                 for file in all_files {
