@@ -1,6 +1,6 @@
 [package]
 name = "wayback-rpki"
-version = "0.0.1"
+version = "0.1.0"
 authors = ["Mingwei Zhang <mingwei@bgpkit.com>"]
 edition = "2021"
 default-run="wayback-rpki"
@@ -13,11 +13,12 @@ path = "src/bin/updater.rs"
 [dependencies]
 
 anyhow = "1"
+oneio = "0.14"
 chrono = "0.4.22"
-diesel = {version= "2.0.3", features=["postgres", "r2d2", "chrono", "ipnetwork", "network-address", "numeric"]}
+diesel = {version = "2.0.3", features=["postgres", "extras"]}
 dotenv = "0.15.0"
 indicatif = "0.17.3"
-ipnetwork = "0.18.0"
+ipnetwork = "0.20.0"
 rayon = "1.5.1"
 regex="1"
 reqwest = {version="0.11.9", features=["blocking"]}

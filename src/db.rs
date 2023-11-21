@@ -271,7 +271,7 @@ mod tests {
     fn test_insert() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         info!("start");
-        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv");
+        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv.xz");
         info!("{}", roas.len());
         let mut conn = DbConnection::new();
         conn.insert_roa_entries(&roas);
@@ -294,9 +294,9 @@ mod tests {
     fn test_processed() {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         let mut conn = DbConnection::new();
-        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv");
+        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv.xz");
         conn.mark_file_as_processed(
-            "https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv",
+            "https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv.xz",
             true,
             roas.len() as i32,
         );
@@ -307,7 +307,7 @@ mod tests {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
         let mut conn = DbConnection::new();
         conn.mark_file_as_processed(
-            "https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv",
+            "https://ftp.ripe.net/rpki/afrinic.tal/2022/02/01/roas.csv.xz",
             false,
             0,
         );

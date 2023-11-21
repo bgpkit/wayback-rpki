@@ -4,13 +4,11 @@ pub mod roas_table;
 pub use crate::db::*;
 pub use crate::roas_table::*;
 
-use crate::db::{roa_history, RoaFile};
 use chrono::{Datelike, NaiveDate};
 use ipnetwork::IpNetwork;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
 use std::str::FromStr;
 use tracing::{debug, info};
 
@@ -54,7 +52,7 @@ fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
 /// Crawl and return all RIPE ROA file meta data after a given date
 ///
 /// The ROA files URLs has the following format:
-/// https://ftp.ripe.net/ripe/rpki/ripencc.tal/2022/08/28/roas.csv
+/// https://ftp.ripe.net/ripe/rpki/ripencc.tal/2022/08/28/roas.csv.xz
 pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> {
     let fields: Vec<&str> = tal_url.split('/').collect();
     let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
@@ -108,7 +106,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
 
                     days.into_iter()
                         .map(|day| {
-                            let url = format!("{}/{:02}/roas.csv", month_url, day);
+                            let url = format!("{}/{:02}/roas.csv.xz", month_url, day);
                             let file_date = NaiveDate::from_ymd_opt(*year, *month, day).unwrap();
                             RoaFile {
                                 tal: tal.clone(),
@@ -137,10 +135,8 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
     let day = fields[7].parse::<u32>().unwrap();
     let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
 
-    let response = reqwest::blocking::get(csv_url).unwrap();
-    let reader = BufReader::new(response);
     let mut roas = HashSet::new();
-    for line in reader.lines() {
+    for line in oneio::read_lines(csv_url).unwrap() {
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
@@ -184,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv");
+        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv.xz");
         for roa in &roas.iter().take(10).collect::<Vec<&RoaEntry>>() {
             println!("{} {} {}", roa.asn, roa.prefix, roa.max_len);
         }

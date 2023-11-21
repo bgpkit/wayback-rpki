@@ -114,7 +114,10 @@ fn main() {
 
             for (tal, tal_url) in tal_urls {
                 info!("start updating roas history for {}", tal.as_str());
-                info!("searching for latest roas.csv files from {}", tal.as_str());
+                info!(
+                    "searching for latest roas.csv.xz files from {}",
+                    tal.as_str()
+                );
 
                 let mut conn = DbConnection::new();
 
@@ -127,7 +130,7 @@ fn main() {
 
                 // 3. process the missing files and insert the results into the database
                 let all_files = conn.get_all_files(tal.as_str(), true, false);
-                info!("start processing {} roas.csv files", all_files.len());
+                info!("start processing {} roas.csv.xz files", all_files.len());
                 for file in all_files {
                     info!("start processing {}", file.url.as_str());
                     let roa_entries = parse_roas_csv(file.url.as_str());
