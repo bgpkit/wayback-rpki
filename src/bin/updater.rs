@@ -100,6 +100,10 @@ fn main() {
 
         Opts::Update { tal } => {
             // The Update subcommand should "catch up" with the latest roas.csv files based on the most recent data files in the database for each tal
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(10)
+                .build_global()
+                .unwrap();
 
             let tal_urls: Vec<(String, String)> = match tal {
                 None => tals_map
