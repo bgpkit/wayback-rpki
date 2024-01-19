@@ -101,7 +101,7 @@ fn main() {
         Opts::Update { tal } => {
             // The Update subcommand should "catch up" with the latest roas.csv files based on the most recent data files in the database for each tal
             rayon::ThreadPoolBuilder::new()
-                .num_threads(10)
+                .num_threads(50)
                 .build_global()
                 .unwrap();
 
@@ -116,14 +116,14 @@ fn main() {
                 }
             };
 
+            let mut conn = DbConnection::new();
+
             for (tal, tal_url) in tal_urls {
                 info!("start updating roas history for {}", tal.as_str());
                 info!(
                     "searching for latest roas.csv.xz files from {}",
                     tal.as_str()
                 );
-
-                let mut conn = DbConnection::new();
 
                 // 1. get the latest files date for the given TAL
                 let latest_file = conn.get_latest_processed_file(tal.as_str()).unwrap();
