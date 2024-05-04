@@ -1,3 +1,4 @@
+use chrono::NaiveDate;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -12,13 +13,17 @@ use wayback_rpki::*;
 enum Opts {
     /// Bootstrapping `roa_history` table
     Bootstrap {
-        /// limit to specic TAL: afrinic, apnic, arin, lacnic, ripencc
+        /// limit to specific tal: afrinic, apnic, arin, lacnic, ripencc
         #[clap(short, long)]
         tal: Option<String>,
 
         /// Number of parallel chunks
         #[clap(short, long = "chunks")]
         chunks_opt: Option<usize>,
+
+        /// Number of days to look back, default no limit
+        #[clap(short, long)]
+        from_date: Option<NaiveDate>,
 
         /// file path to dump the trie
         #[clap(default_value = "roas_trie.bin.gz")]
@@ -50,6 +55,7 @@ fn main() {
             tal,
             chunks_opt,
             path,
+            from_date,
         } => {
             let chunks = chunks_opt.unwrap_or(num_cpus::get());
             let tal_urls = match tal {
@@ -65,7 +71,7 @@ fn main() {
 
             let all_files = tal_urls
                 .into_iter()
-                .flat_map(|tal_url| crawl_tal_after(tal_url.as_str(), None))
+                .flat_map(|tal_url| crawl_tal_after(tal_url.as_str(), from_date))
                 .collect::<Vec<RoaFile>>();
 
             // conn.insert_roa_files(&all_files);
@@ -158,7 +164,7 @@ fn main() {
                 // 1. get the latest files date for the given TAL
                 let latest_file = conn.get_latest_processed_file(tal.as_str()).unwrap();
 
-                // 2. crawl and find all files *after* the latest date, i.e. the missing files
+                // 2. crawl and find all files *after* the latest date, i.e., the missing files
                 let roa_files = crawl_tal_after(tal_url.as_str(), Some(latest_file.file_date));
                 conn.insert_roa_files(&roa_files);
 

@@ -57,7 +57,7 @@ fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
     months_days
 }
 
-/// Crawl and return all RIPE ROA file meta data after a given date
+/// Crawl and return all RIPE ROA file metadata after a given date
 ///
 /// The ROA files URLs has the following format:
 /// https://ftp.ripe.net/ripe/rpki/ripencc.tal/2022/08/28/roas.csv.xz
@@ -66,10 +66,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
     let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
 
     let min_date: NaiveDate = NaiveDate::from_ymd_opt(1000, 1, 1).unwrap();
-    let after_date: NaiveDate = match after {
-        None => min_date,
-        Some(d) => d,
-    };
+    let after_date: NaiveDate = after.unwrap_or_else(|| min_date);
 
     // get all years
     let years: Vec<i32> = __crawl_years(tal_url)

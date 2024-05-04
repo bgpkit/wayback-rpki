@@ -1,6 +1,7 @@
 use crate::{parse_roas_csv, RoaEntry};
 use anyhow::Result;
 use bincode::{Decode, Encode};
+use chrono::NaiveDate;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -21,19 +22,27 @@ pub struct RoasTrieEntry {
     dates_compressed: VecDeque<(i64, i64)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RoasLookupEntry {
+    pub prefix: IpNet,
+    pub origin: u32,
+    pub max_len: u8,
+    pub dates_ranges: Vec<(NaiveDate, NaiveDate)>,
+}
+
 impl RoasTrieEntry {
-    pub fn new_from_date(date_ts: i64, bootstrap: bool) -> RoasTrieEntry {
+    pub fn new(date_ts: i64, max_len: u8, origin: u32, bootstrap: bool) -> RoasTrieEntry {
         match bootstrap {
             true => RoasTrieEntry {
-                max_len: 0,
-                origin: 0,
+                max_len,
+                origin,
                 dates: HashSet::from([date_ts]),
                 dates_compressed: VecDeque::new(),
             },
 
             false => RoasTrieEntry {
-                max_len: 0,
-                origin: 0,
+                max_len,
+                origin,
                 dates: HashSet::new(),
                 dates_compressed: VecDeque::from([(date_ts, date_ts)]),
             },
@@ -74,7 +83,7 @@ impl RoasTrieEntry {
 
         self.dates_compressed = compressed;
 
-        // after the full compression, the dates HahsSet should be empty
+        // after the full compression, the dates HashSet should be empty
         assert!(self.dates.is_empty());
     }
 
@@ -168,12 +177,13 @@ impl RoasTrie {
                 Some(v) => {
                     v.entry((max_len, origin))
                         .and_modify(|e| e.push_date(date_ts, bootstrap))
-                        .or_insert_with(|| RoasTrieEntry::new_from_date(date_ts, bootstrap));
+                        .or_insert_with(|| RoasTrieEntry::new(date_ts, max_len, origin, bootstrap));
                 }
                 None => {
                     self.trie.insert(
                         prefix,
-                        RoasTrieEntry::new_from_date(date_ts, bootstrap).convert_to_hash_map(),
+                        RoasTrieEntry::new(date_ts, max_len, origin, bootstrap)
+                            .convert_to_hash_map(),
                     );
                 }
             };
@@ -205,6 +215,36 @@ impl RoasTrie {
 
         is_valid
     }
+
+    pub fn lookup_prefix(&self, prefix: &IpNet) -> Vec<RoasLookupEntry> {
+        let mut entries = Vec::new();
+        for (prefix, map) in self.trie.matches(prefix) {
+            for entry in map.values() {
+                entries.push(RoasLookupEntry {
+                    prefix: prefix.clone(),
+                    origin: entry.origin,
+                    max_len: entry.max_len,
+                    dates_ranges: entry
+                        .dates_compressed
+                        .iter()
+                        .map(|(start, end)| {
+                            (
+                                chrono::DateTime::from_timestamp(*start, 0)
+                                    .unwrap()
+                                    .naive_utc()
+                                    .date(),
+                                chrono::DateTime::from_timestamp(*end, 0)
+                                    .unwrap()
+                                    .naive_utc()
+                                    .date(),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        }
+        entries
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +263,17 @@ mod tests {
         roas_trie.compress_dates();
         roas_trie.dump("roas_trie.compressed.bin.gz").unwrap();
         info!("compressing trie... done");
+    }
+
+    #[test]
+    fn test_lookup() {
+        tracing_subscriber::fmt().init();
+        info!("loading trie...");
+        let roas_trie = RoasTrie::load("roas_trie.bin.gz").unwrap();
+        info!("loading trie... done");
+
+        for results in roas_trie.lookup_prefix(&"1.1.1.0/32".parse().unwrap()) {
+            info!("{:?}", results);
+        }
     }
 }
