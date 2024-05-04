@@ -1,39 +1,42 @@
+use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::{env, thread};
-use structopt::StructOpt;
+use std::thread;
 use tracing::{info, Level};
 use wayback_rpki::*;
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "wayback-rpki")]
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+#[clap(name = "wayback-rpki")]
 enum Opts {
     /// Bootstrapping `roa_history` table
     Bootstrap {
-        /// TAL: afrinic, apnic, arin, lacnic, ripencc
-        #[structopt(short, long)]
-        tal: String,
+        /// limit to specic TAL: afrinic, apnic, arin, lacnic, ripencc
+        #[clap(short, long)]
+        tal: Option<String>,
 
         /// Number of parallel chunks
-        #[structopt(short, long)]
-        chunks: usize,
+        #[clap(short, long = "chunks")]
+        chunks_opt: Option<usize>,
+
+        /// file path to dump the trie
+        #[clap(default_value = "roas_trie.bin.gz")]
+        path: String,
     },
     /// Find new ROA files and apply changes
     Update {
         /// TAL: afrinic, apnic, arin, lacnic, ripencc; default: all
-        #[structopt(short, long)]
+        #[clap(short, long)]
         tal: Option<String>,
     },
 }
 
 fn main() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-    let opts: Opts = Opts::from_args();
+    let opts: Opts = Opts::parse();
 
     // check db url
-    let _db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-
     let tals_map = HashMap::from([
         ("afrinic", "https://ftp.ripe.net/rpki/afrinic.tal"),
         ("lacnic", "https://ftp.ripe.net/rpki/lacnic.tal"),
@@ -43,57 +46,83 @@ fn main() {
     ]);
 
     match opts {
-        Opts::Bootstrap { tal, chunks } => {
-            let mut conn = DbConnection::new();
+        Opts::Bootstrap {
+            tal,
+            chunks_opt,
+            path,
+        } => {
+            let chunks = chunks_opt.unwrap_or(num_cpus::get());
+            let tal_urls = match tal {
+                None => tals_map.values().map(|url| url.to_string()).collect(),
+                Some(tal) => {
+                    let url = tals_map
+                        .get(tal.as_str())
+                        .expect(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#)
+                        .to_string();
+                    vec![url]
+                }
+            };
 
-            let tal_url = tals_map
-                .get(tal.as_str())
-                .expect("unknown tal name")
-                .to_string();
+            let all_files = tal_urls
+                .into_iter()
+                .flat_map(|tal_url| crawl_tal_after(tal_url.as_str(), None))
+                .collect::<Vec<RoaFile>>();
 
-            let all_files = crawl_tal_after(tal_url.as_str(), None);
-
-            conn.insert_roa_files(&all_files);
+            // conn.insert_roa_files(&all_files);
             // let all_files = conn.get_all_files(tal.as_str(), false, latest);
             info!("total of {} roa files to process", all_files.len());
 
             let (sender_pb, receiver_pb) = std::sync::mpsc::sync_channel::<(String, i32)>(20);
+            let (sender_entries, receiver_entries) =
+                std::sync::mpsc::sync_channel::<Vec<RoaEntry>>(2000);
 
             let total_files = all_files.len();
 
+            let pb = ProgressBar::new(total_files as u64);
+            let sty = ProgressStyle::default_bar()
+                .template(
+                    "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} [{eta_precise}] {msg}",
+                )
+                .unwrap()
+                .progress_chars("##-");
+            pb.set_style(sty);
+
             // dedicated thread for showing progress of the parsing
             thread::spawn(move || {
-                let mut conn = DbConnection::new();
-                let sty = ProgressStyle::default_bar()
-                    .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} [{eta_precise}] {msg}").unwrap()
-                    .progress_chars("##-");
-                let pb = ProgressBar::new(total_files as u64);
-                pb.set_style(sty);
-                for (url, count) in receiver_pb.iter() {
-                    conn.mark_file_as_processed(url.as_str(), true, count);
+                // let mut conn = DbConnection::new();
+                for (url, _count) in receiver_pb.iter() {
+                    // conn.mark_file_as_processed(url.as_str(), true, count);
                     pb.set_message(url);
                     pb.inc(1);
                 }
             });
 
-            let tables = all_files
-                .par_chunks(chunks)
-                .map_with(sender_pb, |s, files| {
-                    let mut roas_table = RoasTable::new();
+            // dedicated writer thread
+            let handle = thread::spawn(move || {
+                let mut trie = RoasTrie::new();
+                for entries in receiver_entries.iter() {
+                    trie.process_entries(&entries, true);
+                }
+                trie.compress_dates();
+                trie.dump(path.as_str()).unwrap();
+            });
+
+            all_files.par_chunks(chunks).for_each_with(
+                (sender_pb, sender_entries),
+                |(s_pb, s_entries), files| {
                     for file in files {
                         let url: &str = file.url.as_str();
                         // info!("processing {}", url);
-                        let roas = parse_roas_csv(url);
-                        let count = roas.len() as i32;
-                        roas.iter().for_each(|r| roas_table.insert_entry(r));
-                        s.send((url.to_owned(), count)).unwrap();
+                        if let Ok(roas) = parse_roas_csv(url) {
+                            let count = roas.len() as i32;
+                            s_entries.send(roas).unwrap();
+                            s_pb.send((url.to_owned(), count)).unwrap();
+                        }
                     }
-                    roas_table
-                })
-                .collect::<Vec<RoasTable>>();
+                },
+            );
 
-            let merged_table = RoasTable::merge_tables(tables);
-            conn.insert_roa_history_entries(&merged_table.export_to_history());
+            handle.join().unwrap();
 
             info!("bootstrap finished");
         }
@@ -116,15 +145,16 @@ fn main() {
                 }
             };
 
-            let mut conn = DbConnection::new();
+            // let mut conn = DbConnection::new();
 
-            for (tal, tal_url) in tal_urls {
+            for (tal, _tal_url) in tal_urls {
                 info!("start updating roas history for {}", tal.as_str());
                 info!(
                     "searching for latest roas.csv.xz files from {}",
                     tal.as_str()
                 );
 
+                /*
                 // 1. get the latest files date for the given TAL
                 let latest_file = conn.get_latest_processed_file(tal.as_str()).unwrap();
 
@@ -148,6 +178,7 @@ fn main() {
                     conn.mark_file_as_processed(file.url.as_str(), true, count as i32);
                 }
                 info!("roas history update process finished");
+                 */
             }
         }
     }

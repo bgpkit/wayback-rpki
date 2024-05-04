@@ -1,31 +1,42 @@
-pub mod db;
-pub mod roas_table;
+// pub mod roas_table;
+mod roas_trie;
 
-pub use crate::db::*;
-pub use crate::roas_table::*;
+// pub use crate::roas_table::*;
 
+use anyhow::Result;
 use chrono::{Datelike, NaiveDate};
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashSet;
 use std::str::FromStr;
 use tracing::{debug, info};
 
+pub use roas_trie::*;
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RoaEntry {
     tal: String,
-    prefix: IpNetwork,
+    prefix: IpNet,
     max_len: i32,
     asn: u32,
     date: NaiveDate,
+}
+
+#[derive(Debug)]
+pub struct RoaFile {
+    pub url: String,
+    pub tal: String,
+    pub file_date: NaiveDate,
+    pub rows_count: i32,
+    pub processed: bool,
 }
 
 fn __crawl_years(tal_url: &str) -> Vec<String> {
     let year_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d\d\d)/</a>.*"#).unwrap();
 
     // get all years
-    let body = reqwest::blocking::get(tal_url).unwrap().text().unwrap();
+    let body = oneio::read_to_string(tal_url).unwrap();
     let years: Vec<String> = year_pattern
         .captures_iter(body.as_str())
         .map(|cap| cap[1].to_owned())
@@ -37,10 +48,7 @@ fn __crawl_years(tal_url: &str) -> Vec<String> {
 fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
     let month_day_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d)/</a>.*"#).unwrap();
 
-    let body = reqwest::blocking::get(months_days_url)
-        .unwrap()
-        .text()
-        .unwrap();
+    let body = oneio::read_to_string(months_days_url).unwrap();
     let months_days: Vec<String> = month_day_pattern
         .captures_iter(body.as_str())
         .map(|cap| cap[1].to_owned())
@@ -76,7 +84,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
     years
         .par_iter()
         .map(|year| {
-            info!("scraping data for {}/{} ...", &tal_url, &year);
+            info!("scanning roas.csv.xz files for {}/{} ...", &tal_url, &year);
             let year_url = format!("{}/{}", tal_url, year);
 
             let months: Vec<u32> = __crawl_months_days(year_url.as_str())
@@ -92,7 +100,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
             months
                 .par_iter()
                 .map(|month| {
-                    info!("scraping data for {}/{:02} ...", &year_url, &month);
+                    debug!("scraping data for {}/{:02} ...", &year_url, &month);
                     let month_url = format!("{}/{:02}", year_url, month);
 
                     let days: Vec<u32> = __crawl_months_days(month_url.as_str())
@@ -126,17 +134,17 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
 }
 
 /// Parse a RIPE ROA CSV file and return a set of ROA entries.
-pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
+pub fn parse_roas_csv(csv_url: &str) -> Result<Vec<RoaEntry>> {
     // parse csv url for auxiliary fields
     let fields: Vec<&str> = csv_url.split('/').collect();
     let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
-    let year = fields[5].parse::<i32>().unwrap();
-    let month = fields[6].parse::<u32>().unwrap();
-    let day = fields[7].parse::<u32>().unwrap();
+    let year = fields[5].parse::<i32>()?;
+    let month = fields[6].parse::<u32>()?;
+    let day = fields[7].parse::<u32>()?;
     let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
 
     let mut roas = HashSet::new();
-    for line in oneio::read_lines(csv_url).unwrap() {
+    for line in oneio::read_lines(csv_url)? {
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
@@ -151,15 +159,11 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
         }
 
         let fields = line.split(',').collect::<Vec<&str>>();
-        let asn = fields[1]
-            .strip_prefix("AS")
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        let prefix = IpNetwork::from_str(fields[2].to_owned().as_str()).unwrap();
+        let asn = fields[1].trim_start_matches("AS").parse::<u32>()?;
+        let prefix = IpNet::from_str(fields[2].to_owned().as_str()).unwrap();
         let max_len = match fields[3].to_owned().parse::<i32>() {
             Ok(l) => l,
-            Err(_e) => prefix.prefix() as i32,
+            Err(_e) => prefix.prefix_len() as i32,
         };
 
         roas.insert(RoaEntry {
@@ -171,7 +175,7 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
         });
     }
 
-    roas
+    Ok(roas.into_iter().collect::<Vec<RoaEntry>>())
 }
 
 #[cfg(test)]
@@ -180,8 +184,9 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv.xz");
-        for roa in &roas.iter().take(10).collect::<Vec<&RoaEntry>>() {
+        let roas =
+            parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv.xz").unwrap();
+        for roa in roas.iter().take(10) {
             println!("{} {} {}", roa.asn, roa.prefix, roa.max_len);
         }
     }
