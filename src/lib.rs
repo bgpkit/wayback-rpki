@@ -57,16 +57,44 @@ fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
     months_days
 }
 
+fn check_date(
+    date: NaiveDate,
+    from: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    check_month: bool,
+    check_day: bool,
+) -> bool {
+    let from_match = match from {
+        Some(from_date) => {
+            date.year() >= from_date.year()
+                && (check_month && date.month() >= from_date.month() || !check_month)
+                && (check_day && date.day() >= from_date.day() || !check_day)
+        }
+        None => true,
+    };
+    let until_match = match until {
+        Some(until_date) => {
+            date.year() <= until_date.year()
+                && (check_month && date.month() <= until_date.month() || !check_month)
+                && (check_day && date.day() <= until_date.day() || !check_day)
+        }
+        None => true,
+    };
+
+    from_match && until_match
+}
+
 /// Crawl and return all RIPE ROA file metadata after a given date
 ///
 /// The ROA files URLs has the following format:
 /// https://ftp.ripe.net/ripe/rpki/ripencc.tal/2022/08/28/roas.csv.xz
-pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> {
+pub fn crawl_tal_after(
+    tal_url: &str,
+    from: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+) -> Vec<RoaFile> {
     let fields: Vec<&str> = tal_url.split('/').collect();
     let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
-
-    let min_date: NaiveDate = NaiveDate::from_ymd_opt(1000, 1, 1).unwrap();
-    let after_date: NaiveDate = after.unwrap_or_else(|| min_date);
 
     // get all years
     let years: Vec<i32> = __crawl_years(tal_url)
@@ -74,7 +102,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
         .map(|y| y.parse::<i32>().unwrap())
         .filter(|y| {
             let date = NaiveDate::from_ymd_opt(*y, 1, 1).unwrap();
-            date >= NaiveDate::from_ymd_opt(after_date.year(), 1, 1).unwrap()
+            check_date(date, from, until, false, false)
         })
         .collect();
 
@@ -89,8 +117,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
                 .map(|m| m.parse::<u32>().unwrap())
                 .filter(|m| {
                     let date = NaiveDate::from_ymd_opt(*year, *m, 1).unwrap();
-                    date >= NaiveDate::from_ymd_opt(after_date.year(), after_date.month(), 1)
-                        .unwrap()
+                    check_date(date, from, until, true, false)
                 })
                 .collect();
 
@@ -105,7 +132,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
                         .map(|d| d.parse::<u32>().unwrap())
                         .filter(|d| {
                             let date = NaiveDate::from_ymd_opt(*year, *month, *d).unwrap();
-                            date > after_date
+                            check_date(date, from, until, true, true)
                         })
                         .collect();
 
@@ -191,7 +218,11 @@ mod tests {
     #[test]
     fn test_crawl_after() {
         let after_date = NaiveDate::from_ymd_opt(2023, 3, 31).unwrap();
-        let roa_files = crawl_tal_after("https://ftp.ripe.net/rpki/ripencc.tal", Some(after_date));
+        let roa_files = crawl_tal_after(
+            "https://ftp.ripe.net/rpki/ripencc.tal",
+            Some(after_date),
+            None,
+        );
         assert!(!roa_files.is_empty());
         assert_eq!(
             roa_files[0].file_date,
@@ -201,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_crawl_after_bootstrap() {
-        let roa_files = crawl_tal_after("https://ftp.ripe.net/rpki/ripencc.tal", None);
+        let roa_files = crawl_tal_after("https://ftp.ripe.net/rpki/ripencc.tal", None, None);
         assert!(!roa_files.is_empty());
         assert_eq!(
             roa_files[0].file_date,

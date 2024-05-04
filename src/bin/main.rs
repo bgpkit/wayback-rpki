@@ -21,9 +21,13 @@ enum Opts {
         #[clap(short, long = "chunks")]
         chunks_opt: Option<usize>,
 
-        /// Number of days to look back, default no limit
+        /// Date to start from, default no limit
         #[clap(short, long)]
-        from_date: Option<NaiveDate>,
+        from: Option<NaiveDate>,
+
+        /// Date to stop at, default no limit
+        #[clap(short, long)]
+        until: Option<NaiveDate>,
 
         /// file path to dump the trie
         #[clap(default_value = "roas_trie.bin.gz")]
@@ -34,15 +38,18 @@ enum Opts {
         /// TAL: afrinic, apnic, arin, lacnic, ripencc; default: all
         #[clap(short, long)]
         tal: Option<String>,
+
+        /// file path to dump the trie
+        #[clap(default_value = "roas_trie.bin.gz")]
+        path: String,
+
+        /// Date to stop at, default no limit
+        #[clap(short, long)]
+        until: Option<NaiveDate>,
     },
 }
-
-fn main() {
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-    let opts: Opts = Opts::parse();
-
-    // check db url
-    let tals_map = HashMap::from([
+fn get_tal_urls(tal: Option<String>) -> Vec<String> {
+    let tal_map = HashMap::from([
         ("afrinic", "https://ftp.ripe.net/rpki/afrinic.tal"),
         ("lacnic", "https://ftp.ripe.net/rpki/lacnic.tal"),
         ("apnic", "https://ftp.ripe.net/rpki/apnic.tal"),
@@ -50,28 +57,35 @@ fn main() {
         ("arin", "https://ftp.ripe.net/rpki/arin.tal"),
     ]);
 
+    match tal {
+        None => tal_map.values().map(|url| url.to_string()).collect(),
+        Some(tal) => {
+            let url = tal_map
+                .get(tal.as_str())
+                .expect(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#)
+                .to_string();
+            vec![url]
+        }
+    }
+}
+
+fn main() {
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    let opts: Opts = Opts::parse();
+
+    // check db url
     match opts {
         Opts::Bootstrap {
             tal,
             chunks_opt,
             path,
-            from_date,
+            from,
+            until,
         } => {
             let chunks = chunks_opt.unwrap_or(num_cpus::get());
-            let tal_urls = match tal {
-                None => tals_map.values().map(|url| url.to_string()).collect(),
-                Some(tal) => {
-                    let url = tals_map
-                        .get(tal.as_str())
-                        .expect(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#)
-                        .to_string();
-                    vec![url]
-                }
-            };
-
-            let all_files = tal_urls
+            let all_files = get_tal_urls(tal)
                 .into_iter()
-                .flat_map(|tal_url| crawl_tal_after(tal_url.as_str(), from_date))
+                .flat_map(|tal_url| crawl_tal_after(tal_url.as_str(), from, until))
                 .collect::<Vec<RoaFile>>();
 
             // conn.insert_roa_files(&all_files);
@@ -96,8 +110,10 @@ fn main() {
             // dedicated thread for showing progress of the parsing
             thread::spawn(move || {
                 // let mut conn = DbConnection::new();
+                let mut writer = oneio::get_writer("wayback-rpki.bootstrap.log").unwrap();
                 for (url, _count) in receiver_pb.iter() {
                     // conn.mark_file_as_processed(url.as_str(), true, count);
+                    writeln!(writer, "{}", url).unwrap();
                     pb.set_message(url);
                     pb.inc(1);
                 }
@@ -133,59 +149,36 @@ fn main() {
             info!("bootstrap finished");
         }
 
-        Opts::Update { tal } => {
-            // The Update subcommand should "catch up" with the latest roas.csv files based on the most recent data files in the database for each tal
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(50)
-                .build_global()
-                .unwrap();
+        Opts::Update { tal, path, until } => {
+            let mut trie = RoasTrie::load(path.as_str()).unwrap();
+            let mut all_files = get_tal_urls(tal)
+                .into_iter()
+                .flat_map(|tal_url| {
+                    crawl_tal_after(
+                        tal_url.as_str(),
+                        Some(trie.get_latest_date() + chrono::Duration::days(1)),
+                        until,
+                    )
+                })
+                .collect::<Vec<RoaFile>>();
 
-            let tal_urls: Vec<(String, String)> = match tal {
-                None => tals_map
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-                Some(tal) => {
-                    let url = tals_map.get(tal.as_str()).expect(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#).to_string();
-                    vec![(tal, url)]
-                }
-            };
-
-            // let mut conn = DbConnection::new();
-
-            for (tal, _tal_url) in tal_urls {
-                info!("start updating roas history for {}", tal.as_str());
-                info!(
-                    "searching for latest roas.csv.xz files from {}",
-                    tal.as_str()
-                );
-
-                /*
-                // 1. get the latest files date for the given TAL
-                let latest_file = conn.get_latest_processed_file(tal.as_str()).unwrap();
-
-                // 2. crawl and find all files *after* the latest date, i.e., the missing files
-                let roa_files = crawl_tal_after(tal_url.as_str(), Some(latest_file.file_date));
-                conn.insert_roa_files(&roa_files);
-
-                // 3. process the missing files and insert the results into the database
-                let all_files = conn.get_all_files(tal.as_str(), true, false);
-                info!("start processing {} roas.csv.xz files", all_files.len());
-                for file in all_files {
-                    info!("start processing {}", file.url.as_str());
-                    let roa_entries = parse_roas_csv(file.url.as_str());
-                    let count = roa_entries.len();
-                    let roa_entries_vec = roa_entries.into_iter().collect::<Vec<RoaEntry>>();
-                    info!("total of {} ROA entries to process", roa_entries_vec.len());
-                    roa_entries_vec.par_chunks(2000).for_each(|entries| {
-                        let mut new_conn = DbConnection::new();
-                        new_conn.insert_roa_entries(entries);
-                    });
-                    conn.mark_file_as_processed(file.url.as_str(), true, count as i32);
-                }
-                info!("roas history update process finished");
-                 */
+            if all_files.is_empty() {
+                info!("ROAS trie is up to date. No new files found.");
+                return;
             }
+
+            // sort by date
+            all_files.sort_by(|a, b| a.file_date.cmp(&b.file_date));
+
+            for file in all_files {
+                info!("processing {}", file.url.as_str());
+                let url: &str = file.url.as_str();
+                if let Ok(roas) = parse_roas_csv(url) {
+                    trie.process_entries(&roas, false);
+                }
+            }
+
+            trie.dump(path.as_str()).unwrap();
         }
     }
 }

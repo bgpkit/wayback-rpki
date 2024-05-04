@@ -7,7 +7,7 @@ default-run = "wayback-rpki"
 
 [[bin]]
 name = "wayback-rpki"
-path = "src/bin/updater.rs"
+path = "src/bin/main.rs"
 
 
 [dependencies]

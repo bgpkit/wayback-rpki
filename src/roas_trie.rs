@@ -5,9 +5,12 @@ use chrono::NaiveDate;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use std::collections::{HashMap, HashSet, VecDeque};
+use tracing::info;
 
+#[derive(Clone)]
 pub struct RoasTrie {
     pub trie: IpnetTrie<HashMap<(u8, u32), RoasTrieEntry>>,
+    pub latest_date: i64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Encode, Decode)]
@@ -98,10 +101,13 @@ impl RoasTrieEntry {
                     self.dates_compressed.push_back((date_ts, date_ts));
                 } else {
                     let (_start, end) = self.dates_compressed.back_mut().unwrap();
-                    if *end + chrono::Duration::days(1).num_seconds() == date_ts {
+                    let next_day_ts = *end + chrono::Duration::days(1).num_seconds();
+                    if date_ts == next_day_ts {
                         *end = date_ts;
-                    } else {
+                    } else if date_ts > next_day_ts {
                         self.dates_compressed.push_back((date_ts, date_ts));
+                    } else {
+                        // the date is already in the range or in the past, skip
                     }
                 }
             }
@@ -140,17 +146,45 @@ impl RoasTrie {
     pub fn new() -> RoasTrie {
         RoasTrie {
             trie: IpnetTrie::new(),
+            latest_date: 0,
         }
     }
 
     pub fn load(path: &str) -> Result<RoasTrie> {
+        info!("loading trie from {} ...", path);
         let mut reader = oneio::get_reader(path)?;
         let mut trie: IpnetTrie<HashMap<(u8, u32), RoasTrieEntry>> = IpnetTrie::new();
         trie.import_from_reader(&mut reader)?;
-        Ok(RoasTrie { trie })
+        let mut roas_trie = RoasTrie {
+            trie,
+            latest_date: 0,
+        };
+        roas_trie.update_latest_date();
+        Ok(roas_trie)
+    }
+
+    pub fn update_latest_date(&mut self) {
+        info!("updating latest date...");
+        let mut latest_date = 0;
+        for (_prefix, map) in self.trie.iter() {
+            for (_key, entry) in map.iter() {
+                if let Some(date) = entry.dates.iter().max() {
+                    if *date > latest_date {
+                        latest_date = *date;
+                    }
+                }
+                if let Some((_, end)) = entry.dates_compressed.back() {
+                    if *end > latest_date {
+                        latest_date = *end;
+                    }
+                }
+            }
+        }
+        self.latest_date = latest_date;
     }
 
     pub fn dump(&self, path: &str) -> Result<()> {
+        info!("exporting trie to {} ...", path);
         let mut writer = oneio::get_writer(path)?;
         self.trie.export_to_writer(&mut writer)?;
         Ok(())
@@ -187,10 +221,22 @@ impl RoasTrie {
                     );
                 }
             };
+
+            if date_ts > self.latest_date {
+                self.latest_date = date_ts;
+            }
         }
     }
 
+    pub fn get_latest_date(&self) -> NaiveDate {
+        chrono::DateTime::from_timestamp(self.latest_date, 0)
+            .unwrap()
+            .naive_utc()
+            .date()
+    }
+
     pub fn compress_dates(&mut self) {
+        info!("compressing dates into date ranges...");
         for (_prefix, map) in self.trie.iter_mut() {
             for (_key, entry) in map.iter_mut() {
                 entry.full_compress();
