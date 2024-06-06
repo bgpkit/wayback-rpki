@@ -1,15 +1,28 @@
 use chrono::NaiveDate;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use ipnet::IpNet;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::thread;
+use tabled::settings::Style;
+use tabled::Table;
 use tracing::{info, Level};
 use wayback_rpki::*;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 #[clap(name = "wayback-rpki")]
+struct Cli {
+    /// file path to dump the trie
+    #[clap(default_value = "roas_trie.bin.gz", global = true)]
+    path: String,
+
+    #[clap(subcommand)]
+    subcommands: Opts,
+}
+
+#[derive(Subcommand)]
 enum Opts {
     /// Bootstrapping `roa_history` table
     Bootstrap {
@@ -28,10 +41,6 @@ enum Opts {
         /// Date to stop at, default no limit
         #[clap(short, long)]
         until: Option<NaiveDate>,
-
-        /// file path to dump the trie
-        #[clap(default_value = "roas_trie.bin.gz")]
-        path: String,
     },
     /// Find new ROA files and apply changes
     Update {
@@ -39,14 +48,36 @@ enum Opts {
         #[clap(short, long)]
         tal: Option<String>,
 
-        /// file path to dump the trie
-        #[clap(default_value = "roas_trie.bin.gz")]
-        path: String,
-
         /// Date to stop at, default no limit
         #[clap(short, long)]
         until: Option<NaiveDate>,
     },
+    /// Fix potential data issues
+    Fix {},
+    /// Search for ROAs in history
+    Search {
+        /// filter results by ASN exact match
+        #[clap(short, long)]
+        asn: Option<u32>,
+
+        /// IP prefix to search ROAs for, e.g. `?prefix=
+        #[clap(short, long)]
+        prefix: Option<IpNet>,
+
+        /// filter by max_len
+        #[clap(short, long)]
+        max_len: Option<u8>,
+
+        /// limit the date of the ROAs, format: YYYY-MM-DD, e.g. `?date=2022-01-01`
+        #[clap(short, long)]
+        date: Option<NaiveDate>,
+
+        /// filter results to whether ROA is still current
+        #[clap(short, long)]
+        current: Option<bool>,
+    },
+    /// Serve the API
+    Serve {},
 }
 fn get_tal_urls(tal: Option<String>) -> Vec<String> {
     let tal_map = HashMap::from([
@@ -71,14 +102,14 @@ fn get_tal_urls(tal: Option<String>) -> Vec<String> {
 
 fn main() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-    let opts: Opts = Opts::parse();
+    let opts = Cli::parse();
+    let path = opts.path;
 
     // check db url
-    match opts {
+    match opts.subcommands {
         Opts::Bootstrap {
             tal,
             chunks_opt,
-            path,
             from,
             until,
         } => {
@@ -149,7 +180,7 @@ fn main() {
             info!("bootstrap finished");
         }
 
-        Opts::Update { tal, path, until } => {
+        Opts::Update { tal, until } => {
             let mut trie = RoasTrie::load(path.as_str()).unwrap();
             let mut all_files = get_tal_urls(tal)
                 .into_iter()
@@ -179,6 +210,43 @@ fn main() {
             }
 
             trie.dump(path.as_str()).unwrap();
+        }
+        Opts::Search {
+            asn,
+            prefix,
+            max_len,
+            date,
+            current,
+        } => {
+            let trie = RoasTrie::load(path.as_str()).unwrap();
+            let results: Vec<RoasLookupEntryTabled> = trie
+                .search(prefix, asn, max_len, date, current)
+                .into_iter()
+                .map(|entry| entry.into())
+                .collect();
+            println!("{}", Table::new(results).with(Style::markdown()));
+        }
+        Opts::Fix {} => {
+            let mut trie = RoasTrie::load(path.as_str()).unwrap();
+            trie.fill_gaps();
+            trie.dump(path.as_str()).unwrap();
+        }
+
+        Opts::Serve {} => {
+            let trie = RoasTrie::load(path.as_str()).unwrap();
+            let host = "0.0.0.0";
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(num_cpus::get())
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(start_api_service(
+                    trie,
+                    host.to_string(),
+                    3000,
+                    "/".to_string(),
+                ))
+                .unwrap();
         }
     }
 }

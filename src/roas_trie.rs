@@ -5,7 +5,36 @@ use chrono::NaiveDate;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use std::collections::{HashMap, HashSet, VecDeque};
+use tabled::Tabled;
 use tracing::info;
+
+const KNOWN_GAPS_STR: [(&str, &str); 25] = [
+    ("2018-12-28", "2019-01-02"),
+    ("2019-10-22", "2019-10-22"),
+    ("2019-11-24", "2019-11-24"),
+    ("2020-08-03", "2020-08-03"),
+    ("2021-01-04", "2021-01-04"),
+    ("2021-07-15", "2021-07-15"),
+    ("2021-07-19", "2021-07-19"),
+    ("2021-07-23", "2021-07-23"),
+    ("2021-07-31", "2021-07-31"),
+    ("2021-08-10", "2021-08-10"),
+    ("2021-09-03", "2021-09-03"),
+    ("2021-09-06", "2021-09-07"),
+    ("2021-09-10", "2021-09-25"),
+    ("2021-09-27", "2021-09-28"),
+    ("2022-01-03", "2022-01-03"),
+    ("2022-01-15", "2022-01-15"),
+    ("2022-01-19", "2022-01-19"),
+    ("2022-01-24", "2022-01-24"),
+    ("2022-02-02", "2022-02-02"),
+    ("2022-02-04", "2022-02-04"),
+    ("2022-02-13", "2022-02-13"),
+    ("2022-02-16", "2022-02-16"),
+    ("2023-06-24", "2023-06-24"),
+    ("2023-07-14", "2023-07-17"),
+    ("2023-06-24", "2023-06-24"),
+];
 
 #[derive(Clone)]
 pub struct RoasTrie {
@@ -31,6 +60,30 @@ pub struct RoasLookupEntry {
     pub origin: u32,
     pub max_len: u8,
     pub dates_ranges: Vec<(NaiveDate, NaiveDate)>,
+}
+
+#[derive(Debug, Clone, Tabled)]
+pub struct RoasLookupEntryTabled {
+    pub origin: u32,
+    pub prefix: String,
+    pub max_len: u8,
+    pub dates_ranges: String,
+}
+
+impl From<RoasLookupEntry> for RoasLookupEntryTabled {
+    fn from(entry: RoasLookupEntry) -> Self {
+        RoasLookupEntryTabled {
+            origin: entry.origin,
+            prefix: entry.prefix.to_string(),
+            max_len: entry.max_len,
+            dates_ranges: entry
+                .dates_ranges
+                .iter()
+                .map(|(start, end)| format!("({},{})", start, end))
+                .collect::<Vec<String>>()
+                .join(", "),
+        }
+    }
 }
 
 impl RoasTrieEntry {
@@ -163,7 +216,54 @@ impl RoasTrie {
         Ok(roas_trie)
     }
 
-    pub fn update_latest_date(&mut self) {
+    pub fn fill_gaps(&mut self) {
+        info!("filling known gaps...");
+        const ONE_DAY_SECONDS: i64 = 86400;
+
+        for (start, end) in KNOWN_GAPS_STR.iter() {
+            let start_ts = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp();
+            let end_ts = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp();
+
+            // vector of timestamps from start_ts to end_ts
+            let mut dates = Vec::new();
+            let mut date = start_ts;
+            while date <= end_ts {
+                dates.push(date);
+                date += ONE_DAY_SECONDS;
+            }
+
+            for (_prefix, map) in self.trie.iter_mut() {
+                for (_key, entry) in map.iter_mut() {
+                    let mut should_compress = false;
+                    for i in 0..entry.dates_compressed.len() - 1 {
+                        // let (start, end) = entry.dates_compressed[i];
+                        if start_ts - ONE_DAY_SECONDS == entry.dates_compressed[i].1
+                            && end_ts + ONE_DAY_SECONDS == entry.dates_compressed[i + 1].0
+                        {
+                            entry.dates.extend(&dates);
+                            should_compress = true;
+                        }
+                    }
+                    if should_compress {
+                        entry.full_compress();
+                    }
+                }
+            }
+        }
+        info!("filling known gaps... done");
+    }
+
+    fn update_latest_date(&mut self) {
         info!("updating latest date...");
         let mut latest_date = 0;
         for (_prefix, map) in self.trie.iter() {
@@ -266,6 +366,101 @@ impl RoasTrie {
         let mut entries = Vec::new();
         for (prefix, map) in self.trie.matches(prefix) {
             for entry in map.values() {
+                entries.push(RoasLookupEntry {
+                    prefix: prefix.clone(),
+                    origin: entry.origin,
+                    max_len: entry.max_len,
+                    dates_ranges: entry
+                        .dates_compressed
+                        .iter()
+                        .map(|(start, end)| {
+                            (
+                                chrono::DateTime::from_timestamp(*start, 0)
+                                    .unwrap()
+                                    .naive_utc()
+                                    .date(),
+                                chrono::DateTime::from_timestamp(*end, 0)
+                                    .unwrap()
+                                    .naive_utc()
+                                    .date(),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        }
+        entries
+    }
+
+    pub fn search(
+        &self,
+        prefix: Option<IpNet>,
+        origin: Option<u32>,
+        max_len: Option<u8>,
+        date: Option<NaiveDate>,
+        current: Option<bool>,
+    ) -> Vec<RoasLookupEntry> {
+        let mut entries = Vec::new();
+
+        // prefix filter
+        let iter = match prefix {
+            Some(prefix) => self.trie.matches(&prefix),
+            None => self.trie.iter().collect(),
+        };
+
+        let mut only_expired = false;
+
+        let date = match current {
+            Some(c) => match c {
+                true => Some(self.latest_date),
+                false => {
+                    only_expired = true;
+                    None
+                }
+            },
+            None => date.map(|d| {
+                d.and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                    .and_utc()
+                    .timestamp()
+            }),
+        };
+
+        for (prefix, map) in iter {
+            for entry in map.values() {
+                if let Some(origin) = origin {
+                    if entry.origin != origin {
+                        continue;
+                    }
+                }
+
+                if let Some(max_len) = max_len {
+                    if entry.max_len != max_len {
+                        continue;
+                    }
+                }
+
+                if let Some(date) = date {
+                    // check if date_ts is within one of the date ranges in entry.dates_compressed
+                    if entry
+                        .dates_compressed
+                        .iter()
+                        .all(|(start, end)| date < *start || date > *end)
+                    {
+                        continue;
+                    }
+                }
+
+                if only_expired {
+                    if entry
+                        .dates_compressed
+                        .iter()
+                        .any(|(_, end)| *end >= self.latest_date)
+                    {
+                        // if any of the date ranges is still current, the entry is current, skip
+                        continue;
+                    }
+                }
+
                 entries.push(RoasLookupEntry {
                     prefix: prefix.clone(),
                     origin: entry.origin,

@@ -1,4 +1,5 @@
 // pub mod roas_table;
+mod api;
 mod roas_trie;
 
 // pub use crate::roas_table::*;
@@ -12,6 +13,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use tracing::{debug, info};
 
+pub use api::*;
 pub use roas_trie::*;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

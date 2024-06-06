@@ -4,9 +4,10 @@ use axum::http::Method;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::DateTime;
 use clap::Args;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Args, Debug, Serialize, Deserialize)]
@@ -28,20 +29,37 @@ pub struct RoasSearchQuery {
 }
 
 #[derive(Serialize, Deserialize)]
-struct RoasSearchResult {
-    prefix: String,
-    max_len: u8,
-    asn: u32,
-    date_ranges: Vec<(String, String)>,
-    current: bool,
+pub struct RoasSearchResult {
+    pub count: usize,
+    pub error: Option<String>,
+    pub data: Vec<RoasSearchResultEntry>,
+    pub meta: Option<Meta>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Meta {
+    pub latest_date: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RoasSearchResultEntry {
+    pub prefix: String,
+    pub max_len: u8,
+    pub asn: u32,
+    pub date_ranges: Vec<(String, String)>,
+    pub current: bool,
 }
 
 async fn search(
     query: Query<RoasSearchQuery>,
-    State(state): State<Arc<Mutex<RoasTrie>>>,
+    State(state): State<Arc<RoasTrie>>,
 ) -> impl IntoResponse {
-    let trie = state.lock().unwrap();
+    let trie = state.as_ref();
     let latest_ts = trie.latest_date;
+    let latest_date = DateTime::from_timestamp(latest_ts, 0)
+        .unwrap()
+        .naive_utc()
+        .date();
     let mut results = trie.search(
         query.prefix.clone().map(|p| p.parse().unwrap()),
         query.asn,
@@ -50,9 +68,9 @@ async fn search(
         query.current,
     );
     results.sort_by(|a, b| a.prefix.cmp(&b.prefix));
-    let results = results
+    let result_entries = results
         .iter()
-        .map(|entry| RoasSearchResult {
+        .map(|entry| RoasSearchResultEntry {
             prefix: entry.prefix.to_string(),
             max_len: entry.max_len,
             asn: entry.origin,
@@ -66,7 +84,15 @@ async fn search(
             }),
         })
         .collect::<Vec<_>>();
-    Json(results).into_response()
+    Json(RoasSearchResult {
+        count: result_entries.len(),
+        error: None,
+        data: result_entries,
+        meta: Some(Meta {
+            latest_date: latest_date.to_string(),
+        }),
+    })
+    .into_response()
 }
 
 pub async fn start_api_service(
@@ -81,7 +107,7 @@ pub async fn start_api_service(
         // allow requests from any origin
         .allow_origin(Any);
 
-    let state = Arc::new(Mutex::new(trie));
+    let state = Arc::new(trie);
     let app = Router::new()
         .route("/search", get(search))
         .with_state(state)
