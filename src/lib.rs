@@ -1,10 +1,12 @@
+#![allow(clippy::nonminimal_bool)]
+
 // pub mod roas_table;
 mod api;
 mod roas_trie;
 
 // pub use crate::roas_table::*;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{Datelike, NaiveDate};
 use ipnet::IpNet;
 use rayon::prelude::*;
@@ -163,6 +165,7 @@ pub fn crawl_tal_after(
 pub fn parse_roas_csv(csv_url: &str) -> Result<Vec<RoaEntry>> {
     // parse csv url for auxiliary fields
     let fields: Vec<&str> = csv_url.split('/').collect();
+
     let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
     let year = fields[5].parse::<i32>()?;
     let month = fields[6].parse::<u32>()?;
@@ -170,35 +173,38 @@ pub fn parse_roas_csv(csv_url: &str) -> Result<Vec<RoaEntry>> {
     let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
 
     let mut roas = HashSet::new();
+
+    let mut file_ok = false;
+
     for line in oneio::read_lines(csv_url)? {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+        let line = line.unwrap();
+
         if line.starts_with("URI") {
-            // skip the first line
+            file_ok = true;
             continue;
         }
-        if line.to_lowercase().contains("html") {
-            debug!("file {} does not exist, skipping", csv_url);
-            break;
+
+        if !file_ok {
+            return Err(anyhow!("file format incorrect!"));
         }
 
         let fields = line.split(',').collect::<Vec<&str>>();
-        let asn = fields[1].trim_start_matches("AS").parse::<u32>()?;
+        let asn = fields[1].trim_start_matches("AS").parse::<u32>().unwrap();
         let prefix = IpNet::from_str(fields[2].to_owned().as_str()).unwrap();
         let max_len = match fields[3].to_owned().parse::<i32>() {
             Ok(l) => l,
             Err(_e) => prefix.prefix_len() as i32,
         };
 
-        roas.insert(RoaEntry {
+        let entry = RoaEntry {
             prefix,
             asn,
             max_len,
             tal: tal.to_owned(),
             date,
-        });
+        };
+
+        roas.insert(entry);
     }
 
     Ok(roas.into_iter().collect::<Vec<RoaEntry>>())
@@ -240,5 +246,16 @@ mod tests {
             roa_files[0].file_date,
             NaiveDate::from_ymd_opt(2011, 1, 21).unwrap()
         );
+    }
+
+    #[test]
+    fn test_missing_prefix() {
+        let roas =
+            parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2024/06/02/roas.csv.xz").unwrap();
+        for entry in roas {
+            if entry.prefix.to_string().as_str() == "193.0.14.0/24" {
+                dbg!(entry);
+            }
+        }
     }
 }

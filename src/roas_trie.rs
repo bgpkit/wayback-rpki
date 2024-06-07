@@ -4,6 +4,7 @@ use bincode::{Decode, Encode};
 use chrono::NaiveDate;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tabled::Tabled;
 use tracing::info;
@@ -155,12 +156,17 @@ impl RoasTrieEntry {
                 } else {
                     let (_start, end) = self.dates_compressed.back_mut().unwrap();
                     let next_day_ts = *end + chrono::Duration::days(1).num_seconds();
-                    if date_ts == next_day_ts {
-                        *end = date_ts;
-                    } else if date_ts > next_day_ts {
-                        self.dates_compressed.push_back((date_ts, date_ts));
-                    } else {
-                        // the date is already in the range or in the past, skip
+
+                    match date_ts.cmp(&next_day_ts) {
+                        Ordering::Equal => {
+                            *end = date_ts;
+                        }
+                        Ordering::Greater => {
+                            self.dates_compressed.push_back((date_ts, date_ts));
+                        }
+                        Ordering::Less => {
+                            // the date is already in the range or in the past, skip
+                        }
                     }
                 }
             }
@@ -367,7 +373,7 @@ impl RoasTrie {
         for (prefix, map) in self.trie.matches(prefix) {
             for entry in map.values() {
                 entries.push(RoasLookupEntry {
-                    prefix: prefix.clone(),
+                    prefix,
                     origin: entry.origin,
                     max_len: entry.max_len,
                     dates_ranges: entry
@@ -450,19 +456,18 @@ impl RoasTrie {
                     }
                 }
 
-                if only_expired {
-                    if entry
+                if only_expired
+                    && entry
                         .dates_compressed
                         .iter()
                         .any(|(_, end)| *end >= self.latest_date)
-                    {
-                        // if any of the date ranges is still current, the entry is current, skip
-                        continue;
-                    }
+                {
+                    // if any of the date ranges is still current, the entry is current, skip
+                    continue;
                 }
 
                 entries.push(RoasLookupEntry {
-                    prefix: prefix.clone(),
+                    prefix,
                     origin: entry.origin,
                     max_len: entry.max_len,
                     dates_ranges: entry
