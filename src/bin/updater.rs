@@ -83,7 +83,7 @@ fn main() {
                     for file in files {
                         let url: &str = file.url.as_str();
                         // info!("processing {}", url);
-                        let roas = parse_roas_csv(url);
+                        let roas = parse_roas_csv(url).unwrap();
                         let count = roas.len() as i32;
                         roas.iter().for_each(|r| roas_table.insert_entry(r));
                         s.send((url.to_owned(), count)).unwrap();
@@ -137,7 +137,7 @@ fn main() {
                 info!("start processing {} roas.csv.xz files", all_files.len());
                 for file in all_files {
                     info!("start processing {}", file.url.as_str());
-                    let roa_entries = parse_roas_csv(file.url.as_str());
+                    let roa_entries = parse_roas_csv(file.url.as_str()).unwrap();
                     let count = roa_entries.len();
                     let roa_entries_vec = roa_entries.into_iter().collect::<Vec<RoaEntry>>();
                     info!("total of {} ROA entries to process", roa_entries_vec.len());

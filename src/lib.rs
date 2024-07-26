@@ -4,13 +4,14 @@ pub mod roas_table;
 pub use crate::db::*;
 pub use crate::roas_table::*;
 
+use anyhow::{anyhow, Result};
 use chrono::{Datelike, NaiveDate};
 use ipnetwork::IpNetwork;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashSet;
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::info;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RoaEntry {
@@ -126,7 +127,7 @@ pub fn crawl_tal_after(tal_url: &str, after: Option<NaiveDate>) -> Vec<RoaFile> 
 }
 
 /// Parse a RIPE ROA CSV file and return a set of ROA entries.
-pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
+pub fn parse_roas_csv(csv_url: &str) -> Result<HashSet<RoaEntry>> {
     // parse csv url for auxiliary fields
     let fields: Vec<&str> = csv_url.split('/').collect();
     let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
@@ -136,6 +137,9 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
     let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
 
     let mut roas = HashSet::new();
+
+    let mut file_ok = false;
+
     for line in oneio::read_lines(csv_url).unwrap() {
         let line = match line {
             Ok(l) => l,
@@ -143,11 +147,12 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
         };
         if line.starts_with("URI") {
             // skip the first line
+            file_ok = true;
             continue;
         }
-        if line.to_lowercase().contains("html") {
-            debug!("file {} does not exist, skipping", csv_url);
-            break;
+
+        if !file_ok {
+            return Err(anyhow!("file format incorrect!"));
         }
 
         let fields = line.split(',').collect::<Vec<&str>>();
@@ -171,7 +176,7 @@ pub fn parse_roas_csv(csv_url: &str) -> HashSet<RoaEntry> {
         });
     }
 
-    roas
+    Ok(roas)
 }
 
 #[cfg(test)]
@@ -180,7 +185,8 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        let roas = parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv.xz");
+        let roas =
+            parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2022/01/15/roas.csv.xz").unwrap();
         for roa in &roas.iter().take(10).collect::<Vec<&RoaEntry>>() {
             println!("{} {} {}", roa.asn, roa.prefix, roa.max_len);
         }
@@ -205,5 +211,16 @@ mod tests {
             roa_files[0].file_date,
             NaiveDate::from_ymd_opt(2011, 1, 21).unwrap()
         );
+    }
+
+    #[test]
+    fn test_missing_prefix() {
+        let roas =
+            parse_roas_csv("https://ftp.ripe.net/rpki/ripencc.tal/2024/06/02/roas.csv.xz").unwrap();
+        for entry in roas {
+            if entry.prefix.to_string().as_str() == "193.0.14.0/24" {
+                dbg!(entry);
+            }
+        }
     }
 }
