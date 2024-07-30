@@ -3,11 +3,13 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ipnet::IpNet;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::thread;
 use tabled::settings::Style;
 use tabled::Table;
-use tracing::{info, Level};
+use tokio::runtime::Runtime;
+use tokio::sync::RwLock;
+use tracing::{debug, info, Level};
 use wayback_rpki::*;
 
 #[derive(Parser)]
@@ -78,26 +80,6 @@ enum Opts {
     },
     /// Serve the API
     Serve {},
-}
-fn get_tal_urls(tal: Option<String>) -> Vec<String> {
-    let tal_map = HashMap::from([
-        ("afrinic", "https://ftp.ripe.net/rpki/afrinic.tal"),
-        ("lacnic", "https://ftp.ripe.net/rpki/lacnic.tal"),
-        ("apnic", "https://ftp.ripe.net/rpki/apnic.tal"),
-        ("ripencc", "https://ftp.ripe.net/rpki/ripencc.tal"),
-        ("arin", "https://ftp.ripe.net/rpki/arin.tal"),
-    ]);
-
-    match tal {
-        None => tal_map.values().map(|url| url.to_string()).collect(),
-        Some(tal) => {
-            let url = tal_map
-                .get(tal.as_str())
-                .expect(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#)
-                .to_string();
-            vec![url]
-        }
-    }
 }
 
 fn main() {
@@ -182,35 +164,10 @@ fn main() {
 
         Opts::Update { tal, until } => {
             let mut trie = RoasTrie::load(path.as_str()).unwrap();
-            let mut all_files = get_tal_urls(tal)
-                .into_iter()
-                .flat_map(|tal_url| {
-                    crawl_tal_after(
-                        tal_url.as_str(),
-                        Some(trie.get_latest_date() + chrono::Duration::days(1)),
-                        until,
-                    )
-                })
-                .collect::<Vec<RoaFile>>();
-
-            if all_files.is_empty() {
-                info!("ROAS trie is up to date. No new files found.");
-                return;
-            }
-
-            // sort by date
-            all_files.sort_by(|a, b| a.file_date.cmp(&b.file_date));
-
-            for file in all_files {
-                info!("processing {}", file.url.as_str());
-                let url: &str = file.url.as_str();
-                if let Ok(roas) = parse_roas_csv(url) {
-                    trie.process_entries(&roas, false);
-                }
-            }
-
+            trie.update(tal, until).unwrap();
             trie.dump(path.as_str()).unwrap();
         }
+
         Opts::Search {
             asn,
             prefix,
@@ -226,6 +183,7 @@ fn main() {
                 .collect();
             println!("{}", Table::new(results).with(Style::markdown()));
         }
+
         Opts::Fix {} => {
             let mut trie = RoasTrie::load(path.as_str()).unwrap();
             trie.fill_gaps();
@@ -234,14 +192,44 @@ fn main() {
 
         Opts::Serve {} => {
             let trie = RoasTrie::load(path.as_str()).unwrap();
+            let trie_lock = Arc::new(RwLock::new(trie));
+            let timer_lock = trie_lock.clone();
             let host = "0.0.0.0";
+
+            let update_interval = 60 * 60 * 8;
+
+            std::thread::spawn(move || {
+                let rt = get_tokio_runtime();
+                rt.block_on(async {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(update_interval));
+                    loop {
+                        interval.tick().await;
+
+                        info!("creating a backup trie...");
+                        // updating from the latest data available
+                        let read_lock = timer_lock.read().await;
+                        let mut backup = read_lock.clone();
+                        drop(read_lock);
+                        backup.update(None, None).unwrap();
+
+                        info!("replacing backup trie with the original trie...");
+                        let mut write_lock = timer_lock.write().await;
+                        write_lock.replace(backup);
+                        drop(write_lock);
+
+                        info!("wait for {} seconds before next update", update_interval);
+                    }
+                });
+            });
+
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(num_cpus::get())
                 .enable_all()
                 .build()
                 .unwrap()
                 .block_on(start_api_service(
-                    trie,
+                    trie_lock,
                     host.to_string(),
                     3000,
                     "/".to_string(),
@@ -249,4 +237,16 @@ fn main() {
                 .unwrap();
         }
     }
+}
+
+fn get_tokio_runtime() -> Runtime {
+    let blocking_cpus = num_cpus::get();
+
+    debug!("using {} cores for parsing html pages", blocking_cpus);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(blocking_cpus)
+        .build()
+        .unwrap();
+    rt
 }

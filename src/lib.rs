@@ -11,7 +11,7 @@ use chrono::{Datelike, NaiveDate};
 use ipnet::IpNet;
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tracing::{debug, info};
 
@@ -208,6 +208,27 @@ pub fn parse_roas_csv(csv_url: &str) -> Result<Vec<RoaEntry>> {
     }
 
     Ok(roas.into_iter().collect::<Vec<RoaEntry>>())
+}
+
+pub fn get_tal_urls(tal: Option<String>) -> Vec<String> {
+    let tal_map = HashMap::from([
+        ("afrinic", "https://ftp.ripe.net/rpki/afrinic.tal"),
+        ("lacnic", "https://ftp.ripe.net/rpki/lacnic.tal"),
+        ("apnic", "https://ftp.ripe.net/rpki/apnic.tal"),
+        ("ripencc", "https://ftp.ripe.net/rpki/ripencc.tal"),
+        ("arin", "https://ftp.ripe.net/rpki/arin.tal"),
+    ]);
+
+    match tal {
+        None => tal_map.values().map(|url| url.to_string()).collect(),
+        Some(tal) => {
+            let url = tal_map
+                .get(tal.as_str())
+                .expect(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#)
+                .to_string();
+            vec![url]
+        }
+    }
 }
 
 #[cfg(test)]

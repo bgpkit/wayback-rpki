@@ -1,4 +1,4 @@
-use crate::{parse_roas_csv, RoaEntry};
+use crate::{crawl_tal_after, get_tal_urls, parse_roas_csv, RoaEntry, RoaFile};
 use anyhow::Result;
 use bincode::{Decode, Encode};
 use chrono::NaiveDate;
@@ -105,6 +105,7 @@ impl RoasTrieEntry {
             },
         }
     }
+
     /// Do full compression where we explode the dates_compressed into individual dates and
     /// then compress them again with the new dates
     pub fn full_compress(&mut self) {
@@ -490,6 +491,44 @@ impl RoasTrie {
             }
         }
         entries
+    }
+
+    pub fn update(&mut self, tal: Option<String>, until: Option<NaiveDate>) -> Result<()> {
+        info!("updating trie...");
+        let mut all_files = get_tal_urls(tal)
+            .into_iter()
+            .flat_map(|tal_url| {
+                crawl_tal_after(
+                    tal_url.as_str(),
+                    Some(self.get_latest_date() + chrono::Duration::days(1)),
+                    until,
+                )
+            })
+            .collect::<Vec<RoaFile>>();
+
+        if all_files.is_empty() {
+            info!("trie is up to date. No new files found.");
+            return Ok(());
+        }
+
+        // sort by date
+        all_files.sort_by(|a, b| a.file_date.cmp(&b.file_date));
+
+        for file in all_files {
+            info!("processing {}", file.url.as_str());
+            let url: &str = file.url.as_str();
+            if let Ok(roas) = parse_roas_csv(url) {
+                self.process_entries(&roas, false);
+            }
+        }
+
+        info!("updating trie... done");
+        Ok(())
+    }
+
+    pub fn replace(&mut self, other: RoasTrie) {
+        self.trie = other.trie;
+        self.latest_date = other.latest_date;
     }
 }
 

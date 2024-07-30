@@ -8,7 +8,9 @@ use chrono::DateTime;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
+use tracing::info;
 
 #[derive(Args, Debug, Serialize, Deserialize)]
 pub struct RoasSearchQuery {
@@ -52,9 +54,9 @@ pub struct RoasSearchResultEntry {
 
 async fn search(
     query: Query<RoasSearchQuery>,
-    State(state): State<Arc<RoasTrie>>,
+    State(state): State<Arc<RwLock<RoasTrie>>>,
 ) -> impl IntoResponse {
-    let trie = state.as_ref();
+    let trie = state.read().await;
     let latest_ts = trie.latest_date;
     let latest_date = DateTime::from_timestamp(latest_ts, 0)
         .unwrap()
@@ -96,7 +98,7 @@ async fn search(
 }
 
 pub async fn start_api_service(
-    trie: RoasTrie,
+    trie_lock: Arc<RwLock<RoasTrie>>,
     host: String,
     port: u16,
     root: String,
@@ -107,10 +109,9 @@ pub async fn start_api_service(
         // allow requests from any origin
         .allow_origin(Any);
 
-    let state = Arc::new(trie);
     let app = Router::new()
         .route("/search", get(search))
-        .with_state(state)
+        .with_state(trie_lock)
         .layer(cors_layer);
     let root_app = Router::new().nest(root.as_str(), app);
 
