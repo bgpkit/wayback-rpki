@@ -72,7 +72,7 @@ fn check_date(
         Some(from_date) => {
             date.year() >= from_date.year()
                 && (check_month && date.month() >= from_date.month() || !check_month)
-                && (check_day && date.day() >= from_date.day() || !check_day)
+                && (check_day && date >= from_date || !check_day)
         }
         None => true,
     };
@@ -80,7 +80,7 @@ fn check_date(
         Some(until_date) => {
             date.year() <= until_date.year()
                 && (check_month && date.month() <= until_date.month() || !check_month)
-                && (check_day && date.day() <= until_date.day() || !check_day)
+                && (check_day && date <= until_date || !check_day)
         }
         None => true,
     };
