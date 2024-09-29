@@ -9,16 +9,20 @@ use tabled::settings::Style;
 use tabled::Table;
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
-use tracing::{debug, info, Level};
+use tracing::{debug, error, info, Level};
 use wayback_rpki::*;
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 #[clap(name = "wayback-rpki")]
 struct Cli {
-    /// file path to dump the trie
+    /// file path to dump the trie.
     #[clap(default_value = "roas_trie.bin.gz", global = true)]
     path: String,
+
+    /// download bootstrap file to help get started quickly
+    #[clap(short, long, global = true)]
+    bootstrap: bool,
 
     #[clap(subcommand)]
     subcommands: Opts,
@@ -26,8 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Opts {
-    /// Bootstrapping `roa_history` table
-    Bootstrap {
+    /// Rebuild the entire RPKI ROA history data from scratch
+    Rebuild {
         /// limit to specific tal: afrinic, apnic, arin, lacnic, ripencc
         #[clap(short, long)]
         tal: Option<String>,
@@ -89,7 +93,7 @@ fn main() {
 
     // check db url
     match opts.subcommands {
-        Opts::Bootstrap {
+        Opts::Rebuild {
             tal,
             chunks_opt,
             from,
@@ -163,6 +167,7 @@ fn main() {
         }
 
         Opts::Update { tal, until } => {
+            check_bootstrap_and_download(path.as_str(), opts.bootstrap);
             let mut trie = RoasTrie::load(path.as_str()).unwrap();
             trie.update(tal, until).unwrap();
             trie.dump(path.as_str()).unwrap();
@@ -175,6 +180,7 @@ fn main() {
             date,
             current,
         } => {
+            check_bootstrap_and_download(path.as_str(), opts.bootstrap);
             let trie = RoasTrie::load(path.as_str()).unwrap();
             let results: Vec<RoasLookupEntryTabled> = trie
                 .search(prefix, asn, max_len, date, current)
@@ -185,12 +191,14 @@ fn main() {
         }
 
         Opts::Fix {} => {
+            check_bootstrap_and_download(path.as_str(), opts.bootstrap);
             let mut trie = RoasTrie::load(path.as_str()).unwrap();
             trie.fill_gaps();
             trie.dump(path.as_str()).unwrap();
         }
 
         Opts::Serve {} => {
+            check_bootstrap_and_download(path.as_str(), opts.bootstrap);
             let trie = RoasTrie::load(path.as_str()).unwrap();
             let trie_lock = Arc::new(RwLock::new(trie));
             let timer_lock = trie_lock.clone();
@@ -198,7 +206,7 @@ fn main() {
 
             let update_interval = 60 * 60 * 8;
 
-            std::thread::spawn(move || {
+            thread::spawn(move || {
                 let rt = get_tokio_runtime();
                 rt.block_on(async {
                     let mut interval =
@@ -212,6 +220,14 @@ fn main() {
                         let mut backup = read_lock.clone();
                         drop(read_lock);
                         backup.update(None, None).unwrap();
+
+                        info!("writing updated trie to disk...");
+                        match backup.dump(&path) {
+                            Ok(_) => {
+                                info!("backup trie written to disk: {}", path);
+                            }
+                            Err(e) => error!("failed to write backup trie to disk: {}", e),
+                        }
 
                         info!("replacing backup trie with the original trie...");
                         let mut write_lock = timer_lock.write().await;
@@ -249,4 +265,20 @@ fn get_tokio_runtime() -> Runtime {
         .build()
         .unwrap();
     rt
+}
+
+/// Check if data file exists, and bootstrap if necessary
+fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
+    if !std::path::Path::new(path).exists() {
+        // if file at `path` does not exist
+        if bootstrap {
+            // download bootstrap file
+            let remote_bootstrap_file = "https://data.bgpkit.com/broker/roas_trie.bin.gz";
+            info!(
+                "downloading bootstrap file {} to {}",
+                remote_bootstrap_file, path
+            );
+            oneio::download(remote_bootstrap_file, path, None).unwrap();
+        }
+    }
 }

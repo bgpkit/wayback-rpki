@@ -7,10 +7,11 @@ use axum::{Json, Router};
 use chrono::DateTime;
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::warn;
 
 #[derive(Args, Debug, Serialize, Deserialize)]
 pub struct RoasSearchQuery {
@@ -28,6 +29,12 @@ pub struct RoasSearchQuery {
 
     /// filter results to whether ROA is still current
     current: Option<bool>,
+
+    /// page number, starting from 0
+    page: Option<usize>,
+
+    /// number of items per page, maximum 1000
+    page_size: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -36,6 +43,8 @@ pub struct RoasSearchResult {
     pub error: Option<String>,
     pub data: Vec<RoasSearchResultEntry>,
     pub meta: Option<Meta>,
+    pub page: usize,
+    pub page_size: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,10 +61,29 @@ pub struct RoasSearchResultEntry {
     pub current: bool,
 }
 
+async fn health(State(state): State<Arc<RwLock<RoasTrie>>>) -> impl IntoResponse {
+    let trie = state.read().await;
+    let (ipv4_count, ipv6_count) = trie.trie.len();
+    let latest_ts = trie.latest_date;
+    Json(json! ({
+        "ipv4_roas_count": ipv4_count,
+        "ipv6_roas_count": ipv6_count,
+        "latest_date": DateTime::from_timestamp(latest_ts, 0).unwrap().naive_utc().date().to_string(),
+    }))
+    .into_response()
+}
+
 async fn search(
     query: Query<RoasSearchQuery>,
     State(state): State<Arc<RwLock<RoasTrie>>>,
 ) -> impl IntoResponse {
+    let page = query.page.unwrap_or(0);
+    let mut page_size = query.page_size.unwrap_or(100);
+    if page_size > 1000 {
+        warn!("page_size is too large, setting to 1000");
+        page_size = 1000;
+    }
+
     let trie = state.read().await;
     let latest_ts = trie.latest_date;
     let latest_date = DateTime::from_timestamp(latest_ts, 0)
@@ -86,6 +114,14 @@ async fn search(
             }),
         })
         .collect::<Vec<_>>();
+
+    // filter result entries by page and page_size
+    let result_entries = result_entries
+        .into_iter()
+        .skip(page * page_size)
+        .take(page_size)
+        .collect::<Vec<_>>();
+
     Json(RoasSearchResult {
         count: result_entries.len(),
         error: None,
@@ -93,6 +129,8 @@ async fn search(
         meta: Some(Meta {
             latest_date: latest_date.to_string(),
         }),
+        page,
+        page_size,
     })
     .into_response()
 }
@@ -111,6 +149,7 @@ pub async fn start_api_service(
 
     let app = Router::new()
         .route("/search", get(search))
+        .route("/health", get(health))
         .with_state(trie_lock)
         .layer(cors_layer);
     let root_app = Router::new().nest(root.as_str(), app);
