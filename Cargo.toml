@@ -13,9 +13,9 @@ path = "src/bin/main.rs"
 [dependencies]
 
 anyhow = "1"
-oneio = "0.17.0-beta.1"
+oneio = { version = "0.17.0", features = ["s3"] }
 chrono = "0.4.38"
-dotenv = "0.15.0"
+dotenvy = "0.15"
 indicatif = "0.17.3"
 ipnet = "2.9"
 rayon = "1.5.1"

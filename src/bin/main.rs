@@ -83,11 +83,16 @@ enum Opts {
         current: Option<bool>,
     },
     /// Serve the API
-    Serve {},
+    Serve {
+        /// Additional path to backup the trie
+        #[clap(long)]
+        backup_to: Option<String>,
+    },
 }
 
 fn main() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    dotenvy::dotenv().ok();
     let opts = Cli::parse();
     let path = opts.path;
 
@@ -197,7 +202,13 @@ fn main() {
             trie.dump(path.as_str()).unwrap();
         }
 
-        Opts::Serve {} => {
+        Opts::Serve { backup_to } => {
+            let mut backup_destinations = vec![backup_to];
+            if let Ok(p) = std::env::var("WAYBACK_BACKUP_TO") {
+                // replace backup_to with the env variable if it is set
+                backup_destinations.push(Some(p));
+            }
+
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
             let trie = RoasTrie::load(path.as_str()).unwrap();
             let trie_lock = Arc::new(RwLock::new(trie));
@@ -227,6 +238,40 @@ fn main() {
                                 info!("backup trie written to disk: {}", path);
                             }
                             Err(e) => error!("failed to write backup trie to disk: {}", e),
+                        }
+
+                        for backup_to in &backup_destinations {
+                            if let Some(backup_to) = backup_to.as_ref() {
+                                info!("writing additional backup trie to disk at {}...", backup_to);
+                                match oneio::s3_url_parse(backup_to) {
+                                    Ok((bucket, key)) => {
+                                        if oneio::s3_env_check().is_err() {
+                                            error!("s3 environment variables not set, skipping backup to s3");
+                                        } else {
+                                            match oneio::s3_upload(&bucket, &key, path.as_str()) {
+                                                Ok(_) => {
+                                                    info!("backup trie written to s3: {}", backup_to);
+                                                }
+                                                Err(_) => {
+                                                    error!("failed to write backup trie to s3: {}", backup_to);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // not a s3 url, copy the current trie to the specified path
+                                        // make file system copy of the trie file at path
+                                        match std::fs::copy(&path, backup_to) {
+                                            Ok(_) => {
+                                                info!("backup trie written to disk: {}", backup_to);
+                                            }
+                                            Err(e) => {
+                                                error!("failed to write backup trie to disk: {}", e)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         info!("replacing backup trie with the original trie...");
@@ -273,7 +318,7 @@ fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
         // if file at `path` does not exist
         if bootstrap {
             // download bootstrap file
-            let remote_bootstrap_file = "https://data.bgpkit.com/broker/roas_trie.bin.gz";
+            let remote_bootstrap_file = "https://spaces.bgpkit.org/broker/roas_trie.bin.gz";
             info!(
                 "downloading bootstrap file {} to {}",
                 remote_bootstrap_file, path
