@@ -271,7 +271,6 @@ impl RoasTrie {
     }
 
     fn update_latest_date(&mut self) {
-        info!("updating latest date...");
         let mut latest_date = 0;
         for (_prefix, map) in self.trie.iter() {
             for (_key, entry) in map.iter() {
@@ -288,6 +287,7 @@ impl RoasTrie {
             }
         }
         self.latest_date = latest_date;
+        info!("updating latest date to {}", self.get_latest_date());
     }
 
     pub fn dump(&self, path: &str) -> Result<()> {
@@ -494,7 +494,7 @@ impl RoasTrie {
     }
 
     pub fn update(&mut self, tal: Option<String>, until: Option<NaiveDate>) -> Result<()> {
-        info!("updating trie...");
+        info!("updating trie... tal: {:?}, until: {:?}", &tal, &until);
         let mut all_files = get_tal_urls(tal)
             .into_iter()
             .flat_map(|tal_url| {
