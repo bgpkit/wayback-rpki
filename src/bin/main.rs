@@ -91,7 +91,10 @@ enum Opts {
 }
 
 fn main() {
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_ansi(true)
+        .init();
     dotenvy::dotenv().ok();
     let opts = Cli::parse();
     let path = opts.path;
