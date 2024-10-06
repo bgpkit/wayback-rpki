@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ipnet::IpNet;
 use rayon::prelude::*;
+use std::process::exit;
 use std::sync::Arc;
 use std::thread;
 use tabled::settings::Style;
@@ -23,6 +24,10 @@ struct Cli {
     /// download bootstrap file to help get started quickly
     #[clap(short, long, global = true)]
     bootstrap: bool,
+
+    /// path to an environment variable file
+    #[clap(long, global = true)]
+    env: Option<String>,
 
     #[clap(subcommand)]
     subcommands: Opts,
@@ -95,8 +100,26 @@ fn main() {
         .with_max_level(Level::INFO)
         .with_ansi(true)
         .init();
-    dotenvy::dotenv().ok();
+
     let opts = Cli::parse();
+    match opts.env {
+        Some(env_path) => {
+            match dotenvy::from_path(env_path.as_str()) {
+                Ok(_) => {
+                    info!("loaded environment variables from {}", env_path);
+                }
+                Err(_) => {
+                    error!("failed to load environment variables from {}", env_path);
+                    exit(1);
+                }
+            };
+        }
+        None => {
+            dotenvy::dotenv().ok();
+            info!("no environment variable file specified, load from .env or alike");
+        }
+    }
+
     let path = opts.path;
 
     // check db url
@@ -210,6 +233,11 @@ fn main() {
             if let Ok(p) = std::env::var("WAYBACK_BACKUP_TO") {
                 // replace backup_to with the env variable if it is set
                 backup_destinations.push(Some(p));
+            }
+            for backup_to in &backup_destinations {
+                if let Some(backup_to) = backup_to.as_ref() {
+                    info!("backup trie will be written to {}", backup_to);
+                }
             }
 
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
