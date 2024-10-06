@@ -98,7 +98,7 @@ enum Opts {
 fn main() {
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
-        .with_ansi(true)
+        .with_ansi(false)
         .init();
 
     let opts = Cli::parse();
