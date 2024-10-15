@@ -239,6 +239,10 @@ fn main() {
                     info!("backup trie will be written to {}", backup_to);
                 }
             }
+            let backup_heartbeat_url = std::env::var("WAYBACK_BACKUP_HEARTBEAT_URL").ok();
+            if let Some(backup_heartbeat_url) = backup_heartbeat_url.as_ref() {
+                info!("backup heartbeat will be sent to {}", backup_heartbeat_url);
+            }
 
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
             let trie = RoasTrie::load(path.as_str()).unwrap();
@@ -271,6 +275,7 @@ fn main() {
                             Err(e) => error!("failed to write backup trie to disk: {}", e),
                         }
 
+                        let mut to_send_heartbeat = false;
                         for backup_to in &backup_destinations {
                             if let Some(backup_to) = backup_to.as_ref() {
                                 info!("writing additional backup trie to disk at {}...", backup_to);
@@ -282,6 +287,7 @@ fn main() {
                                             match oneio::s3_upload(&bucket, &key, path.as_str()) {
                                                 Ok(_) => {
                                                     info!("backup trie written to s3: {}", backup_to);
+                                                    to_send_heartbeat = true;
                                                 }
                                                 Err(_) => {
                                                     error!("failed to write backup trie to s3: {}", backup_to);
@@ -295,12 +301,22 @@ fn main() {
                                         match std::fs::copy(&path, backup_to) {
                                             Ok(_) => {
                                                 info!("backup trie written to disk: {}", backup_to);
+                                                to_send_heartbeat = true;
                                             }
                                             Err(e) => {
                                                 error!("failed to write backup trie to disk: {}", e)
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+
+                        if to_send_heartbeat {
+                            if let Some(backup_heartbeat_url) = backup_heartbeat_url.as_ref() {
+                                info!("sending heartbeat to {}", backup_heartbeat_url);
+                                if let Err(e) = reqwest::blocking::get(backup_heartbeat_url){
+                                    error!("failed to send heartbeat: {}", e);
                                 }
                             }
                         }
