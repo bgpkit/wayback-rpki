@@ -19,7 +19,6 @@ FROM debian:bookworm-slim
 # copy the build artifact from the build stage
 COPY --from=build /my_project/target/release/wayback-rpki /usr/local/bin/wayback-rpki
 
-#RUN DEBIAN=NONINTERACTIVE apt update; apt install -y libssl-dev libpq-dev cron ; rm -rf /var/lib/apt/lists/*
+WORKDIR /wayback-rpki
 
-# set the startup command to run your binary
-ENTRYPOINT bash -c '/usr/local/bin/wayback-rpki serve --bootstrap'
+ENTRYPOINT bash -c '/usr/local/bin/wayback-rpki serve --bootstrap --host 0.0.0.0 --port 40065'

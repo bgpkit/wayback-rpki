@@ -92,6 +92,12 @@ enum Opts {
         /// Additional path to backup the trie
         #[clap(long)]
         backup_to: Option<String>,
+
+        #[clap(short, long, default_value = "0.0.0.0")]
+        host: String,
+
+        #[clap(short, long, default_value = "40065")]
+        port: u16,
     },
 }
 
@@ -228,7 +234,11 @@ fn main() {
             trie.dump(path.as_str()).unwrap();
         }
 
-        Opts::Serve { backup_to } => {
+        Opts::Serve {
+            backup_to,
+            host,
+            port,
+        } => {
             let mut backup_destinations = vec![backup_to];
             if let Ok(p) = std::env::var("WAYBACK_BACKUP_TO") {
                 // replace backup_to with the env variable if it is set
@@ -248,7 +258,6 @@ fn main() {
             let trie = RoasTrie::load(path.as_str()).unwrap();
             let trie_lock = Arc::new(RwLock::new(trie));
             let timer_lock = trie_lock.clone();
-            let host = "0.0.0.0";
 
             let update_interval = 60 * 60 * 8;
 
@@ -315,7 +324,7 @@ fn main() {
                         if to_send_heartbeat {
                             if let Some(backup_heartbeat_url) = backup_heartbeat_url.as_ref() {
                                 info!("sending heartbeat to {}", backup_heartbeat_url);
-                                if let Err(e) = reqwest::blocking::get(backup_heartbeat_url){
+                                if let Err(e) = reqwest::blocking::get(backup_heartbeat_url) {
                                     error!("failed to send heartbeat: {}", e);
                                 }
                             }
@@ -336,12 +345,7 @@ fn main() {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(start_api_service(
-                    trie_lock,
-                    host.to_string(),
-                    3000,
-                    "/".to_string(),
-                ))
+                .block_on(start_api_service(trie_lock, host, port, "/".to_string()))
                 .unwrap();
         }
     }

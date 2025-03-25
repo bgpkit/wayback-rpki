@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## v1.0.1 - 2025-03-25
+
+### Highlights
+
+* Add `--host` and `--port` arguments for the `wayback-rpki serve` command
+* Add `/wayback-rpki` as the workdir for the Docker container
+* Specify default `--host 0.0.0.0 --port 40065` for Docker container
+
 ## v1.0.0 - 2025-03-25
 
 Stable release version.
