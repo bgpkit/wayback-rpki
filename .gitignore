@@ -2,4 +2,3 @@
 .idea
 target
 *.gz
-Cargo.lock

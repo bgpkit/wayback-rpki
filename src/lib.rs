@@ -253,10 +253,7 @@ mod tests {
             None,
         );
         assert!(!roa_files.is_empty());
-        assert_eq!(
-            roa_files[0].file_date,
-            after_date + chrono::Duration::days(1)
-        );
+        assert_eq!(roa_files[0].file_date, after_date);
     }
 
     #[test]

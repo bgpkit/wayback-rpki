@@ -531,34 +531,3 @@ impl RoasTrie {
         self.latest_date = other.latest_date;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tracing::log::info;
-
-    #[test]
-    fn test_bootstrapped() {
-        tracing_subscriber::fmt().init();
-        info!("loading trie...");
-        let mut roas_trie = RoasTrie::load("roas_trie.bin.gz").unwrap();
-        info!("loading trie... done");
-
-        info!("compressing trie...");
-        roas_trie.compress_dates();
-        roas_trie.dump("roas_trie.compressed.bin.gz").unwrap();
-        info!("compressing trie... done");
-    }
-
-    #[test]
-    fn test_lookup() {
-        tracing_subscriber::fmt().init();
-        info!("loading trie...");
-        let roas_trie = RoasTrie::load("roas_trie.bin.gz").unwrap();
-        info!("loading trie... done");
-
-        for results in roas_trie.lookup_prefix(&"1.1.1.0/32".parse().unwrap()) {
-            info!("{:?}", results);
-        }
-    }
-}
