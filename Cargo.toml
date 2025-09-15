@@ -1,6 +1,6 @@
 [package]
 name = "wayback-rpki"
-version = "1.0.1"
+version = "1.0.2"
 authors = ["Mingwei Zhang <mingwei@bgpkit.com>"]
 edition = "2021"
 license = "MIT"
@@ -18,10 +18,10 @@ path = "src/bin/main.rs"
 [dependencies]
 
 anyhow = "1"
-oneio = { version = "0.17.0", features = ["s3"] }
+oneio = { version = "0.19.0", default-features = false, features = ["https", "xz", "s3"] }
 chrono = "0.4.38"
 dotenvy = "0.15"
-indicatif = "0.17.3"
+indicatif = "0.18.0"
 ipnet = "2.9"
 rayon = "1.5.1"
 regex = "1"
@@ -35,11 +35,11 @@ tracing-subscriber = "0.3.3"
 ipnet-trie = { version = "0.3.0", features = ["export"] }
 bincode = "2.0.1"
 
-tabled = "0.15.0"
+tabled = "0.20.0"
 
 # api
-axum = "0.7.5"
-tower-http = { version = "0.5", features = ["cors"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
 tokio = { version = "1", features = ["full"] }
 
 [package.metadata.binstall]
