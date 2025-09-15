@@ -274,7 +274,10 @@ fn main() {
                         let read_lock = timer_lock.read().await;
                         let mut backup = read_lock.clone();
                         drop(read_lock);
-                        backup.update(None, None).unwrap();
+                        if let Err(e) = backup.update(None, None) {
+                            error!("backup update failed: {}", e);
+                            continue;
+                        }
 
                         info!("writing updated trie to disk...");
                         match backup.dump(&path) {

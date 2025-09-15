@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub use api::*;
 pub use roas_trie::*;
@@ -40,7 +40,13 @@ fn __crawl_years(tal_url: &str) -> Vec<String> {
     let year_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d\d\d)/</a>.*"#).unwrap();
 
     // get all years
-    let body = oneio::read_to_string(tal_url).unwrap();
+    let body = match oneio::read_to_string(tal_url) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to fetch years listing {}: {}", tal_url, e);
+            return Vec::new();
+        }
+    };
     let years: Vec<String> = year_pattern
         .captures_iter(body.as_str())
         .map(|cap| cap[1].to_owned())
@@ -52,7 +58,13 @@ fn __crawl_years(tal_url: &str) -> Vec<String> {
 fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
     let month_day_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d)/</a>.*"#).unwrap();
 
-    let body = oneio::read_to_string(months_days_url).unwrap();
+    let body = match oneio::read_to_string(months_days_url) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to fetch months/days listing {}: {}", months_days_url, e);
+            return Vec::new();
+        }
+    };
     let months_days: Vec<String> = month_day_pattern
         .captures_iter(body.as_str())
         .map(|cap| cap[1].to_owned())

@@ -156,8 +156,8 @@ pub async fn start_api_service(
 
     let socket_str = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(socket_str).await?;
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, root_app).await.unwrap();
+    tracing::info!("listening on {}", listener.local_addr()?);
+    axum::serve(listener, root_app).await?;
 
     Ok(())
 }
