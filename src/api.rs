@@ -152,7 +152,13 @@ pub async fn start_api_service(
         .route("/health", get(health))
         .with_state(trie_lock)
         .layer(cors_layer);
-    let root_app = Router::new().nest(root.as_str(), app);
+    let root_app = if root == "/" {
+        // If root is "/", just use the app router directly
+        app
+    } else {
+        // Otherwise, nest under the specified path
+        Router::new().nest(root.as_str(), app)
+    };
 
     let socket_str = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(socket_str).await?;
