@@ -61,7 +61,10 @@ fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
     let body = match oneio::read_to_string(months_days_url) {
         Ok(b) => b,
         Err(e) => {
-            warn!("failed to fetch months/days listing {}: {}", months_days_url, e);
+            warn!(
+                "failed to fetch months/days listing {}: {}",
+                months_days_url, e
+            );
             return Vec::new();
         }
     };
