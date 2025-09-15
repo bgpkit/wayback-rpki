@@ -1,6 +1,6 @@
 [package]
 name = "wayback-rpki"
-version = "1.0.2"
+version = "1.0.3"
 authors = ["Mingwei Zhang <mingwei@bgpkit.com>"]
 edition = "2021"
 license = "MIT"
@@ -18,7 +18,7 @@ path = "src/bin/main.rs"
 [dependencies]
 
 anyhow = "1"
-oneio = { version = "0.19.0", default-features = false, features = ["https", "xz", "s3"] }
+oneio = { version = "0.19.0", default-features = false, features = ["https", "xz", "gz", "s3"] }
 chrono = "0.4.38"
 dotenvy = "0.15"
 indicatif = "0.18.0"

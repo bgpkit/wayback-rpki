@@ -413,6 +413,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -538,6 +547,16 @@ name = "find-msvc-tools"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fd99930f64d146689264c637b5af2f0233a933bef0d8570e2526bf9e083192d"
+
+[[package]]
+name = "flate2"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a3d7db9596fecd151c5f638c0ee5d5bd487b6e0ea232e5dc96d5250f6f94b1d"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+]
 
 [[package]]
 name = "fnv"
@@ -1265,6 +1284,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c12bd5bc5be5df8a4ccad484b589c9e5c7798026b7abcd4d02a6187535f4160"
 dependencies = [
  "dotenvy",
+ "flate2",
  "reqwest",
  "rust-s3",
  "suppaftp",
@@ -2443,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "wayback-rpki"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "axum",
