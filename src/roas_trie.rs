@@ -406,11 +406,19 @@ impl RoasTrie {
         max_len: Option<u8>,
         date: Option<NaiveDate>,
         current: Option<bool>,
+        exact: bool,
     ) -> Vec<RoasLookupEntry> {
         let mut entries = Vec::new();
 
-        // prefix filter
-        let iter = match prefix {
+        // prefix filter: exact match by default (fixes issue #9),
+        // falls back to matches() when exact=false for supernet/subnet inclusion
+        let iter: Vec<(IpNet, &HashMap<(u8, u32), RoasTrieEntry>)> = match prefix {
+            Some(prefix) if exact => {
+                match self.trie.exact_match(prefix) {
+                    Some(map) => vec![(prefix, map)],
+                    None => vec![],
+                }
+            }
             Some(prefix) => self.trie.matches(&prefix),
             None => self.trie.iter().collect(),
         };

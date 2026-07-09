@@ -35,6 +35,9 @@ pub struct RoasSearchQuery {
 
     /// number of items per page, maximum 1000
     page_size: Option<usize>,
+
+    /// if true (default), only return exact prefix matches; if false, include supernets and subnets
+    exact: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,6 +99,7 @@ async fn search(
         query.max_len,
         query.date.clone().map(|d| d.parse().unwrap()),
         query.current,
+        query.exact.unwrap_or(true),
     );
     results.sort_by(|a, b| a.prefix.cmp(&b.prefix));
     let result_entries = results

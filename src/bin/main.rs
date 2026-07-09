@@ -220,7 +220,7 @@ fn main() {
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
             let trie = RoasTrie::load(path.as_str()).unwrap();
             let results: Vec<RoasLookupEntryTabled> = trie
-                .search(prefix, asn, max_len, date, current)
+                .search(prefix, asn, max_len, date, current, true)
                 .into_iter()
                 .map(|entry| entry.into())
                 .collect();
