@@ -106,8 +106,10 @@ cargo test                                # Run all tests (some require network)
 - **`rust.yml`** — On PR to main: `cargo build` + `cargo clippy -- -D warnings`.
 - **`release.yml`** — On `v*` tag: GitHub release (from `CHANGELOG.md`), `cargo publish`,
   binary uploads for `aarch64-linux`, `x86_64-linux`, `universal-apple-darwin`.
-- **`docker.yml`** — On `v*` tag or push to main: builds `linux/amd64` + `linux/arm64`,
-  pushes to `bgpkit/wayback-rpki` on Docker Hub with semver tags + `latest`.
+- **`docker.yml`** — On `v*` tag: builds `linux/amd64` + `linux/arm64` natively (no
+  QEMU — uses `ubuntu-latest` and `ubuntu-24.04-arm` runners in a matrix), merges into
+  multi-arch manifests, pushes to `bgpkit/wayback-rpki` on Docker Hub with semver tags
+  + `latest`.
 
 ## Conventions
 
