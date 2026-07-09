@@ -86,6 +86,10 @@ enum Opts {
         /// filter results to whether ROA is still current
         #[clap(short, long)]
         current: Option<bool>,
+
+        /// only return exact prefix matches (default: true); set to false to include supernets and subnets
+        #[clap(short, long)]
+        exact: Option<bool>,
     },
     /// Serve the API
     Serve {
@@ -216,11 +220,12 @@ fn main() {
             max_len,
             date,
             current,
+            exact,
         } => {
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
             let trie = RoasTrie::load(path.as_str()).unwrap();
             let results: Vec<RoasLookupEntryTabled> = trie
-                .search(prefix, asn, max_len, date, current)
+                .search(prefix, asn, max_len, date, current, exact.unwrap_or(true))
                 .into_iter()
                 .map(|entry| entry.into())
                 .collect();
