@@ -9,6 +9,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tabled::Tabled;
 use tracing::info;
 
+/// Type alias for trie entries keyed by (max_len, origin).
+type RoasTrieMap = HashMap<(u8, u32), RoasTrieEntry>;
+
 const KNOWN_GAPS_STR: [(&str, &str); 25] = [
     ("2018-12-28", "2019-01-02"),
     ("2019-10-22", "2019-10-22"),
@@ -412,13 +415,11 @@ impl RoasTrie {
 
         // prefix filter: exact match by default (fixes issue #9),
         // falls back to matches() when exact=false for supernet/subnet inclusion
-        let iter: Vec<(IpNet, &HashMap<(u8, u32), RoasTrieEntry>)> = match prefix {
-            Some(prefix) if exact => {
-                match self.trie.exact_match(prefix) {
-                    Some(map) => vec![(prefix, map)],
-                    None => vec![],
-                }
-            }
+        let iter: Vec<(IpNet, &RoasTrieMap)> = match prefix {
+            Some(prefix) if exact => match self.trie.exact_match(prefix) {
+                Some(map) => vec![(prefix, map)],
+                None => vec![],
+            },
             Some(prefix) => self.trie.matches(&prefix),
             None => self.trie.iter().collect(),
         };
@@ -537,5 +538,85 @@ impl RoasTrie {
     pub fn replace(&mut self, other: RoasTrie) {
         self.trie = other.trie;
         self.latest_date = other.latest_date;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RoaEntry;
+    use chrono::NaiveDate;
+    use ipnet::IpNet;
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+
+    fn make_entry(prefix: &str, asn: u32, max_len: i32, date: NaiveDate) -> RoaEntry {
+        RoaEntry {
+            tal: "test".to_string(),
+            prefix: IpNet::from_str(prefix).unwrap(),
+            max_len,
+            asn,
+            date,
+        }
+    }
+
+    fn build_test_trie() -> RoasTrie {
+        let date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let entries = vec![
+            // supernet
+            make_entry("1.0.0.0/8", 64512, 8, date),
+            // exact prefix we will search for
+            make_entry("1.1.1.0/24", 13335, 24, date),
+            // subnet (more-specific)
+            make_entry("1.1.1.0/25", 64513, 25, date),
+        ];
+        let mut trie = RoasTrie::new();
+        trie.process_entries(&entries, true);
+        trie.compress_dates();
+        trie
+    }
+
+    #[test]
+    fn test_search_exact_returns_only_matching_prefix() {
+        let trie = build_test_trie();
+        let prefix = IpNet::V4(ipnet::Ipv4Net::new(Ipv4Addr::new(1, 1, 1, 0), 24).unwrap());
+
+        // exact=true should return only the /24 ROA
+        let results = trie.search(Some(prefix), None, None, None, None, true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].prefix.to_string(), "1.1.1.0/24");
+        assert_eq!(results[0].origin, 13335);
+    }
+
+    #[test]
+    fn test_search_non_exact_includes_super_and_sub() {
+        let trie = build_test_trie();
+        let prefix = IpNet::V4(ipnet::Ipv4Net::new(Ipv4Addr::new(1, 1, 1, 0), 24).unwrap());
+
+        // exact=false should use matches(), which includes the supernet and subnet
+        let results = trie.search(Some(prefix), None, None, None, None, false);
+        let prefixes: Vec<String> = results.iter().map(|r| r.prefix.to_string()).collect();
+        assert!(prefixes.contains(&"1.0.0.0/8".to_string()));
+        assert!(prefixes.contains(&"1.1.1.0/24".to_string()));
+        assert!(prefixes.contains(&"1.1.1.0/25".to_string()));
+    }
+
+    #[test]
+    fn test_search_exact_no_match_returns_empty() {
+        let trie = build_test_trie();
+        // prefix not in trie
+        let prefix = IpNet::V4(ipnet::Ipv4Net::new(Ipv4Addr::new(2, 2, 2, 0), 24).unwrap());
+
+        let results = trie.search(Some(prefix), None, None, None, None, true);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_no_prefix_returns_all() {
+        let trie = build_test_trie();
+
+        // No prefix filter → return all entries regardless of exact flag
+        let results = trie.search(None, None, None, None, None, true);
+        assert_eq!(results.len(), 3);
     }
 }

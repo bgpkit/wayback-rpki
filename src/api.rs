@@ -1,6 +1,6 @@
 use crate::RoasTrie;
 use axum::extract::{Query, State};
-use axum::http::Method;
+use axum::http::{Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -87,6 +87,31 @@ async fn search(
         page_size = 1000;
     }
 
+    // Parse prefix and date early so we can return a clean 400 instead of
+    // panicking (→ 500) on malformed input.
+    let prefix = match query.prefix.as_ref().map(|p| p.parse()) {
+        Some(Ok(p)) => Some(p),
+        Some(Err(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid prefix"})),
+            )
+                .into_response();
+        }
+        None => None,
+    };
+    let date = match query.date.as_ref().map(|d| d.parse()) {
+        Some(Ok(d)) => Some(d),
+        Some(Err(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid date"})),
+            )
+                .into_response();
+        }
+        None => None,
+    };
+
     let trie = state.read().await;
     let latest_ts = trie.latest_date;
     let latest_date = DateTime::from_timestamp(latest_ts, 0)
@@ -94,10 +119,10 @@ async fn search(
         .naive_utc()
         .date();
     let mut results = trie.search(
-        query.prefix.clone().map(|p| p.parse().unwrap()),
+        prefix,
         query.asn,
         query.max_len,
-        query.date.clone().map(|d| d.parse().unwrap()),
+        date,
         query.current,
         query.exact.unwrap_or(true),
     );

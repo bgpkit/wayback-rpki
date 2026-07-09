@@ -5,13 +5,9 @@ on:
     # On merge/push to main → tag as bgpkit/wayback-rpki:main
     branches:
       - main
-    paths:
-      - "Dockerfile"
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/docker.yml"
     # On new version tag → tag as bgpkit/wayback-rpki:{version} and bgpkit/wayback-rpki:latest
+    # NOTE: no `paths` filter — tag pushes must always trigger so release images
+    # are never silently skipped (the release.yml workflow runs in parallel).
     tags:
       - v[0-9]+.*
 
