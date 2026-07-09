@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## v1.0.5 - 2026-07-09
+
+### Highlights
+
+* Fix incorrect prefix search results: `/search?prefix=` now returns only exact prefix matches by default (issue #9)
+* Add Docker CI workflow for automatic multi-arch image publishing to Docker Hub on tag
+* Add input validation: malformed prefix or date query params now return `400` instead of `500`
+* Add `AGENTS.md` and expanded `README.md` with full API and library documentation
+
+### Bug Fixes
+
+* **Issue #9**: `search()` used `ipnet-trie`'s `matches()` which returns all children of the
+  shortest matching supernet, causing unrelated super- and sub-prefix ROAs to appear in
+  results. Now defaults to `exact_match()` with a new `exact` parameter (`?exact=false`
+  preserves the old inclusive behavior).
+* Return `400 Bad Request` with JSON error for malformed `prefix` or `date` query
+  parameters instead of panicking with a `500 Internal Server Error`.
+* Resolve `clippy::unnecessary_sort_by` and `clippy::type_complexity` lints for
+  compatibility with clippy 1.96+.
+
+### Features
+
+* Add `exact` query parameter to `/search` API (default `true`) and `--exact` CLI flag.
+* Add `.github/workflows/docker.yml`: builds `linux/amd64` + `linux/arm64` images and
+  pushes to `bgpkit/wayback-rpki` on Docker Hub on `v*` tags and `main` pushes.
+* Add 4 offline unit tests for `search()` exact vs non-exact behavior.
+* Update `Dockerfile` to Rust 1.90 and include `Cargo.lock` for reproducible builds.
+
 ## v1.0.4 - 2025-09-14
 
 - Update dependencies
