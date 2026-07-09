@@ -126,7 +126,7 @@ async fn search(
         query.current,
         query.exact.unwrap_or(true),
     );
-    results.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+    results.sort_by_key(|a| a.prefix);
     let result_entries = results
         .iter()
         .map(|entry| RoasSearchResultEntry {

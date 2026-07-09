@@ -521,7 +521,7 @@ impl RoasTrie {
         }
 
         // sort by date
-        all_files.sort_by(|a, b| a.file_date.cmp(&b.file_date));
+        all_files.sort_by_key(|a| a.file_date);
 
         for file in all_files {
             info!("processing {}", file.url.as_str());
