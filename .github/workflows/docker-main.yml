@@ -1,0 +1,40 @@
+name: Docker (main)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/docker-main.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      output: image
+      push: true
+      platforms: linux/amd64,linux/arm64
+      context: .
+      file: ./Dockerfile
+      cache: true
+      cache-mode: max
+      meta-images: bgpkit/wayback-rpki
+      meta-tags: |
+        type=ref,event=branch
+    secrets:
+      registry-auths: |
+        - registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
