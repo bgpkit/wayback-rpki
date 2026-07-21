@@ -1,25 +1,35 @@
-# select build image
-FROM rust:1.90 AS build
+# syntax=docker/dockerfile:1
+FROM rust:1.90 AS chef
+WORKDIR /app
+RUN cargo install cargo-chef --locked
 
-# create a new empty shell project
-RUN USER=root cargo new --bin my_project
-WORKDIR /my_project
+# ------------------------------------------------------------------------------
+# Planner: extract dependency recipe from Cargo.toml + Cargo.lock + source
+# structure. Does NOT compile.
+# ------------------------------------------------------------------------------
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# copy your source tree
-COPY ./src ./src
-COPY ./Cargo.toml .
-COPY ./Cargo.lock .
+# ------------------------------------------------------------------------------
+# Builder: compile dependencies from recipe, then the real application source.
+# The dependency-cook layer is only invalidated when the dependency tree changes.
+# ------------------------------------------------------------------------------
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo chef cook --release --recipe-path recipe.json
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release && \
+    cp /app/target/release/wayback-rpki /usr/local/bin/wayback-rpki
 
-# build for release
-RUN cargo build --release
-
-
-# our final base
+# ------------------------------------------------------------------------------
+# Runtime image
+# ------------------------------------------------------------------------------
 FROM debian:bookworm-slim
-
-# copy the build artifact from the build stage
-COPY --from=build /my_project/target/release/wayback-rpki /usr/local/bin/wayback-rpki
+COPY --from=builder /usr/local/bin/wayback-rpki /usr/local/bin/wayback-rpki
 
 WORKDIR /wayback-rpki
 
-ENTRYPOINT bash -c '/usr/local/bin/wayback-rpki serve --bootstrap --host 0.0.0.0 --port 40065'
+ENTRYPOINT ["/usr/local/bin/wayback-rpki", "serve", "--bootstrap", "--host", "0.0.0.0", "--port", "40065"]
