@@ -253,7 +253,7 @@ impl RoasTrie {
             }
 
             for (_prefix, map) in self.trie.iter_mut() {
-                for (_key, entry) in map.iter_mut() {
+                for entry in map.values_mut() {
                     let mut should_compress = false;
                     for i in 0..entry.dates_compressed.len() - 1 {
                         // let (start, end) = entry.dates_compressed[i];
@@ -276,7 +276,7 @@ impl RoasTrie {
     fn update_latest_date(&mut self) {
         let mut latest_date = 0;
         for (_prefix, map) in self.trie.iter() {
-            for (_key, entry) in map.iter() {
+            for entry in map.values() {
                 if let Some(date) = entry.dates.iter().max() {
                     if *date > latest_date {
                         latest_date = *date;
@@ -348,7 +348,7 @@ impl RoasTrie {
     pub fn compress_dates(&mut self) {
         info!("compressing dates into date ranges...");
         for (_prefix, map) in self.trie.iter_mut() {
-            for (_key, entry) in map.iter_mut() {
+            for entry in map.values_mut() {
                 entry.full_compress();
             }
         }
