@@ -1,11 +1,33 @@
-# flyctl launch added from .idea/.gitignore
-# Default ignored files
-.idea/shelf
-.idea/workspace.xml
-# Editor-based HTTP Client requests
-.idea/httpRequests
-# Datasource local storage ignored files
-.idea/dataSources
-.idea/dataSources.local.xml
+# Build artifacts
+target/
+debug/
+release/
 
-target
+# Git
+.git/
+.gitignore
+.github/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Documentation (not needed for build)
+CHANGELOG.md
+README.md
+
+# Docker files (prevent recursive issues)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Misc
+*.log
+*.bak
+*.tmp
+.env
+.env.*
