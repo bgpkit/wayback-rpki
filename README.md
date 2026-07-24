@@ -279,7 +279,9 @@ files are transport/backup artifacts only and are decompressed before serving.
 During the v2 transition, `.bin`/`.bin.gz` paths retain the legacy in-memory
 backend. A missing `roas_trie.rkyv` is automatically generated from a sibling
 `roas_trie.bin.gz` or `roas_trie.bin` **before any bootstrap download is
-attempted**, without prompting. Explicit conversion is also available as
+attempted**, without prompting. If neither exists and the remote `.rkyv.gz`
+bootstrap is unavailable, bootstrap downloads the remote `.bin.gz` and converts
+it locally. Explicit conversion is also available as
 `wayback-rpki roas_trie.bin.gz convert --from roas_trie.bin.gz roas_trie.rkyv`.
 
 | `compress_dates()` | Merge consecutive dates into ranges |

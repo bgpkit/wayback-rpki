@@ -535,6 +535,8 @@ fn backup_archive(source: &str, destination: &str) -> anyhow::Result<()> {
 /// For a missing `.rkyv`, a local sibling legacy archive is always preferred:
 /// `roas_trie.bin.gz`/`.bin` is converted before attempting network bootstrap.
 fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
+    const LEGACY_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.bin.gz";
+
     if Path::new(path).exists() {
         return;
     }
@@ -556,12 +558,34 @@ fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
 
     if is_rkyv_path(path) {
         info!(
-            "no local legacy archive found; downloading compressed bootstrap {} and streaming it to raw mmap archive {}",
-            REMOTE_BOOTSTRAP_URL, path
+            "no local legacy archive found; attempting compressed rkyv bootstrap {}",
+            REMOTE_BOOTSTRAP_URL
         );
-        download_rkyv_transport(REMOTE_BOOTSTRAP_URL, path).unwrap();
+        if let Err(rkyv_error) = download_rkyv_transport(REMOTE_BOOTSTRAP_URL, path) {
+            // During the transition the v1 archive remains the durable remote
+            // bootstrap source. Download it beside the requested rkyv path, then
+            // reuse the normal conversion path to create the mmap-ready archive.
+            let legacy_path = format!("{}.bin.gz", path.strip_suffix(".rkyv").unwrap_or(path));
+            warn!(
+                "rkyv bootstrap {} failed: {}; falling back to legacy bootstrap {}",
+                REMOTE_BOOTSTRAP_URL, rkyv_error, LEGACY_BOOTSTRAP_URL
+            );
+            if let Err(legacy_error) = oneio::download(LEGACY_BOOTSTRAP_URL, &legacy_path) {
+                error!(
+                    "legacy bootstrap {} also failed: {}",
+                    LEGACY_BOOTSTRAP_URL, legacy_error
+                );
+                exit(1);
+            }
+            if let Err(convert_error) = auto_convert(&legacy_path, path) {
+                error!(
+                    "failed to convert downloaded legacy bootstrap {}: {}",
+                    legacy_path, convert_error
+                );
+                exit(1);
+            }
+        }
     } else {
-        const LEGACY_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.bin.gz";
         info!(
             "downloading legacy bootstrap file {} to {}",
             LEGACY_BOOTSTRAP_URL, path
