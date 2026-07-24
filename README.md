@@ -220,12 +220,12 @@ use wayback_rpki::{crawl_tal_after, parse_roas_csv, get_tal_urls, RoaEntry, RoaF
 ### Trie Storage (`roas_trie.rs`)
 
 ```rust
-use wayback_rpki::RoasTrie;
+use wayback_rpki::{RoasTrie, RoasTrieMut};
 use ipnet::IpNet;
 use chrono::NaiveDate;
 
-// Load a pre-built trie
-let trie = RoasTrie::load("roas_trie.bin.gz")?;
+// Open a pre-built trie (memory-mapped, zero-copy)
+let trie = RoasTrie::open("roas_trie.rkyv")?;
 
 // Search with filters (exact=true by default)
 let results = trie.search(
@@ -251,22 +251,29 @@ let date_ts = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
 let validation = trie.validate(&"1.1.1.0/24".parse().unwrap(), 13335, date_ts);
 // → RpkiValidation::Valid
 
-// Save the trie
-trie.dump("roas_trie.bin.gz")?;
+// Build / update (mutable builder), then serialize
+let mut builder = RoasTrieMut::new();
+builder.process_entries(&entries, true)?;
+builder.dump("roas_trie.rkyv")?;
 ```
 
-#### Key `RoasTrie` Methods
+#### Key Types
 
-| Method | Description |
-|--------|-------------|
-| `new()` | Create an empty trie |
-| `load(path)` | Load from a `.bin.gz` file |
-| `dump(path)` | Save to a `.bin.gz` file |
-| `process_entries(entries, bootstrap)` | Insert ROA entries |
-| `search(prefix, origin, max_len, date, current, exact)` | Query with filters |
-| `lookup_prefix(prefix)` | Get all ROAs for a prefix (includes super/subnets) |
-| `validate(prefix, origin, date_ts)` | RPKI validation → `Valid` / `Invalid` / `Unknown` |
-| `update(tal, until)` | Incremental update from RIPE |
+| Type | Role |
+|------|------|
+| `RoasTrie` | Read-only query handle over an rkyv archive (mmap or in-memory) |
+| `RoasTrieMut` | Mutable builder: `new`, `load_mut`, `process_entries`, `update`, `dump` |
+| `RoasTrie::open(path)` | Memory-map an archive (near-zero heap usage) |
+| `RoasTrieMut::load_mut(path)` | Load for mutation (update / fix flows) |
+| `RoasTrie::search(...)` | Query with filters |
+| `RoasTrie::lookup_prefix(prefix)` | All ROAs covering a prefix (super + subnets) |
+| `RoasTrie::validate(...)` | RPKI validation → `Valid` / `Invalid` / `Unknown` |
+
+The on-disk format is a raw `rkyv` archive (`RoasTrieData` with header metadata
+and a `JointPrefixMap`). v1 `roas_trie.bin.gz` archives can be converted with
+`wayback-rpki convert --from roas_trie.bin.gz roas_trie.rkyv` (requires the
+`legacy` cargo feature).
+
 | `compress_dates()` | Merge consecutive dates into ranges |
 | `fill_gaps()` | Fill known historical data gaps |
 

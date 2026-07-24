@@ -1,17 +1,20 @@
-use crate::RoasTrie;
+use crate::{RoasTrie, RpkiValidation};
 use axum::extract::{Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::DateTime;
+use chrono::{DateTime, NaiveDate};
 use clap::Args;
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
+
+pub type SharedTrie = Arc<RwLock<RoasTrie>>;
 
 #[derive(Args, Debug, Serialize, Deserialize)]
 pub struct RoasSearchQuery {
@@ -42,7 +45,9 @@ pub struct RoasSearchQuery {
 
 #[derive(Serialize, Deserialize)]
 pub struct RoasSearchResult {
-    pub count: usize,
+    /// total number of matching entries (before pagination)
+    pub total: usize,
+    /// error message if any
     pub error: Option<String>,
     pub data: Vec<RoasSearchResultEntry>,
     pub meta: Option<Meta>,
@@ -53,6 +58,7 @@ pub struct RoasSearchResult {
 #[derive(Serialize, Deserialize)]
 pub struct Meta {
     pub latest_date: String,
+    pub format_version: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,21 +70,49 @@ pub struct RoasSearchResultEntry {
     pub current: bool,
 }
 
-async fn health(State(state): State<Arc<RwLock<RoasTrie>>>) -> impl IntoResponse {
+#[derive(Args, Debug, Serialize, Deserialize)]
+pub struct ValidateQuery {
+    /// IP prefix to validate, e.g. `?prefix=1.1.1.0/24` (required)
+    prefix: String,
+
+    /// origin ASN to validate (required)
+    asn: u32,
+
+    /// date for historical validation, format: YYYY-MM-DD (default: latest)
+    date: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ValidateResult {
+    pub prefix: String,
+    pub asn: u32,
+    pub date: String,
+    pub result: String,
+}
+
+fn bad_request(msg: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": msg})),
+    )
+        .into_response()
+}
+
+async fn health(State(state): State<SharedTrie>) -> impl IntoResponse {
     let trie = state.read().await;
-    let (ipv4_count, ipv6_count) = trie.trie.len();
-    let latest_ts = trie.latest_date;
+    let (ipv4_count, ipv6_count) = trie.counts();
     Json(json! ({
         "ipv4_roas_count": ipv4_count,
         "ipv6_roas_count": ipv6_count,
-        "latest_date": DateTime::from_timestamp(latest_ts, 0).unwrap().naive_utc().date().to_string(),
+        "latest_date": trie.get_latest_date().to_string(),
+        "format_version": crate::FORMAT_VERSION,
     }))
     .into_response()
 }
 
 async fn search(
     query: Query<RoasSearchQuery>,
-    State(state): State<Arc<RwLock<RoasTrie>>>,
+    State(state): State<SharedTrie>,
 ) -> impl IntoResponse {
     let page = query.page.unwrap_or(0);
     let mut page_size = query.page_size.unwrap_or(100);
@@ -89,36 +123,25 @@ async fn search(
 
     // Parse prefix and date early so we can return a clean 400 instead of
     // panicking (→ 500) on malformed input.
-    let prefix = match query.prefix.as_ref().map(|p| p.parse()) {
+    let prefix: Option<IpNet> = match query.prefix.as_ref().map(|p| p.parse()) {
         Some(Ok(p)) => Some(p),
-        Some(Err(_)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid prefix"})),
-            )
-                .into_response();
-        }
+        Some(Err(_)) => return bad_request("invalid prefix"),
         None => None,
     };
-    let date = match query.date.as_ref().map(|d| d.parse()) {
+    let date: Option<NaiveDate> = match query.date.as_ref().map(|d| d.parse()) {
         Some(Ok(d)) => Some(d),
-        Some(Err(_)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid date"})),
-            )
-                .into_response();
-        }
+        Some(Err(_)) => return bad_request("invalid date"),
         None => None,
     };
 
     let trie = state.read().await;
-    let latest_ts = trie.latest_date;
+    let latest_ts = trie.latest_date_ts();
     let latest_date = DateTime::from_timestamp(latest_ts, 0)
         .unwrap()
         .naive_utc()
         .date();
-    let mut results = trie.search(
+
+    let results = trie.search(
         prefix,
         query.asn,
         query.max_len,
@@ -126,9 +149,15 @@ async fn search(
         query.current,
         query.exact.unwrap_or(true),
     );
-    results.sort_by_key(|a| a.prefix);
+
+    let total = results.len();
+
+    // Results come back in deterministic trie (lexicographic prefix) order;
+    // paginate without an additional full sort.
     let result_entries = results
         .iter()
+        .skip(page * page_size)
+        .take(page_size)
         .map(|entry| RoasSearchResultEntry {
             prefix: entry.prefix.to_string(),
             max_len: entry.max_len,
@@ -144,19 +173,13 @@ async fn search(
         })
         .collect::<Vec<_>>();
 
-    // filter result entries by page and page_size
-    let result_entries = result_entries
-        .into_iter()
-        .skip(page * page_size)
-        .take(page_size)
-        .collect::<Vec<_>>();
-
     Json(RoasSearchResult {
-        count: result_entries.len(),
+        total,
         error: None,
         data: result_entries,
         meta: Some(Meta {
             latest_date: latest_date.to_string(),
+            format_version: crate::FORMAT_VERSION,
         }),
         page,
         page_size,
@@ -164,8 +187,45 @@ async fn search(
     .into_response()
 }
 
+async fn validate(
+    query: Query<ValidateQuery>,
+    State(state): State<SharedTrie>,
+) -> impl IntoResponse {
+    let prefix: IpNet = match query.prefix.parse() {
+        Ok(p) => p,
+        Err(_) => return bad_request("invalid prefix"),
+    };
+    let trie = state.read().await;
+    let latest_ts = trie.latest_date_ts();
+    let latest_date = DateTime::from_timestamp(latest_ts, 0)
+        .unwrap()
+        .naive_utc()
+        .date();
+    let date: NaiveDate = match query.date.as_ref().map(|d| d.parse()) {
+        Some(Ok(d)) => d,
+        Some(Err(_)) => return bad_request("invalid date"),
+        None => latest_date,
+    };
+    let date_ts = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+
+    let result = trie.validate(&prefix, query.asn, date_ts);
+    let result_str = match result {
+        RpkiValidation::Valid => "valid",
+        RpkiValidation::Invalid => "invalid",
+        RpkiValidation::Unknown => "unknown",
+    };
+
+    Json(ValidateResult {
+        prefix: prefix.to_string(),
+        asn: query.asn,
+        date: date.to_string(),
+        result: result_str.to_string(),
+    })
+    .into_response()
+}
+
 pub async fn start_api_service(
-    trie_lock: Arc<RwLock<RoasTrie>>,
+    trie_lock: SharedTrie,
     host: String,
     port: u16,
     root: String,
@@ -178,6 +238,7 @@ pub async fn start_api_service(
 
     let app = Router::new()
         .route("/search", get(search))
+        .route("/validate", get(validate))
         .route("/health", get(health))
         .with_state(trie_lock)
         .layer(cors_layer);

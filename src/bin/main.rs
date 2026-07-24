@@ -8,17 +8,16 @@ use std::sync::Arc;
 use std::thread;
 use tabled::settings::Style;
 use tabled::Table;
-use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, Level};
+use tracing::{debug, error, info, warn, Level};
 use wayback_rpki::*;
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 #[clap(name = "wayback-rpki")]
 struct Cli {
-    /// file path to dump the trie.
-    #[clap(default_value = "roas_trie.bin.gz", global = true)]
+    /// file path to the trie archive (v2 rkyv format).
+    #[clap(default_value = "roas_trie.rkyv", global = true)]
     path: String,
 
     /// download bootstrap file to help get started quickly
@@ -91,6 +90,13 @@ enum Opts {
         #[clap(short, long)]
         exact: Option<bool>,
     },
+    /// Convert a legacy v1 (bincode + ipnet-trie) archive to the v2 rkyv format
+    #[cfg(feature = "legacy")]
+    Convert {
+        /// path to the legacy v1 archive (e.g. roas_trie.bin.gz)
+        #[clap(short, long)]
+        from: String,
+    },
     /// Serve the API
     Serve {
         /// Additional path to backup the trie
@@ -102,7 +108,17 @@ enum Opts {
 
         #[clap(short, long, default_value = "40065")]
         port: u16,
+
+        /// update interval in seconds between data refreshes (default: 8 hours)
+        #[clap(short, long, default_value = "28800")]
+        update_interval: u64,
     },
+}
+
+fn num_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 fn main() {
@@ -132,7 +148,6 @@ fn main() {
 
     let path = opts.path;
 
-    // check db url
     match opts.subcommands {
         Opts::Rebuild {
             tal,
@@ -140,14 +155,12 @@ fn main() {
             from,
             until,
         } => {
-            let chunks = chunks_opt.unwrap_or(num_cpus::get());
+            let chunks = chunks_opt.unwrap_or_else(num_threads);
             let all_files = get_tal_urls(tal)
                 .into_iter()
                 .flat_map(|tal_url| crawl_tal_after(tal_url.as_str(), from, until))
                 .collect::<Vec<RoaFile>>();
 
-            // conn.insert_roa_files(&all_files);
-            // let all_files = conn.get_all_files(tal.as_str(), false, latest);
             info!("total of {} roa files to process", all_files.len());
 
             let (sender_pb, receiver_pb) = std::sync::mpsc::sync_channel::<(String, i32)>(20);
@@ -167,10 +180,8 @@ fn main() {
 
             // dedicated thread for showing progress of the parsing
             thread::spawn(move || {
-                // let mut conn = DbConnection::new();
                 let mut writer = oneio::get_writer("wayback-rpki.bootstrap.log").unwrap();
                 for (url, _count) in receiver_pb.iter() {
-                    // conn.mark_file_as_processed(url.as_str(), true, count);
                     writeln!(writer, "{}", url).unwrap();
                     pb.set_message(url);
                     pb.inc(1);
@@ -179,12 +190,16 @@ fn main() {
 
             // dedicated writer thread
             let handle = thread::spawn(move || {
-                let mut trie = RoasTrie::new();
+                let mut trie = RoasTrieMut::new();
                 for entries in receiver_entries.iter() {
                     trie.process_entries(&entries, true);
                 }
-                trie.compress_dates();
                 trie.dump(path.as_str()).unwrap();
+                info!(
+                    "bootstrap finished: {} prefixes written to {}",
+                    trie.len(),
+                    path
+                );
             });
 
             all_files.par_chunks(chunks).for_each_with(
@@ -192,24 +207,27 @@ fn main() {
                 |(s_pb, s_entries), files| {
                     for file in files {
                         let url: &str = file.url.as_str();
-                        // info!("processing {}", url);
-                        if let Ok(roas) = parse_roas_csv(url) {
-                            let count = roas.len() as i32;
-                            s_entries.send(roas).unwrap();
-                            s_pb.send((url.to_owned(), count)).unwrap();
+                        match parse_roas_csv(url) {
+                            Ok(roas) => {
+                                let count = roas.len() as i32;
+                                s_entries.send(roas).unwrap();
+                                s_pb.send((url.to_owned(), count)).unwrap();
+                            }
+                            Err(e) => {
+                                warn!("failed to parse {}: {}", url, e);
+                                s_pb.send((url.to_owned(), 0)).unwrap();
+                            }
                         }
                     }
                 },
             );
 
             handle.join().unwrap();
-
-            info!("bootstrap finished");
         }
 
         Opts::Update { tal, until } => {
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
-            let mut trie = RoasTrie::load(path.as_str()).unwrap();
+            let mut trie = RoasTrieMut::load(path.as_str()).unwrap();
             trie.update(tal, until).unwrap();
             trie.dump(path.as_str()).unwrap();
         }
@@ -223,7 +241,7 @@ fn main() {
             exact,
         } => {
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
-            let trie = RoasTrie::load(path.as_str()).unwrap();
+            let trie = RoasTrie::open(path.as_str()).unwrap();
             let results: Vec<RoasLookupEntryTabled> = trie
                 .search(prefix, asn, max_len, date, current, exact.unwrap_or(true))
                 .into_iter()
@@ -234,15 +252,23 @@ fn main() {
 
         Opts::Fix {} => {
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
-            let mut trie = RoasTrie::load(path.as_str()).unwrap();
+            let mut trie = RoasTrieMut::load(path.as_str()).unwrap();
             trie.fill_gaps();
             trie.dump(path.as_str()).unwrap();
+        }
+
+        #[cfg(feature = "legacy")]
+        Opts::Convert { from } => {
+            let mut trie = wayback_rpki::legacy::load_legacy(&from).unwrap();
+            trie.dump(path.as_str()).unwrap();
+            info!("converted legacy archive {} -> {}", from, path);
         }
 
         Opts::Serve {
             backup_to,
             host,
             port,
+            update_interval,
         } => {
             let mut backup_destinations = vec![backup_to];
             if let Ok(p) = std::env::var("WAYBACK_BACKUP_TO") {
@@ -260,11 +286,9 @@ fn main() {
             }
 
             check_bootstrap_and_download(path.as_str(), opts.bootstrap);
-            let trie = RoasTrie::load(path.as_str()).unwrap();
+            let trie = RoasTrie::open(path.as_str()).unwrap();
             let trie_lock = Arc::new(RwLock::new(trie));
             let timer_lock = trie_lock.clone();
-
-            let update_interval = 60 * 60 * 8;
 
             thread::spawn(move || {
                 let rt = get_tokio_runtime();
@@ -274,28 +298,31 @@ fn main() {
                     loop {
                         interval.tick().await;
 
-                        info!("creating a backup trie...");
-                        // updating from the latest data available
-                        let read_lock = timer_lock.read().await;
-                        let mut backup = read_lock.clone();
-                        drop(read_lock);
+                        info!("updating trie from latest data...");
+                        // Load the current archive into a mutable trie, update, and
+                        // write back atomically. The serving trie itself stays
+                        // memory-mapped; only the updater materializes data.
+                        let mut backup = match RoasTrieMut::load(path.as_str()) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                error!("failed to load trie for update: {}", e);
+                                continue;
+                            }
+                        };
                         if let Err(e) = backup.update(None, None) {
-                            error!("backup update failed: {}", e);
+                            error!("trie update failed: {}", e);
                             continue;
                         }
-
-                        info!("writing updated trie to disk...");
-                        match backup.dump(&path) {
-                            Ok(_) => {
-                                info!("backup trie written to disk: {}", path);
-                            }
-                            Err(e) => error!("failed to write backup trie to disk: {}", e),
+                        if let Err(e) = backup.dump(path.as_str()) {
+                            error!("failed to write updated trie to disk: {}", e);
+                            continue;
                         }
+                        info!("updated trie written to disk: {}", path);
 
                         let mut to_send_heartbeat = false;
                         for backup_to in &backup_destinations {
                             if let Some(backup_to) = backup_to.as_ref() {
-                                info!("writing additional backup trie to disk at {}...", backup_to);
+                                info!("writing additional backup trie to {}...", backup_to);
                                 match oneio::s3_url_parse(backup_to) {
                                     Ok((bucket, key)) => {
                                         if oneio::s3_env_check().is_err() {
@@ -306,22 +333,21 @@ fn main() {
                                                     info!("backup trie written to s3: {}", backup_to);
                                                     to_send_heartbeat = true;
                                                 }
-                                                Err(_) => {
-                                                    error!("failed to write backup trie to s3: {}", backup_to);
+                                                Err(e) => {
+                                                    error!("failed to write backup trie to s3 {}: {}", backup_to, e);
                                                 }
                                             }
                                         }
                                     }
                                     Err(_) => {
-                                        // not a s3 url, copy the current trie to the specified path
-                                        // make file system copy of the trie file at path
+                                        // not an s3 url: make a file system copy
                                         match std::fs::copy(&path, backup_to) {
                                             Ok(_) => {
                                                 info!("backup trie written to disk: {}", backup_to);
                                                 to_send_heartbeat = true;
                                             }
                                             Err(e) => {
-                                                error!("failed to write backup trie to disk: {}", e)
+                                                error!("failed to write backup trie to disk {}: {}", backup_to, e)
                                             }
                                         }
                                     }
@@ -332,16 +358,25 @@ fn main() {
                         if to_send_heartbeat {
                             if let Some(backup_heartbeat_url) = backup_heartbeat_url.as_ref() {
                                 info!("sending heartbeat to {}", backup_heartbeat_url);
-                                if let Err(e) = reqwest::blocking::get(backup_heartbeat_url) {
+                                if let Err(e) = oneio::read_to_string_lossy(backup_heartbeat_url) {
                                     error!("failed to send heartbeat: {}", e);
                                 }
                             }
                         }
 
-                        info!("replacing backup trie with the original trie...");
-                        let mut write_lock = timer_lock.write().await;
-                        write_lock.replace(backup);
-                        drop(write_lock);
+                        // Swap in the updated archive: re-map the file and replace.
+                        info!("swapping serving trie to updated archive...");
+                        match RoasTrie::open(path.as_str()) {
+                            Ok(new_trie) => {
+                                let mut write_lock = timer_lock.write().await;
+                                *write_lock = new_trie;
+                                drop(write_lock);
+                                info!("serving trie swapped");
+                            }
+                            Err(e) => {
+                                error!("failed to re-open updated trie: {}", e);
+                            }
+                        }
 
                         info!("wait for {} seconds before next update", update_interval);
                     }
@@ -349,7 +384,7 @@ fn main() {
             });
 
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_cpus::get())
+                .worker_threads(num_threads())
                 .enable_all()
                 .build()
                 .unwrap()
@@ -359,16 +394,16 @@ fn main() {
     }
 }
 
-fn get_tokio_runtime() -> Runtime {
-    let blocking_cpus = num_cpus::get();
+use std::io::Write;
 
+fn get_tokio_runtime() -> tokio::runtime::Runtime {
+    let blocking_cpus = num_threads();
     debug!("using {} cores for parsing html pages", blocking_cpus);
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(blocking_cpus)
         .build()
-        .unwrap();
-    rt
+        .unwrap()
 }
 
 /// Check if data file exists, and bootstrap if necessary
@@ -377,12 +412,11 @@ fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
         // if file at `path` does not exist
         if bootstrap {
             // download bootstrap file
-            let remote_bootstrap_file = "https://spaces.bgpkit.org/broker/roas_trie.bin.gz";
             info!(
                 "downloading bootstrap file {} to {}",
-                remote_bootstrap_file, path
+                REMOTE_BOOTSTRAP_URL, path
             );
-            oneio::download(remote_bootstrap_file, path, None).unwrap();
+            oneio::download(REMOTE_BOOTSTRAP_URL, path).unwrap();
         }
     }
 }

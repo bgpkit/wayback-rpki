@@ -1,10 +1,9 @@
 #![allow(clippy::nonminimal_bool)]
 
-// pub mod roas_table;
 mod api;
+#[cfg(feature = "legacy")]
+pub mod legacy;
 mod roas_trie;
-
-// pub use crate::roas_table::*;
 
 use anyhow::{anyhow, Result};
 use chrono::{Datelike, NaiveDate};
@@ -40,7 +39,7 @@ fn __crawl_years(tal_url: &str) -> Vec<String> {
     let year_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d\d\d)/</a>.*"#).unwrap();
 
     // get all years
-    let body = match oneio::read_to_string(tal_url) {
+    let body = match oneio::read_to_string_lossy(tal_url) {
         Ok(b) => b,
         Err(e) => {
             warn!("failed to fetch years listing {}: {}", tal_url, e);
@@ -58,7 +57,7 @@ fn __crawl_years(tal_url: &str) -> Vec<String> {
 fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
     let month_day_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d)/</a>.*"#).unwrap();
 
-    let body = match oneio::read_to_string(months_days_url) {
+    let body = match oneio::read_to_string_lossy(months_days_url) {
         Ok(b) => b,
         Err(e) => {
             warn!(
@@ -191,7 +190,7 @@ pub fn parse_roas_csv(csv_url: &str) -> Result<Vec<RoaEntry>> {
 
     let mut file_ok = false;
 
-    for line in oneio::read_lines(csv_url)? {
+    for line in oneio::read_lines_lossy(csv_url)? {
         let line = line.unwrap();
 
         if line.starts_with("URI") {

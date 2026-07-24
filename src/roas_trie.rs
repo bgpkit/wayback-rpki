@@ -1,18 +1,22 @@
 use crate::{crawl_tal_after, get_tal_urls, parse_roas_csv, RoaEntry, RoaFile};
-use anyhow::Result;
-use bincode::{Decode, Encode};
+use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
 use ipnet::IpNet;
-use ipnet_trie::IpnetTrie;
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use prefix_trie::joint::JointPrefixMap;
+use prefix_trie::{AsView, TrieView};
+use rkyv::{Archive, Deserialize, Serialize};
+use std::collections::HashSet;
+use std::io::Read;
 use tabled::Tabled;
-use tracing::info;
+use tracing::{info, warn};
 
-/// Type alias for trie entries keyed by (max_len, origin).
-type RoasTrieMap = HashMap<(u8, u32), RoasTrieEntry>;
+/// On-disk format version. v2: rkyv archive of [`RoasTrieData`].
+pub const FORMAT_VERSION: u32 = 2;
 
-const KNOWN_GAPS_STR: [(&str, &str); 25] = [
+/// Default remote bootstrap archive URL (v2 rkyv format).
+pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.rkyv";
+
+const KNOWN_GAPS_STR: [(&str, &str); 24] = [
     ("2018-12-28", "2019-01-02"),
     ("2019-10-22", "2019-10-22"),
     ("2019-11-24", "2019-11-24"),
@@ -37,25 +41,125 @@ const KNOWN_GAPS_STR: [(&str, &str); 25] = [
     ("2022-02-16", "2022-02-16"),
     ("2023-06-24", "2023-06-24"),
     ("2023-07-14", "2023-07-17"),
-    ("2023-06-24", "2023-06-24"),
 ];
 
-#[derive(Clone)]
-pub struct RoasTrie {
-    pub trie: IpnetTrie<HashMap<(u8, u32), RoasTrieEntry>>,
-    pub latest_date: i64,
+const ONE_DAY_SECONDS: i64 = 86400;
+
+/// A single ROA record in the serialized archive: one (max_len, origin) pair
+/// with its compressed date ranges.
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub struct RoaRecord {
+    /// ROA max length
+    pub max_len: u8,
+    /// ROA origin ASN
+    pub origin: u32,
+    /// Compressed date ranges, each tuple is (start_ts, end_ts), UTC day granularity.
+    pub dates: Vec<(i64, i64)>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Encode, Decode)]
-pub struct RoasTrieEntry {
-    /// ROA max length
-    max_len: u8,
-    /// Prefix origin
-    origin: u32,
-    /// Uncompressed dates stored in HashSet
-    dates: HashSet<i64>,
-    /// Compressed dates stored in VecDeque, each tuple represents a date range
-    dates_compressed: VecDeque<(i64, i64)>,
+/// Mutable per-ROA record used while building or updating the trie.
+#[derive(Debug, Clone)]
+pub struct RoaRecordMut {
+    pub max_len: u8,
+    pub origin: u32,
+    /// Uncompressed dates collected during bootstrap.
+    #[cfg_attr(feature = "legacy", allow(dead_code))]
+    pub(crate) dates: HashSet<i64>,
+    /// Compressed date ranges.
+    pub(crate) ranges: Vec<(i64, i64)>,
+}
+
+impl RoaRecordMut {
+    /// Create an empty record for legacy import.
+    #[cfg(feature = "legacy")]
+    pub(crate) fn new_legacy(max_len: u8, origin: u32) -> Self {
+        RoaRecordMut {
+            max_len,
+            origin,
+            dates: HashSet::new(),
+            ranges: Vec::new(),
+        }
+    }
+
+    fn new(date_ts: i64, max_len: u8, origin: u32, bootstrap: bool) -> Self {
+        if bootstrap {
+            RoaRecordMut {
+                max_len,
+                origin,
+                dates: HashSet::from([date_ts]),
+                ranges: Vec::new(),
+            }
+        } else {
+            RoaRecordMut {
+                max_len,
+                origin,
+                dates: HashSet::new(),
+                ranges: vec![(date_ts, date_ts)],
+            }
+        }
+    }
+
+    fn push_date(&mut self, date_ts: i64, bootstrap: bool) {
+        if bootstrap {
+            self.dates.insert(date_ts);
+            return;
+        }
+        match self.ranges.last_mut() {
+            None => self.ranges.push((date_ts, date_ts)),
+            Some((_, end)) => {
+                let next_day_ts = *end + ONE_DAY_SECONDS;
+                if date_ts == next_day_ts {
+                    *end = date_ts;
+                } else if date_ts > next_day_ts {
+                    self.ranges.push((date_ts, date_ts));
+                }
+                // date_ts <= end: already covered, skip
+            }
+        }
+    }
+
+    /// Merge `dates` into `ranges`, producing the final compressed ranges.
+    fn full_compress(&mut self) {
+        let mut all: Vec<i64> = self.dates.iter().copied().collect();
+        self.dates.clear();
+        for (start, end) in self.ranges.iter() {
+            let mut d = *start;
+            while d <= *end {
+                all.push(d);
+                d += ONE_DAY_SECONDS;
+            }
+        }
+        all.sort_unstable();
+
+        let mut compressed: Vec<(i64, i64)> = Vec::new();
+        if all.is_empty() {
+            self.ranges = compressed;
+            return;
+        }
+        let mut start = all[0];
+        let mut end = all[0];
+        for d in all.iter().skip(1) {
+            if *d == end + ONE_DAY_SECONDS {
+                end = *d;
+            } else {
+                compressed.push((start, end));
+                start = *d;
+                end = *d;
+            }
+        }
+        compressed.push((start, end));
+        self.ranges = compressed;
+    }
+}
+
+/// The serialized archive: header metadata plus the prefix trie.
+#[derive(Archive, Serialize, Deserialize)]
+pub struct RoasTrieData {
+    pub format_version: u32,
+    pub latest_date: i64,
+    pub ipv4_count: u64,
+    pub ipv6_count: u64,
+    pub trie: JointPrefixMap<IpNet, Vec<RoaRecord>>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,102 +194,6 @@ impl From<RoasLookupEntry> for RoasLookupEntryTabled {
     }
 }
 
-impl RoasTrieEntry {
-    pub fn new(date_ts: i64, max_len: u8, origin: u32, bootstrap: bool) -> RoasTrieEntry {
-        match bootstrap {
-            true => RoasTrieEntry {
-                max_len,
-                origin,
-                dates: HashSet::from([date_ts]),
-                dates_compressed: VecDeque::new(),
-            },
-
-            false => RoasTrieEntry {
-                max_len,
-                origin,
-                dates: HashSet::new(),
-                dates_compressed: VecDeque::from([(date_ts, date_ts)]),
-            },
-        }
-    }
-
-    /// Do full compression where we explode the dates_compressed into individual dates and
-    /// then compress them again with the new dates
-    pub fn full_compress(&mut self) {
-        let mut dates = self.dates.iter().copied().collect::<Vec<i64>>();
-        self.dates.clear();
-
-        // explode the dates_compressed into individual dates
-        for (start, end) in self.dates_compressed.iter() {
-            let mut date = *start;
-            while date <= *end {
-                dates.push(date);
-                date += chrono::Duration::days(1).num_seconds();
-            }
-        }
-
-        // sort the dates
-        dates.sort();
-
-        // compress the dates
-        let mut compressed = VecDeque::new();
-        let mut start = dates[0];
-        let mut end = dates[0];
-        for d in dates.iter().skip(1) {
-            if *d == end + chrono::Duration::days(1).num_seconds() {
-                end = *d;
-            } else {
-                compressed.push_back((start, end));
-                start = *d;
-                end = *d;
-            }
-        }
-        compressed.push_back((start, end));
-
-        self.dates_compressed = compressed;
-
-        // after the full compression, the dates HashSet should be empty
-        assert!(self.dates.is_empty());
-    }
-
-    /// Push a new date: if bootstrap is true, push to hashSet, otherwise push to VecDeque
-    pub fn push_date(&mut self, date_ts: i64, bootstrap: bool) {
-        match bootstrap {
-            true => {
-                self.dates.insert(date_ts);
-            }
-            false => {
-                if self.dates_compressed.is_empty() {
-                    self.dates_compressed.push_back((date_ts, date_ts));
-                } else {
-                    let (_start, end) = self.dates_compressed.back_mut().unwrap();
-                    let next_day_ts = *end + chrono::Duration::days(1).num_seconds();
-
-                    match date_ts.cmp(&next_day_ts) {
-                        Ordering::Equal => {
-                            *end = date_ts;
-                        }
-                        Ordering::Greater => {
-                            self.dates_compressed.push_back((date_ts, date_ts));
-                        }
-                        Ordering::Less => {
-                            // the date is already in the range or in the past, skip
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn contains_date(&self, date_ts: i64) -> bool {
-        self.dates.contains(&date_ts)
-            || self
-                .dates_compressed
-                .iter()
-                .any(|(start, end)| date_ts >= *start && date_ts <= *end)
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum RpkiValidation {
     Valid,
@@ -193,110 +201,130 @@ pub enum RpkiValidation {
     Unknown,
 }
 
-impl RoasTrieEntry {
-    fn convert_to_hash_map(self) -> HashMap<(u8, u32), RoasTrieEntry> {
-        HashMap::from([((self.max_len, self.origin), self)])
+impl std::fmt::Display for RpkiValidation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpkiValidation::Valid => write!(f, "valid"),
+            RpkiValidation::Invalid => write!(f, "invalid"),
+            RpkiValidation::Unknown => write!(f, "unknown"),
+        }
     }
 }
 
-impl Default for RoasTrie {
+fn ts_to_date(ts: i64) -> NaiveDate {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .unwrap()
+        .naive_utc()
+        .date()
+}
+
+fn date_to_ts(date: NaiveDate) -> i64 {
+    date.and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+        .and_utc()
+        .timestamp()
+}
+
+/// Builder/mutable trie for rebuild, update, and fix operations.
+pub struct RoasTrieMut {
+    trie: JointPrefixMap<IpNet, Vec<RoaRecordMut>>,
+    latest_date: i64,
+}
+
+impl Default for RoasTrieMut {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RoasTrie {
-    pub fn new() -> RoasTrie {
-        RoasTrie {
-            trie: IpnetTrie::new(),
+impl RoasTrieMut {
+    pub fn new() -> Self {
+        RoasTrieMut {
+            trie: JointPrefixMap::new(),
             latest_date: 0,
         }
     }
 
-    pub fn load(path: &str) -> Result<RoasTrie> {
+    /// Load a v2 archive from disk into a mutable trie for updating.
+    pub fn load(path: &str) -> Result<Self> {
         info!("loading trie from {} ...", path);
-        let mut reader = oneio::get_reader(path)?;
-        let mut trie: IpnetTrie<HashMap<(u8, u32), RoasTrieEntry>> = IpnetTrie::new();
-        trie.import_from_reader(&mut reader)?;
-        let mut roas_trie = RoasTrie {
+        let mut bytes = Vec::new();
+        oneio::get_reader(path)?.read_to_end(&mut bytes)?;
+        let data: RoasTrieData = rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes)
+            .map_err(|e| anyhow!("failed to deserialize trie archive: {}", e))?;
+        if data.format_version != FORMAT_VERSION {
+            return Err(anyhow!(
+                "unsupported trie format version {} (expected {})",
+                data.format_version,
+                FORMAT_VERSION
+            ));
+        }
+        let mut trie: JointPrefixMap<IpNet, Vec<RoaRecordMut>> = JointPrefixMap::new();
+        for (prefix, records) in data.trie.iter() {
+            let recs: Vec<RoaRecordMut> = records
+                .iter()
+                .map(|r| RoaRecordMut {
+                    max_len: r.max_len,
+                    origin: r.origin,
+                    dates: HashSet::new(),
+                    ranges: r.dates.clone(),
+                })
+                .collect();
+            trie.insert(prefix, recs);
+        }
+        info!(
+            "loaded {} prefixes, latest date {}",
+            trie.len(),
+            ts_to_date(data.latest_date)
+        );
+        Ok(RoasTrieMut {
             trie,
-            latest_date: 0,
+            latest_date: data.latest_date,
+        })
+    }
+
+    /// Compress all in-flight dates and serialize the trie to `path` (atomically).
+    pub fn dump(&mut self, path: &str) -> Result<()> {
+        info!("compressing dates into date ranges...");
+        self.compress_dates();
+
+        let mut v4_count: u64 = 0;
+        let mut v6_count: u64 = 0;
+        let mut out: JointPrefixMap<IpNet, Vec<RoaRecord>> = JointPrefixMap::new();
+        for (prefix, records) in self.trie.iter() {
+            match prefix {
+                IpNet::V4(_) => v4_count += 1,
+                IpNet::V6(_) => v6_count += 1,
+            }
+            let recs: Vec<RoaRecord> = records
+                .iter()
+                .map(|r| RoaRecord {
+                    max_len: r.max_len,
+                    origin: r.origin,
+                    dates: r.ranges.clone(),
+                })
+                .collect();
+            out.insert(prefix, recs);
+        }
+
+        let data = RoasTrieData {
+            format_version: FORMAT_VERSION,
+            latest_date: self.latest_date,
+            ipv4_count: v4_count,
+            ipv6_count: v6_count,
+            trie: out,
         };
-        roas_trie.update_latest_date();
-        Ok(roas_trie)
-    }
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
+            .map_err(|e| anyhow!("failed to serialize trie: {}", e))?;
 
-    pub fn fill_gaps(&mut self) {
-        info!("filling known gaps...");
-        const ONE_DAY_SECONDS: i64 = 86400;
-
-        for (start, end) in KNOWN_GAPS_STR.iter() {
-            let start_ts = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp();
-            let end_ts = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d")
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp();
-
-            // vector of timestamps from start_ts to end_ts
-            let mut dates = Vec::new();
-            let mut date = start_ts;
-            while date <= end_ts {
-                dates.push(date);
-                date += ONE_DAY_SECONDS;
-            }
-
-            for (_prefix, map) in self.trie.iter_mut() {
-                for entry in map.values_mut() {
-                    let mut should_compress = false;
-                    for i in 0..entry.dates_compressed.len() - 1 {
-                        // let (start, end) = entry.dates_compressed[i];
-                        if start_ts - ONE_DAY_SECONDS == entry.dates_compressed[i].1
-                            && end_ts + ONE_DAY_SECONDS == entry.dates_compressed[i + 1].0
-                        {
-                            entry.dates.extend(&dates);
-                            should_compress = true;
-                        }
-                    }
-                    if should_compress {
-                        entry.full_compress();
-                    }
-                }
-            }
-        }
-        info!("filling known gaps... done");
-    }
-
-    fn update_latest_date(&mut self) {
-        let mut latest_date = 0;
-        for (_prefix, map) in self.trie.iter() {
-            for entry in map.values() {
-                if let Some(date) = entry.dates.iter().max() {
-                    if *date > latest_date {
-                        latest_date = *date;
-                    }
-                }
-                if let Some((_, end)) = entry.dates_compressed.back() {
-                    if *end > latest_date {
-                        latest_date = *end;
-                    }
-                }
-            }
-        }
-        self.latest_date = latest_date;
-        info!("updating latest date to {}", self.get_latest_date());
-    }
-
-    pub fn dump(&self, path: &str) -> Result<()> {
-        info!("exporting trie to {} ...", path);
-        let mut writer = oneio::get_writer(path)?;
-        self.trie.export_to_writer(&mut writer)?;
+        info!(
+            "exporting trie to {} ({} prefixes, {:.1} MB) ...",
+            path,
+            data.trie.len(),
+            bytes.len() as f64 / 1024.0 / 1024.0
+        );
+        let tmp_path = format!("{}.tmp", path);
+        std::fs::write(&tmp_path, &bytes)?;
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 
@@ -311,26 +339,23 @@ impl RoasTrie {
             let prefix = entry.prefix;
             let max_len = entry.max_len as u8;
             let origin = entry.asn;
-            let date_ts = entry
-                .date
-                .and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
-                .and_utc()
-                .timestamp();
+            let date_ts = date_to_ts(entry.date);
 
-            match self.trie.exact_match_mut(prefix) {
-                Some(v) => {
-                    v.entry((max_len, origin))
-                        .and_modify(|e| e.push_date(date_ts, bootstrap))
-                        .or_insert_with(|| RoasTrieEntry::new(date_ts, max_len, origin, bootstrap));
-                }
+            match self.trie.get_mut(&prefix) {
+                Some(recs) => match recs
+                    .iter_mut()
+                    .find(|r| r.max_len == max_len && r.origin == origin)
+                {
+                    Some(r) => r.push_date(date_ts, bootstrap),
+                    None => recs.push(RoaRecordMut::new(date_ts, max_len, origin, bootstrap)),
+                },
                 None => {
                     self.trie.insert(
                         prefix,
-                        RoasTrieEntry::new(date_ts, max_len, origin, bootstrap)
-                            .convert_to_hash_map(),
+                        vec![RoaRecordMut::new(date_ts, max_len, origin, bootstrap)],
                     );
                 }
-            };
+            }
 
             if date_ts > self.latest_date {
                 self.latest_date = date_ts;
@@ -339,169 +364,18 @@ impl RoasTrie {
     }
 
     pub fn get_latest_date(&self) -> NaiveDate {
-        chrono::DateTime::from_timestamp(self.latest_date, 0)
-            .unwrap()
-            .naive_utc()
-            .date()
+        ts_to_date(self.latest_date)
     }
 
-    pub fn compress_dates(&mut self) {
-        info!("compressing dates into date ranges...");
-        for (_prefix, map) in self.trie.iter_mut() {
-            for entry in map.values_mut() {
-                entry.full_compress();
+    fn compress_dates(&mut self) {
+        for (_prefix, records) in self.trie.iter_mut() {
+            for r in records.iter_mut() {
+                r.full_compress();
             }
         }
     }
 
-    pub fn validate(&self, prefix: &IpNet, origin: u32, date_ts: i64) -> RpkiValidation {
-        let mut is_valid = RpkiValidation::Unknown;
-        'outer: for matched in self.trie.matches(prefix) {
-            for entry in matched.1.values() {
-                if entry.origin == origin
-                    && entry.max_len >= prefix.prefix_len()
-                    && entry.contains_date(date_ts)
-                {
-                    is_valid = RpkiValidation::Valid;
-                    break 'outer;
-                }
-            }
-            is_valid = RpkiValidation::Invalid;
-        }
-
-        is_valid
-    }
-
-    pub fn lookup_prefix(&self, prefix: &IpNet) -> Vec<RoasLookupEntry> {
-        let mut entries = Vec::new();
-        for (prefix, map) in self.trie.matches(prefix) {
-            for entry in map.values() {
-                entries.push(RoasLookupEntry {
-                    prefix,
-                    origin: entry.origin,
-                    max_len: entry.max_len,
-                    dates_ranges: entry
-                        .dates_compressed
-                        .iter()
-                        .map(|(start, end)| {
-                            (
-                                chrono::DateTime::from_timestamp(*start, 0)
-                                    .unwrap()
-                                    .naive_utc()
-                                    .date(),
-                                chrono::DateTime::from_timestamp(*end, 0)
-                                    .unwrap()
-                                    .naive_utc()
-                                    .date(),
-                            )
-                        })
-                        .collect(),
-                });
-            }
-        }
-        entries
-    }
-
-    pub fn search(
-        &self,
-        prefix: Option<IpNet>,
-        origin: Option<u32>,
-        max_len: Option<u8>,
-        date: Option<NaiveDate>,
-        current: Option<bool>,
-        exact: bool,
-    ) -> Vec<RoasLookupEntry> {
-        let mut entries = Vec::new();
-
-        // prefix filter: exact match by default (fixes issue #9),
-        // falls back to matches() when exact=false for supernet/subnet inclusion
-        let iter: Vec<(IpNet, &RoasTrieMap)> = match prefix {
-            Some(prefix) if exact => match self.trie.exact_match(prefix) {
-                Some(map) => vec![(prefix, map)],
-                None => vec![],
-            },
-            Some(prefix) => self.trie.matches(&prefix),
-            None => self.trie.iter().collect(),
-        };
-
-        let mut only_expired = false;
-
-        let date = match current {
-            Some(c) => match c {
-                true => Some(self.latest_date),
-                false => {
-                    only_expired = true;
-                    None
-                }
-            },
-            None => date.map(|d| {
-                d.and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
-                    .and_utc()
-                    .timestamp()
-            }),
-        };
-
-        for (prefix, map) in iter {
-            for entry in map.values() {
-                if let Some(origin) = origin {
-                    if entry.origin != origin {
-                        continue;
-                    }
-                }
-
-                if let Some(max_len) = max_len {
-                    if entry.max_len != max_len {
-                        continue;
-                    }
-                }
-
-                if let Some(date) = date {
-                    // check if date_ts is within one of the date ranges in entry.dates_compressed
-                    if entry
-                        .dates_compressed
-                        .iter()
-                        .all(|(start, end)| date < *start || date > *end)
-                    {
-                        continue;
-                    }
-                }
-
-                if only_expired
-                    && entry
-                        .dates_compressed
-                        .iter()
-                        .any(|(_, end)| *end >= self.latest_date)
-                {
-                    // if any of the date ranges is still current, the entry is current, skip
-                    continue;
-                }
-
-                entries.push(RoasLookupEntry {
-                    prefix,
-                    origin: entry.origin,
-                    max_len: entry.max_len,
-                    dates_ranges: entry
-                        .dates_compressed
-                        .iter()
-                        .map(|(start, end)| {
-                            (
-                                chrono::DateTime::from_timestamp(*start, 0)
-                                    .unwrap()
-                                    .naive_utc()
-                                    .date(),
-                                chrono::DateTime::from_timestamp(*end, 0)
-                                    .unwrap()
-                                    .naive_utc()
-                                    .date(),
-                            )
-                        })
-                        .collect(),
-                });
-            }
-        }
-        entries
-    }
-
+    /// Incremental update: crawl new ROA files since `latest_date` and apply.
     pub fn update(&mut self, tal: Option<String>, until: Option<NaiveDate>) -> Result<()> {
         info!("updating trie... tal: {:?}, until: {:?}", &tal, &until);
         let mut all_files = get_tal_urls(tal)
@@ -520,68 +394,369 @@ impl RoasTrie {
             return Ok(());
         }
 
-        // sort by date
         all_files.sort_by_key(|a| a.file_date);
 
-        for file in all_files {
+        let mut failed = 0usize;
+        for file in &all_files {
             info!("processing {}", file.url.as_str());
-            let url: &str = file.url.as_str();
-            if let Ok(roas) = parse_roas_csv(url) {
-                self.process_entries(&roas, false);
+            match parse_roas_csv(file.url.as_str()) {
+                Ok(roas) => self.process_entries(&roas, false),
+                Err(e) => {
+                    failed += 1;
+                    warn!("failed to process {}: {}", file.url, e);
+                }
             }
+        }
+        if failed > 0 {
+            warn!(
+                "update finished with {} failed file(s) out of {}",
+                failed,
+                all_files.len()
+            );
         }
 
         info!("updating trie... done");
         Ok(())
     }
 
-    pub fn replace(&mut self, other: RoasTrie) {
-        self.trie = other.trie;
-        self.latest_date = other.latest_date;
+    /// Fill known historical data gaps by interpolating adjacent date ranges.
+    pub fn fill_gaps(&mut self) {
+        info!("filling known gaps...");
+        for (start, end) in KNOWN_GAPS_STR.iter() {
+            let start_ts = date_to_ts(NaiveDate::parse_from_str(start, "%Y-%m-%d").unwrap());
+            let end_ts = date_to_ts(NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap());
+
+            let mut dates = Vec::new();
+            let mut d = start_ts;
+            while d <= end_ts {
+                dates.push(d);
+                d += ONE_DAY_SECONDS;
+            }
+
+            for (_prefix, records) in self.trie.iter_mut() {
+                for r in records.iter_mut() {
+                    let mut should_compress = false;
+                    for i in 0..r.ranges.len().saturating_sub(1) {
+                        if start_ts - ONE_DAY_SECONDS == r.ranges[i].1
+                            && end_ts + ONE_DAY_SECONDS == r.ranges[i + 1].0
+                        {
+                            r.dates.extend(&dates);
+                            should_compress = true;
+                        }
+                    }
+                    if should_compress {
+                        r.full_compress();
+                    }
+                }
+            }
+        }
+        info!("filling known gaps... done");
+    }
+
+    pub fn len(&self) -> usize {
+        self.trie.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.trie.is_empty()
+    }
+
+    /// Insert a single record under `prefix` (legacy import path).
+    #[cfg(feature = "legacy")]
+    pub(crate) fn insert_record(&mut self, prefix: IpNet, record: RoaRecordMut) {
+        match self.trie.get_mut(&prefix) {
+            Some(recs) => recs.push(record),
+            None => {
+                self.trie.insert(prefix, vec![record]);
+            }
+        }
+    }
+
+    /// Set the latest date (legacy import path).
+    #[cfg(feature = "legacy")]
+    pub(crate) fn set_latest_date(&mut self, ts: i64) {
+        self.latest_date = ts;
     }
 }
+
+/// Read-only trie backed by an rkyv archive, either memory-mapped from disk
+/// or held as owned bytes. Queries run directly on the archived bytes without
+/// deserializing the trie into heap structures.
+pub struct RoasTrie {
+    bytes: TrieBytes,
+}
+
+enum TrieBytes {
+    Mmap(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl TrieBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            TrieBytes::Mmap(m) => m.as_ref(),
+            TrieBytes::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+impl RoasTrie {
+    /// Open a v2 archive file read-only via memory map. The file is validated
+    /// once on open; queries then run directly against the mapped bytes.
+    pub fn open(path: &str) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: the file is opened read-only and the mapping is never mutated.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let trie = RoasTrie {
+            bytes: TrieBytes::Mmap(mmap),
+        };
+        trie.validate_bytes()?;
+        Ok(trie)
+    }
+
+    /// Create a read handle from owned archive bytes (e.g. freshly serialized).
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        let trie = RoasTrie {
+            bytes: TrieBytes::Owned(bytes),
+        };
+        trie.validate_bytes()?;
+        Ok(trie)
+    }
+
+    fn validate_bytes(&self) -> Result<()> {
+        let data: &ArchivedRoasTrieData =
+            rkyv::access::<_, rkyv::rancor::Error>(self.bytes.as_slice())
+                .map_err(|e| anyhow!("trie archive validation failed: {}", e))?;
+        if data.format_version.to_native() != FORMAT_VERSION {
+            return Err(anyhow!(
+                "unsupported trie format version {} (expected {})",
+                data.format_version.to_native(),
+                FORMAT_VERSION
+            ));
+        }
+        Ok(())
+    }
+
+    /// Access the archived data.
+    fn data(&self) -> &ArchivedRoasTrieData {
+        // SAFETY: the bytes were validated in full at open()/from_bytes() and
+        // are immutable for the lifetime of this struct.
+        unsafe { rkyv::access_unchecked::<ArchivedRoasTrieData>(self.bytes.as_slice()) }
+    }
+
+    pub fn latest_date_ts(&self) -> i64 {
+        self.data().latest_date.to_native()
+    }
+
+    pub fn get_latest_date(&self) -> NaiveDate {
+        ts_to_date(self.latest_date_ts())
+    }
+
+    pub fn counts(&self) -> (u64, u64) {
+        let data = self.data();
+        (data.ipv4_count.to_native(), data.ipv6_count.to_native())
+    }
+
+    /// Total number of prefix entries.
+    pub fn len(&self) -> usize {
+        self.data().trie.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// RPKI validation for a prefix/origin at a given date.
+    pub fn validate(&self, prefix: &IpNet, origin: u32, date_ts: i64) -> RpkiValidation {
+        let mut result = RpkiValidation::Unknown;
+        let prefix_len = prefix.prefix_len();
+        for (_p, records) in self.match_records(prefix) {
+            for r in records.iter() {
+                let r_origin = r.origin.to_native();
+                let r_max_len = r.max_len;
+                if r_origin == origin && r_max_len >= prefix_len && record_contains_date(r, date_ts)
+                {
+                    return RpkiValidation::Valid;
+                }
+            }
+            result = RpkiValidation::Invalid;
+        }
+        result
+    }
+
+    /// All ROA records matching a prefix, including supernets and subnets.
+    pub fn lookup_prefix(&self, prefix: &IpNet) -> Vec<RoasLookupEntry> {
+        let mut entries = Vec::new();
+        for (p, records) in self.match_records(prefix) {
+            for r in records.iter() {
+                entries.push(archived_lookup_entry(p, r));
+            }
+        }
+        entries
+    }
+
+    /// Search ROAs with optional filters. `exact=true` restricts to the exact
+    /// prefix; `exact=false` includes supernets and subnets (matching the old
+    /// `matches()` semantics: the subtree of the shortest covering prefix).
+    pub fn search(
+        &self,
+        prefix: Option<IpNet>,
+        origin: Option<u32>,
+        max_len: Option<u8>,
+        date: Option<NaiveDate>,
+        current: Option<bool>,
+        exact: bool,
+    ) -> Vec<RoasLookupEntry> {
+        let mut only_expired = false;
+        let date_ts = match current {
+            Some(true) => Some(self.latest_date_ts()),
+            Some(false) => {
+                only_expired = true;
+                None
+            }
+            None => date.map(date_to_ts),
+        };
+        let latest = self.latest_date_ts();
+
+        let mut entries = Vec::new();
+        for (p, records) in self.select_records(prefix, exact) {
+            // deterministic order within a prefix (v1 was nondeterministic HashMap order)
+            let mut sorted: Vec<&ArchivedRoaRecord> = records.iter().collect();
+            sorted.sort_by_key(|r| (r.origin.to_native(), r.max_len));
+            for r in sorted {
+                if let Some(origin) = origin {
+                    if r.origin.to_native() != origin {
+                        continue;
+                    }
+                }
+                if let Some(max_len) = max_len {
+                    if r.max_len != max_len {
+                        continue;
+                    }
+                }
+                if let Some(date_ts) = date_ts {
+                    if !record_contains_date(r, date_ts) {
+                        continue;
+                    }
+                }
+                if only_expired && r.dates.iter().any(|range| range.1.to_native() >= latest) {
+                    continue;
+                }
+                entries.push(archived_lookup_entry(p, r));
+            }
+        }
+        entries
+    }
+
+    /// Select (prefix, records) pairs according to the prefix filter mode.
+    fn select_records(
+        &self,
+        prefix: Option<IpNet>,
+        exact: bool,
+    ) -> Vec<(IpNet, &ArchivedVec<ArchivedRoaRecord>)> {
+        match prefix {
+            Some(p) if exact => match self.data().trie.get(&p) {
+                Some(recs) => vec![(p, recs)],
+                None => vec![],
+            },
+            Some(p) => self.match_records(&p),
+            None => self.data().trie.iter().collect(),
+        }
+    }
+
+    /// Entries matching `prefix` with old `IpnetTrie::matches()` semantics:
+    /// the shortest covering prefix and its entire subtree.
+    fn match_records<'a>(
+        &'a self,
+        prefix: &IpNet,
+    ) -> Vec<(IpNet, &'a ArchivedVec<ArchivedRoaRecord>)> {
+        let data = self.data();
+        let spm = match data.trie.get_spm(prefix) {
+            Some((spm, _)) => spm,
+            None => return vec![],
+        };
+        match spm {
+            IpNet::V4(spm4) => match (&data.trie.t1).view_at(&spm4) {
+                Some(view) => view.iter().map(|(p, recs)| (IpNet::V4(p), recs)).collect(),
+                None => vec![],
+            },
+            IpNet::V6(spm6) => match (&data.trie.t2).view_at(&spm6) {
+                Some(view) => view.iter().map(|(p, recs)| (IpNet::V6(p), recs)).collect(),
+                None => vec![],
+            },
+        }
+    }
+}
+
+fn record_contains_date(r: &ArchivedRoaRecord, date_ts: i64) -> bool {
+    r.dates.iter().any(|range| {
+        let start = range.0.to_native();
+        let end = range.1.to_native();
+        date_ts >= start && date_ts <= end
+    })
+}
+
+fn archived_lookup_entry(prefix: IpNet, r: &ArchivedRoaRecord) -> RoasLookupEntry {
+    RoasLookupEntry {
+        prefix,
+        origin: r.origin.to_native(),
+        max_len: r.max_len,
+        dates_ranges: r
+            .dates
+            .iter()
+            .map(|range| {
+                (
+                    ts_to_date(range.0.to_native()),
+                    ts_to_date(range.1.to_native()),
+                )
+            })
+            .collect(),
+    }
+}
+
+// Re-export for convenience of the API layer.
+pub use rkyv::vec::ArchivedVec;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RoaEntry;
-    use chrono::NaiveDate;
-    use ipnet::IpNet;
-    use std::net::Ipv4Addr;
-    use std::str::FromStr;
 
     fn make_entry(prefix: &str, asn: u32, max_len: i32, date: NaiveDate) -> RoaEntry {
         RoaEntry {
             tal: "test".to_string(),
-            prefix: IpNet::from_str(prefix).unwrap(),
+            prefix: prefix.parse().unwrap(),
             max_len,
             asn,
             date,
         }
     }
 
-    fn build_test_trie() -> RoasTrie {
+    fn build_test_trie(name: &str) -> RoasTrie {
         let date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         let entries = vec![
-            // supernet
             make_entry("1.0.0.0/8", 64512, 8, date),
-            // exact prefix we will search for
             make_entry("1.1.1.0/24", 13335, 24, date),
-            // subnet (more-specific)
             make_entry("1.1.1.0/25", 64513, 25, date),
         ];
-        let mut trie = RoasTrie::new();
+        let mut trie = RoasTrieMut::new();
         trie.process_entries(&entries, true);
-        trie.compress_dates();
-        trie
+        // serialize in-memory and re-open
+        let tmp = std::env::temp_dir().join(format!(
+            "wayback-rpki-test-{}-{}.rkyv",
+            name,
+            std::process::id()
+        ));
+        trie.dump(tmp.to_str().unwrap()).unwrap();
+        let t = RoasTrie::open(tmp.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        t
     }
 
     #[test]
     fn test_search_exact_returns_only_matching_prefix() {
-        let trie = build_test_trie();
-        let prefix = IpNet::V4(ipnet::Ipv4Net::new(Ipv4Addr::new(1, 1, 1, 0), 24).unwrap());
+        let trie = build_test_trie(concat!("t", line!()));
+        let prefix: IpNet = "1.1.1.0/24".parse().unwrap();
 
-        // exact=true should return only the /24 ROA
         let results = trie.search(Some(prefix), None, None, None, None, true);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].prefix.to_string(), "1.1.1.0/24");
@@ -590,10 +765,9 @@ mod tests {
 
     #[test]
     fn test_search_non_exact_includes_super_and_sub() {
-        let trie = build_test_trie();
-        let prefix = IpNet::V4(ipnet::Ipv4Net::new(Ipv4Addr::new(1, 1, 1, 0), 24).unwrap());
+        let trie = build_test_trie(concat!("t", line!()));
+        let prefix: IpNet = "1.1.1.0/24".parse().unwrap();
 
-        // exact=false should use matches(), which includes the supernet and subnet
         let results = trie.search(Some(prefix), None, None, None, None, false);
         let prefixes: Vec<String> = results.iter().map(|r| r.prefix.to_string()).collect();
         assert!(prefixes.contains(&"1.0.0.0/8".to_string()));
@@ -603,9 +777,8 @@ mod tests {
 
     #[test]
     fn test_search_exact_no_match_returns_empty() {
-        let trie = build_test_trie();
-        // prefix not in trie
-        let prefix = IpNet::V4(ipnet::Ipv4Net::new(Ipv4Addr::new(2, 2, 2, 0), 24).unwrap());
+        let trie = build_test_trie(concat!("t", line!()));
+        let prefix: IpNet = "2.2.2.0/24".parse().unwrap();
 
         let results = trie.search(Some(prefix), None, None, None, None, true);
         assert!(results.is_empty());
@@ -613,10 +786,31 @@ mod tests {
 
     #[test]
     fn test_search_no_prefix_returns_all() {
-        let trie = build_test_trie();
+        let trie = build_test_trie(concat!("t", line!()));
 
-        // No prefix filter → return all entries regardless of exact flag
         let results = trie.search(None, None, None, None, None, true);
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_validate() {
+        let trie = build_test_trie(concat!("t", line!()));
+        let date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let ts = date_to_ts(date);
+
+        let prefix: IpNet = "1.1.1.0/24".parse().unwrap();
+        assert_eq!(trie.validate(&prefix, 13335, ts), RpkiValidation::Valid);
+        assert_eq!(trie.validate(&prefix, 64512, ts), RpkiValidation::Invalid);
+
+        let unknown: IpNet = "9.9.9.0/24".parse().unwrap();
+        assert_eq!(trie.validate(&unknown, 13335, ts), RpkiValidation::Unknown);
+    }
+
+    #[test]
+    fn test_lookup_prefix() {
+        let trie = build_test_trie(concat!("t", line!()));
+        let prefix: IpNet = "1.1.1.0/24".parse().unwrap();
+        let results = trie.lookup_prefix(&prefix);
         assert_eq!(results.len(), 3);
     }
 }
