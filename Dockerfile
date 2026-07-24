@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ------------------------------------------------------------------------------
 # Runtime image
 # ------------------------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 COPY --from=builder /usr/local/bin/wayback-rpki /usr/local/bin/wayback-rpki
 
 WORKDIR /wayback-rpki
