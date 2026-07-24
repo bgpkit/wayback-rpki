@@ -106,7 +106,7 @@ enum Opts {
         #[clap(long)]
         backup_to: Option<String>,
 
-        #[clap(short, long, default_value = "0.0.0.0")]
+        #[clap(short = 'H', long, default_value = "0.0.0.0")]
         host: String,
 
         #[clap(short, long, default_value = "40065")]
@@ -530,23 +530,43 @@ fn backup_archive(source: &str, destination: &str) -> anyhow::Result<()> {
     result
 }
 
-/// Check if data file exists, and bootstrap if necessary
+/// Ensure a requested archive is present.
+///
+/// For a missing `.rkyv`, a local sibling legacy archive is always preferred:
+/// `roas_trie.bin.gz`/`.bin` is converted before attempting network bootstrap.
 fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
-    if !Path::new(path).exists() && bootstrap {
-        if is_rkyv_path(path) {
+    if Path::new(path).exists() {
+        return;
+    }
+
+    if is_rkyv_path(path) {
+        if let Some(bin_path) = find_sibling_bin(path) {
             info!(
-                "downloading compressed bootstrap {} and streaming it to raw mmap archive {}",
-                REMOTE_BOOTSTRAP_URL, path
+                "requested {} not found; auto-converting local sibling {} before bootstrap",
+                path, bin_path
             );
-            download_rkyv_transport(REMOTE_BOOTSTRAP_URL, path).unwrap();
-        } else {
-            const LEGACY_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.bin.gz";
-            info!(
-                "downloading legacy bootstrap file {} to {}",
-                LEGACY_BOOTSTRAP_URL, path
-            );
-            oneio::download(LEGACY_BOOTSTRAP_URL, path).unwrap();
+            auto_convert(&bin_path, path).unwrap();
+            return;
         }
+    }
+
+    if !bootstrap {
+        return;
+    }
+
+    if is_rkyv_path(path) {
+        info!(
+            "no local legacy archive found; downloading compressed bootstrap {} and streaming it to raw mmap archive {}",
+            REMOTE_BOOTSTRAP_URL, path
+        );
+        download_rkyv_transport(REMOTE_BOOTSTRAP_URL, path).unwrap();
+    } else {
+        const LEGACY_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.bin.gz";
+        info!(
+            "downloading legacy bootstrap file {} to {}",
+            LEGACY_BOOTSTRAP_URL, path
+        );
+        oneio::download(LEGACY_BOOTSTRAP_URL, path).unwrap();
     }
 }
 

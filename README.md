@@ -73,7 +73,7 @@ Commands:
   serve     Start the API server
 
 Options:
-  -p, --path <PATH>      Trie archive path; `.rkyv` uses mmap and `.bin[.gz]` uses legacy in-memory mode [default: roas_trie.rkyv]
+  <PATH>                 Trie archive path; `.rkyv` uses mmap and `.bin[.gz]` uses legacy in-memory mode [default: roas_trie.rkyv]
   -b, --bootstrap        Download bootstrap file if the data file doesn't exist
       --env <ENV>        Path to an environment variable file
   -h, --help             Print help
@@ -278,8 +278,9 @@ files are transport/backup artifacts only and are decompressed before serving.
 
 During the v2 transition, `.bin`/`.bin.gz` paths retain the legacy in-memory
 backend. A missing `roas_trie.rkyv` is automatically generated from a sibling
-`roas_trie.bin.gz` or `roas_trie.bin` without prompting. Explicit conversion is
-also available as `wayback-rpki convert --from roas_trie.bin.gz roas_trie.rkyv`.
+`roas_trie.bin.gz` or `roas_trie.bin` **before any bootstrap download is
+attempted**, without prompting. Explicit conversion is also available as
+`wayback-rpki roas_trie.bin.gz convert --from roas_trie.bin.gz roas_trie.rkyv`.
 
 | `compress_dates()` | Merge consecutive dates into ranges |
 | `fill_gaps()` | Fill known historical data gaps |
