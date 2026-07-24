@@ -10,8 +10,10 @@ currency status.
 
 - **Historical ROA data** — Full history from 2011 onward, sourced from all 5 RIR TALs
   (Afrinic, APNIC, ARIN, LACNIC, RIPE NCC)
-- **Fast prefix trie** — `ipnet-trie` backed storage with compressed date ranges for
-  efficient memory usage (~1M+ ROAs in memory)
+- **Zero-copy mmap trie** — `prefix-trie` + rkyv backed v2 storage; the raw
+  local archive is memory-mapped rather than loaded into heap memory
+- **Legacy transition mode** — `.bin`/`.bin.gz` inputs retain the v1 `ipnet-trie`
+  in-memory backend; `.rkyv` inputs select zero-copy mmap automatically
 - **REST API** — Query by prefix, ASN, max-length, date, and current/expired status
 - **Incremental updates** — Background thread fetches new data every 8 hours
 - **Backup to R2/S3** — Automatic backup of the trie to Cloudflare R2 or any S3-compatible
@@ -54,8 +56,9 @@ Start the API with a one-command bootstrap (downloads pre-built trie from
 wayback-rpki serve --bootstrap
 ```
 
-This downloads the bootstrap trie file, loads it into memory, and starts an HTTP API
-server on `0.0.0.0:40065`. The server will automatically update its data every 8 hours.
+This downloads the gzip-compressed bootstrap transport artifact, streams it into
+an uncompressed local `roas_trie.rkyv` archive, then memory-maps that raw file
+for the API on `0.0.0.0:40065`. The server updates every 8 hours.
 
 ## CLI Usage
 
@@ -70,7 +73,7 @@ Commands:
   serve     Start the API server
 
 Options:
-  -p, --path <PATH>      File path to the trie data file [default: roas_trie.bin.gz]
+  <PATH>                 Trie archive path; `.rkyv` uses mmap and `.bin[.gz]` uses legacy in-memory mode [default: roas_trie.rkyv]
   -b, --bootstrap        Download bootstrap file if the data file doesn't exist
       --env <ENV>        Path to an environment variable file
   -h, --help             Print help
@@ -220,12 +223,12 @@ use wayback_rpki::{crawl_tal_after, parse_roas_csv, get_tal_urls, RoaEntry, RoaF
 ### Trie Storage (`roas_trie.rs`)
 
 ```rust
-use wayback_rpki::RoasTrie;
+use wayback_rpki::{RoasTrie, RoasTrieMut};
 use ipnet::IpNet;
 use chrono::NaiveDate;
 
-// Load a pre-built trie
-let trie = RoasTrie::load("roas_trie.bin.gz")?;
+// Open a pre-built trie (memory-mapped, zero-copy)
+let trie = RoasTrie::open("roas_trie.rkyv")?;
 
 // Search with filters (exact=true by default)
 let results = trie.search(
@@ -251,22 +254,36 @@ let date_ts = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
 let validation = trie.validate(&"1.1.1.0/24".parse().unwrap(), 13335, date_ts);
 // → RpkiValidation::Valid
 
-// Save the trie
-trie.dump("roas_trie.bin.gz")?;
+// Build / update (mutable builder), then serialize
+let mut builder = RoasTrieMut::new();
+builder.process_entries(&entries, true)?;
+builder.dump("roas_trie.rkyv")?;
 ```
 
-#### Key `RoasTrie` Methods
+#### Key Types
 
-| Method | Description |
-|--------|-------------|
-| `new()` | Create an empty trie |
-| `load(path)` | Load from a `.bin.gz` file |
-| `dump(path)` | Save to a `.bin.gz` file |
-| `process_entries(entries, bootstrap)` | Insert ROA entries |
-| `search(prefix, origin, max_len, date, current, exact)` | Query with filters |
-| `lookup_prefix(prefix)` | Get all ROAs for a prefix (includes super/subnets) |
-| `validate(prefix, origin, date_ts)` | RPKI validation → `Valid` / `Invalid` / `Unknown` |
-| `update(tal, until)` | Incremental update from RIPE |
+| Type | Role |
+|------|------|
+| `RoasTrie` | Read-only query handle over an rkyv archive (mmap or in-memory) |
+| `RoasTrieMut` | Mutable builder: `new`, `load_mut`, `process_entries`, `update`, `dump` |
+| `RoasTrie::open(path)` | Memory-map an archive (near-zero heap usage) |
+| `RoasTrieMut::load_mut(path)` | Load for mutation (update / fix flows) |
+| `RoasTrie::search(...)` | Query with filters |
+| `RoasTrie::lookup_prefix(prefix)` | All ROAs covering a prefix (super + subnets) |
+| `RoasTrie::validate(...)` | RPKI validation → `Valid` / `Invalid` / `Unknown` |
+
+The on-disk v2 format is a raw `rkyv` archive (`RoasTrieData` with header
+metadata and a `JointPrefixMap`). Raw `.rkyv` files are mmap-ready; `.rkyv.gz`
+files are transport/backup artifacts only and are decompressed before serving.
+
+During the v2 transition, `.bin`/`.bin.gz` paths retain the legacy in-memory
+backend. A missing `roas_trie.rkyv` is automatically generated from a sibling
+`roas_trie.bin.gz` or `roas_trie.bin` **before any bootstrap download is
+attempted**, without prompting. If neither exists and the remote `.rkyv.gz`
+bootstrap is unavailable, bootstrap downloads the remote `.bin.gz` and converts
+it locally. Explicit conversion is also available as
+`wayback-rpki roas_trie.bin.gz convert --from roas_trie.bin.gz roas_trie.rkyv`.
+
 | `compress_dates()` | Merge consecutive dates into ranges |
 | `fill_gaps()` | Fill known historical data gaps |
 
@@ -276,7 +293,7 @@ The `serve` subcommand supports the following environment variables:
 
 | Variable | Description |
 |----------|-------------|
-| `WAYBACK_BACKUP_TO` | Backup destination (`r2://bucket/key` for S3/R2, or local path) |
+| `WAYBACK_BACKUP_TO` | Backup destination (`r2://bucket/key` for S3/R2, or local path). A destination ending in `.rkyv.gz` is gzip-compressed for transport; the local serving archive remains raw/mmap-ready. |
 | `WAYBACK_BACKUP_HEARTBEAT_URL` | URL to ping after successful backup (e.g., UptimeRobot) |
 | `AWS_REGION` | S3/R2 region (required for R2 backups) |
 | `AWS_ENDPOINT` | S3/R2 endpoint (required for R2 backups) |
