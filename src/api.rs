@@ -1,3 +1,4 @@
+use crate::legacy::LegacyRoasTrie;
 use crate::{RoasTrie, RpkiValidation};
 use axum::extract::{Query, State};
 use axum::http::{Method, StatusCode};
@@ -14,7 +15,70 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
-pub type SharedTrie = Arc<RwLock<RoasTrie>>;
+/// The trie backend — either v2 (rkyv mmap) or v1 (legacy in-memory bincode).
+/// Both implement the same query surface (search/validate/counts/latest_date).
+pub enum TrieBackend {
+    V2(RoasTrie),
+    V1(LegacyRoasTrie),
+}
+
+impl TrieBackend {
+    pub fn search(
+        &self,
+        prefix: Option<IpNet>,
+        origin: Option<u32>,
+        max_len: Option<u8>,
+        date: Option<NaiveDate>,
+        current: Option<bool>,
+        exact: bool,
+    ) -> Vec<crate::RoasLookupEntry> {
+        match self {
+            TrieBackend::V2(t) => t.search(prefix, origin, max_len, date, current, exact),
+            TrieBackend::V1(t) => t.search(prefix, origin, max_len, date, current, exact),
+        }
+    }
+
+    pub fn validate(&self, prefix: &IpNet, origin: u32, date_ts: i64) -> RpkiValidation {
+        match self {
+            TrieBackend::V2(t) => t.validate(prefix, origin, date_ts),
+            TrieBackend::V1(t) => t.validate(prefix, origin, date_ts),
+        }
+    }
+
+    pub fn counts(&self) -> (u64, u64) {
+        match self {
+            TrieBackend::V2(t) => t.counts(),
+            TrieBackend::V1(t) => {
+                let mut v4 = 0u64;
+                let mut v6 = 0u64;
+                for (prefix, entries) in t.trie.iter() {
+                    let count = entries.len() as u64;
+                    match prefix {
+                        IpNet::V4(_) => v4 += count,
+                        IpNet::V6(_) => v6 += count,
+                    }
+                }
+                (v4, v6)
+            }
+        }
+    }
+
+    pub fn latest_date_ts(&self) -> i64 {
+        match self {
+            TrieBackend::V2(t) => t.latest_date_ts(),
+            TrieBackend::V1(t) => t.latest_date,
+        }
+    }
+
+    pub fn format_version(&self) -> u32 {
+        match self {
+            TrieBackend::V2(_) => crate::FORMAT_VERSION,
+            TrieBackend::V1(_) => 1,
+        }
+    }
+}
+
+pub type SharedTrie = Arc<RwLock<TrieBackend>>;
 
 #[derive(Args, Debug, Serialize, Deserialize)]
 pub struct RoasSearchQuery {
@@ -101,11 +165,15 @@ fn bad_request(msg: &str) -> axum::response::Response {
 async fn health(State(state): State<SharedTrie>) -> impl IntoResponse {
     let trie = state.read().await;
     let (ipv4_count, ipv6_count) = trie.counts();
-    Json(json! ({
+    Json(json!({
         "ipv4_roas_count": ipv4_count,
         "ipv6_roas_count": ipv6_count,
-        "latest_date": trie.get_latest_date().to_string(),
-        "format_version": crate::FORMAT_VERSION,
+        "latest_date": DateTime::from_timestamp(trie.latest_date_ts(), 0)
+            .unwrap()
+            .naive_utc()
+            .date()
+            .to_string(),
+        "format_version": trie.format_version(),
     }))
     .into_response()
 }
@@ -136,6 +204,7 @@ async fn search(
 
     let trie = state.read().await;
     let latest_ts = trie.latest_date_ts();
+    let format_version = trie.format_version();
     let latest_date = DateTime::from_timestamp(latest_ts, 0)
         .unwrap()
         .naive_utc()
@@ -179,7 +248,7 @@ async fn search(
         data: result_entries,
         meta: Some(Meta {
             latest_date: latest_date.to_string(),
-            format_version: crate::FORMAT_VERSION,
+            format_version,
         }),
         page,
         page_size,

@@ -1,7 +1,6 @@
 #![allow(clippy::nonminimal_bool)]
 
-mod api;
-#[cfg(feature = "legacy")]
+pub mod api;
 pub mod legacy;
 mod roas_trie;
 

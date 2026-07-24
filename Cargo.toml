@@ -42,13 +42,9 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 tokio = { version = "1", features = ["full"] }
 
-# legacy v1 (bincode + ipnet-trie) import support
-ipnet-trie = { version = "0.3.0", features = ["export"], optional = true }
-bincode = { version = "2.0.1", optional = true }
-
-[features]
-default = []
-legacy = ["dep:ipnet-trie", "dep:bincode"]
+# legacy v1 (bincode + ipnet-trie) — always included for transition period
+ipnet-trie = { version = "0.3.0", features = ["export"] }
+bincode = "2.0.1"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"

@@ -16,7 +16,7 @@ pub const FORMAT_VERSION: u32 = 2;
 /// Default remote bootstrap archive URL (v2 rkyv format).
 pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.rkyv";
 
-const KNOWN_GAPS_STR: [(&str, &str); 24] = [
+pub(crate) const KNOWN_GAPS_STR: [(&str, &str); 24] = [
     ("2018-12-28", "2019-01-02"),
     ("2019-10-22", "2019-10-22"),
     ("2019-11-24", "2019-11-24"),
@@ -63,7 +63,7 @@ pub struct RoaRecordMut {
     pub max_len: u8,
     pub origin: u32,
     /// Uncompressed dates collected during bootstrap.
-    #[cfg_attr(feature = "legacy", allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) dates: HashSet<i64>,
     /// Compressed date ranges.
     pub(crate) ranges: Vec<(i64, i64)>,
@@ -71,7 +71,7 @@ pub struct RoaRecordMut {
 
 impl RoaRecordMut {
     /// Create an empty record for legacy import.
-    #[cfg(feature = "legacy")]
+    #[allow(dead_code)]
     pub(crate) fn new_legacy(max_len: u8, origin: u32) -> Self {
         RoaRecordMut {
             max_len,
@@ -211,14 +211,14 @@ impl std::fmt::Display for RpkiValidation {
     }
 }
 
-fn ts_to_date(ts: i64) -> NaiveDate {
+pub(crate) fn ts_to_date(ts: i64) -> NaiveDate {
     chrono::DateTime::from_timestamp(ts, 0)
         .unwrap()
         .naive_utc()
         .date()
 }
 
-fn date_to_ts(date: NaiveDate) -> i64 {
+pub(crate) fn date_to_ts(date: NaiveDate) -> i64 {
     date.and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
         .and_utc()
         .timestamp()
@@ -461,8 +461,7 @@ impl RoasTrieMut {
         self.trie.is_empty()
     }
 
-    /// Insert a single record under `prefix` (legacy import path).
-    #[cfg(feature = "legacy")]
+    /// Insert a single record under `prefix`.
     pub(crate) fn insert_record(&mut self, prefix: IpNet, record: RoaRecordMut) {
         match self.trie.get_mut(&prefix) {
             Some(recs) => recs.push(record),
@@ -472,8 +471,7 @@ impl RoasTrieMut {
         }
     }
 
-    /// Set the latest date (legacy import path).
-    #[cfg(feature = "legacy")]
+    /// Set the latest date.
     pub(crate) fn set_latest_date(&mut self, ts: i64) {
         self.latest_date = ts;
     }
