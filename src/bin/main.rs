@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ipnet::IpNet;
 use rayon::prelude::*;
+use std::io::{copy, Write};
 use std::path::Path;
 use std::process::exit;
 use std::sync::Arc;
@@ -397,39 +398,15 @@ fn main() {
                         for backup_to in &backup_destinations {
                             if let Some(backup_to) = backup_to.as_ref() {
                                 info!("writing additional backup trie to {}...", backup_to);
-                                match oneio::s3_url_parse(backup_to) {
-                                    Ok((bucket, key)) => {
-                                        if oneio::s3_env_check().is_err() {
-                                            error!(
-                                                "s3 environment variables not set, skipping backup to s3"
-                                            );
-                                        } else {
-                                            match oneio::s3_upload(&bucket, &key, rkyv_path.as_str()) {
-                                                Ok(_) => {
-                                                    info!("backup trie written to s3: {}", backup_to);
-                                                    to_send_heartbeat = true;
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "failed to write backup trie to s3 {}: {}",
-                                                        backup_to, e
-                                                    );
-                                                }
-                                            }
-                                        }
+                                match backup_archive(&rkyv_path, backup_to) {
+                                    Ok(()) => {
+                                        info!("backup trie written to {}", backup_to);
+                                        to_send_heartbeat = true;
                                     }
-                                    Err(_) => match std::fs::copy(&rkyv_path, backup_to) {
-                                        Ok(_) => {
-                                            info!("backup trie written to disk: {}", backup_to);
-                                            to_send_heartbeat = true;
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "failed to write backup trie to disk {}: {}",
-                                                backup_to, e
-                                            )
-                                        }
-                                    },
+                                    Err(e) => error!(
+                                        "failed to write backup trie to {}: {}",
+                                        backup_to, e
+                                    ),
                                 }
                             }
                         }
@@ -485,8 +462,6 @@ fn main() {
     }
 }
 
-use std::io::Write;
-
 fn get_tokio_runtime() -> tokio::runtime::Runtime {
     let blocking_cpus = num_threads();
     debug!("using {} cores for parsing html pages", blocking_cpus);
@@ -497,14 +472,81 @@ fn get_tokio_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+/// Stream a suffix-compressed source through oneio into an uncompressed local
+/// archive. The result is suitable for direct `mmap` access.
+fn download_rkyv_transport(url: &str, local_path: &str) -> anyhow::Result<()> {
+    let mut reader = oneio::get_reader(url)?;
+    let mut writer = std::fs::File::create(local_path)?;
+    copy(&mut reader, &mut writer)?;
+    writer.sync_all()?;
+    Ok(())
+}
+
+/// Create a gzip transport copy of a raw rkyv archive. The active archive is
+/// intentionally never gzip-compressed because rkyv serving requires mmap.
+fn create_rkyv_transport_gzip(source: &str) -> anyhow::Result<std::path::PathBuf> {
+    let temp = std::env::temp_dir().join(format!(
+        "wayback-rpki-{}-{}.rkyv.gz",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let mut reader = std::fs::File::open(source)?;
+    let mut writer = oneio::get_writer(temp.to_str().unwrap())?;
+    copy(&mut reader, &mut writer)?;
+    writer.flush()?;
+    drop(writer);
+    Ok(temp)
+}
+
+/// Write an archive backup. A `.rkyv.gz` destination is explicitly a
+/// transport artifact; the running service continues to mmap the raw `.rkyv`.
+fn backup_archive(source: &str, destination: &str) -> anyhow::Result<()> {
+    let temporary = if destination.ends_with(".rkyv.gz") {
+        Some(create_rkyv_transport_gzip(source)?)
+    } else {
+        None
+    };
+    let upload_source = temporary
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .unwrap_or(source);
+
+    let result = match oneio::s3_url_parse(destination) {
+        Ok((bucket, key)) => {
+            oneio::s3_env_check()?;
+            oneio::s3_upload(&bucket, &key, upload_source)?;
+            Ok(())
+        }
+        Err(_) => {
+            std::fs::copy(upload_source, destination)?;
+            Ok(())
+        }
+    };
+    if let Some(temp) = temporary {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+
 /// Check if data file exists, and bootstrap if necessary
 fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
     if !Path::new(path).exists() && bootstrap {
-        info!(
-            "downloading bootstrap file {} to {}",
-            REMOTE_BOOTSTRAP_URL, path
-        );
-        oneio::download(REMOTE_BOOTSTRAP_URL, path).unwrap();
+        if is_rkyv_path(path) {
+            info!(
+                "downloading compressed bootstrap {} and streaming it to raw mmap archive {}",
+                REMOTE_BOOTSTRAP_URL, path
+            );
+            download_rkyv_transport(REMOTE_BOOTSTRAP_URL, path).unwrap();
+        } else {
+            const LEGACY_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.bin.gz";
+            info!(
+                "downloading legacy bootstrap file {} to {}",
+                LEGACY_BOOTSTRAP_URL, path
+            );
+            oneio::download(LEGACY_BOOTSTRAP_URL, path).unwrap();
+        }
     }
 }
 
@@ -538,4 +580,61 @@ fn ensure_data_available(path: &str) {
         path
     );
     exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn unique_path(suffix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "wayback-rpki-main-test-{}-{}{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            suffix
+        ))
+    }
+
+    #[test]
+    fn rkyv_gzip_backup_is_transport_only() {
+        let source = unique_path(".rkyv");
+        let backup = unique_path(".rkyv.gz");
+        let payload = b"raw rkyv archive bytes: must remain mmap-ready locally";
+        std::fs::write(&source, payload).unwrap();
+
+        backup_archive(source.to_str().unwrap(), backup.to_str().unwrap()).unwrap();
+        assert!(backup.exists());
+        assert_ne!(std::fs::read(&backup).unwrap(), payload);
+
+        let mut decoded = Vec::new();
+        oneio::get_reader(backup.to_str().unwrap())
+            .unwrap()
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(std::fs::read(&source).unwrap(), payload);
+
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn suffix_routing_and_sibling_discovery() {
+        assert!(is_rkyv_path("roas_trie.rkyv"));
+        assert!(!is_rkyv_path("roas_trie.bin.gz"));
+
+        let rkyv = unique_path(".rkyv");
+        let base = rkyv.to_str().unwrap().strip_suffix(".rkyv").unwrap();
+        let sibling = format!("{base}.bin.gz");
+        std::fs::write(&sibling, b"legacy").unwrap();
+        assert_eq!(
+            find_sibling_bin(rkyv.to_str().unwrap()),
+            Some(sibling.clone())
+        );
+        let _ = std::fs::remove_file(sibling);
+    }
 }

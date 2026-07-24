@@ -13,8 +13,9 @@ use tracing::{info, warn};
 /// On-disk format version. v2: rkyv archive of [`RoasTrieData`].
 pub const FORMAT_VERSION: u32 = 2;
 
-/// Default remote bootstrap archive URL (v2 rkyv format).
-pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.rkyv";
+/// Default remote bootstrap archive URL. This is gzip-compressed for transport;
+/// the client streams it into a raw local `.rkyv` file for mmap serving.
+pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.rkyv.gz";
 
 pub(crate) const KNOWN_GAPS_STR: [(&str, &str); 24] = [
     ("2018-12-28", "2019-01-02"),
