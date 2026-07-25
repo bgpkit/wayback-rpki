@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## v2.0.0 - 2026-07-25
+
+### Highlights
+
+* Zero-copy mmap serving: the ROA trie is now a `prefix-trie` `JointPrefixMap` serialized as
+  an `rkyv` archive (default `roas_trie.rkyv`) and memory-mapped at startup — RSS drops from
+  ~756 MB to ~5 MB and startup from ~2.3 s to ~23 ms (#12)
+* Platform-agnostic JSONL.gz transport: bootstrap and backups now stream a portable
+  `.jsonl.gz` format instead of platform-specific `.rkyv.gz`, cutting bootstrap peak RAM from
+  ~1 GB to ~200 MB (#13)
+* Smooth v1 → v2 transition: legacy `.bin`/`.bin.gz` archives (local sibling or remote
+  bootstrap) are auto-converted on first run — no manual migration or prompts (#12)
+
+### Breaking Changes
+
+* Default data file is now `roas_trie.rkyv` (was `roas_trie.bin.gz`); `.bin`/`.bin.gz`
+  paths still work in legacy in-memory mode (#12)
+* Bootstrap precedence is now: local sibling `.bin.gz`/`.bin` → auto-convert, then remote
+  `roas_trie.jsonl.gz` (stream-import, preferred), then remote `roas_trie.bin.gz` (legacy
+  fallback) (#13)
+* The `.rkyv.gz` transport format is removed — bootstrap and backups use `.jsonl.gz` (#13)
+
+### Features
+
+* Dual-mode trie backend: `.rkyv` paths use the v2 mmap backend, `.bin`/`.bin.gz` paths use
+  the v1 legacy in-memory backend; `/health` now reports `format_version` (#12)
+* New `convert` subcommand: `wayback-rpki convert --from legacy.bin.gz` writes a v2 rkyv
+  archive (#12)
+* Streaming JSONL import/export: `RoasTrieMut::import_jsonl` builds from a `.jsonl[.gz]`
+  stream one record at a time; `RoasTrie::export_jsonl` streams zero-copy from the mmap
+  archive (#13)
+* Archive updates write to a temp file and atomically rename for safe hot-reload during
+  background updates (#12)
+
+### Bug Fixes
+
+* Validate JSONL transport input and report physical line numbers in diagnostics (#13)
+
+### Build & CI
+
+* Native per-platform Docker builds with cargo-chef and registry cache (#11)
+* Dockerfile runtime updated to `debian:trixie-slim` (the `rust:1.90` base now ships
+  Debian 13 / GLIBC 2.41) (#12)
+
 ## v1.0.5 - 2026-07-09
 
 ### Highlights
