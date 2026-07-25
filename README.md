@@ -56,9 +56,9 @@ Start the API with a one-command bootstrap (downloads pre-built trie from
 wayback-rpki serve --bootstrap
 ```
 
-This downloads the gzip-compressed bootstrap transport artifact, streams it into
-an uncompressed local `roas_trie.rkyv` archive, then memory-maps that raw file
-for the API on `0.0.0.0:40065`. The server updates every 8 hours.
+This downloads the platform-agnostic JSONL.gz transport archive, streams it
+through a builder to produce a local `roas_trie.rkyv`, then memory-maps that
+file for the API on `0.0.0.0:40065`. The server updates every 8 hours.
 
 ## CLI Usage
 
@@ -273,16 +273,22 @@ builder.dump("roas_trie.rkyv")?;
 | `RoasTrie::validate(...)` | RPKI validation → `Valid` / `Invalid` / `Unknown` |
 
 The on-disk v2 format is a raw `rkyv` archive (`RoasTrieData` with header
-metadata and a `JointPrefixMap`). Raw `.rkyv` files are mmap-ready; `.rkyv.gz`
-files are transport/backup artifacts only and are decompressed before serving.
+metadata and a `JointPrefixMap`). Raw `.rkyv` files are mmap-ready and
+platform-specific — they are **never used for transport or backup**.
+
+**Transport/backup format:** JSONL.gz — one line per `(prefix, max_len, origin)`
+ROA record with compressed date ranges. Platform-agnostic, streamable, and
+human-debuggable (`zcat roas_trie.jsonl.gz | head | jq .`).
 
 During the v2 transition, `.bin`/`.bin.gz` paths retain the legacy in-memory
-backend. A missing `roas_trie.rkyv` is automatically generated from a sibling
-`roas_trie.bin.gz` or `roas_trie.bin` **before any bootstrap download is
-attempted**, without prompting. If neither exists and the remote `.rkyv.gz`
-bootstrap is unavailable, bootstrap downloads the remote `.bin.gz` and converts
-it locally. Explicit conversion is also available as
-`wayback-rpki roas_trie.bin.gz convert --from roas_trie.bin.gz roas_trie.rkyv`.
+backend. A missing `roas_trie.rkyv` is auto-generated, in order:
+
+1. Local sibling `.bin.gz`/`.bin` → convert
+2. Remote `roas_trie.jsonl.gz` → stream-import → dump rkyv (preferred, ~200 MB peak RAM)
+3. Remote `roas_trie.bin.gz` → download → convert (legacy fallback)
+
+Explicit conversion is also available as
+`wayback-rpki convert --from roas_trie.bin.gz roas_trie.rkyv`.
 
 | `compress_dates()` | Merge consecutive dates into ranges |
 | `fill_gaps()` | Fill known historical data gaps |
@@ -293,7 +299,7 @@ The `serve` subcommand supports the following environment variables:
 
 | Variable | Description |
 |----------|-------------|
-| `WAYBACK_BACKUP_TO` | Backup destination (`r2://bucket/key` for S3/R2, or local path). A destination ending in `.rkyv.gz` is gzip-compressed for transport; the local serving archive remains raw/mmap-ready. |
+| `WAYBACK_BACKUP_TO` | Backup destination (`r2://bucket/key` for S3/R2, or local path). Backups are written as platform-agnostic JSONL.gz transport files streamed from the live mmap archive. |
 | `WAYBACK_BACKUP_HEARTBEAT_URL` | URL to ping after successful backup (e.g., UptimeRobot) |
 | `AWS_REGION` | S3/R2 region (required for R2 backups) |
 | `AWS_ENDPOINT` | S3/R2 endpoint (required for R2 backups) |

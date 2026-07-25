@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use ipnet::IpNet;
 use rayon::prelude::*;
-use std::io::{copy, Write};
 use std::path::Path;
 use std::process::exit;
 use std::sync::Arc;
@@ -472,68 +471,57 @@ fn get_tokio_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Stream a suffix-compressed source through oneio into an uncompressed local
-/// archive. The result is suitable for direct `mmap` access.
-fn download_rkyv_transport(url: &str, local_path: &str) -> anyhow::Result<()> {
-    let mut reader = oneio::get_reader(url)?;
-    let mut writer = std::fs::File::create(local_path)?;
-    copy(&mut reader, &mut writer)?;
-    writer.sync_all()?;
+/// Bootstrap a `.rkyv` archive from a remote JSONL.gz transport file.
+/// Downloads the compressed JSONL, streams it through a builder, and dumps
+/// the raw `.rkyv`. Peak memory is just the builder (~200 MB).
+fn bootstrap_from_jsonl(url: &str, rkyv_path: &str) -> anyhow::Result<()> {
+    let jsonl_path = format!(
+        "{}.jsonl.gz",
+        rkyv_path.strip_suffix(".rkyv").unwrap_or(rkyv_path)
+    );
+    info!("downloading JSONL transport {} to {}", url, jsonl_path);
+    oneio::download(url, &jsonl_path)?;
+
+    info!("building rkyv archive from JSONL...");
+    let mut builder = RoasTrieMut::from_jsonl(&jsonl_path)?;
+    builder.dump(rkyv_path)?;
+    info!("bootstrap complete: {}", rkyv_path);
     Ok(())
 }
 
-/// Create a gzip transport copy of a raw rkyv archive. The active archive is
-/// intentionally never gzip-compressed because rkyv serving requires mmap.
-fn create_rkyv_transport_gzip(source: &str) -> anyhow::Result<std::path::PathBuf> {
-    let temp = std::env::temp_dir().join(format!(
-        "wayback-rpki-{}-{}.rkyv.gz",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos()
-    ));
-    let mut reader = std::fs::File::open(source)?;
-    let mut writer = oneio::get_writer(temp.to_str().unwrap())?;
-    copy(&mut reader, &mut writer)?;
-    writer.flush()?;
-    drop(writer);
-    Ok(temp)
-}
-
-/// Write an archive backup. A `.rkyv.gz` destination is explicitly a
-/// transport artifact; the running service continues to mmap the raw `.rkyv`.
+/// Write a backup from the live `.rkyv` archive to a `.jsonl[.gz]` transport file.
+/// Streams zero-copy from the mmap'd archive — peak memory ~10 MB.
 fn backup_archive(source: &str, destination: &str) -> anyhow::Result<()> {
-    let temporary = if destination.ends_with(".rkyv.gz") {
-        Some(create_rkyv_transport_gzip(source)?)
-    } else {
-        None
-    };
-    let upload_source = temporary
-        .as_ref()
-        .and_then(|p| p.to_str())
-        .unwrap_or(source);
-
-    let result = match oneio::s3_url_parse(destination) {
+    let trie = RoasTrie::open(source)?;
+    match oneio::s3_url_parse(destination) {
         Ok((bucket, key)) => {
+            // For S3, write to a local temp file first, then upload.
+            let temp = std::env::temp_dir().join(format!(
+                "wayback-rpki-backup-{}-{}.jsonl.gz",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            ));
+            trie.export_jsonl(temp.to_str().unwrap())?;
             oneio::s3_env_check()?;
-            oneio::s3_upload(&bucket, &key, upload_source)?;
+            oneio::s3_upload(&bucket, &key, temp.to_str().unwrap())?;
+            let _ = std::fs::remove_file(&temp);
             Ok(())
         }
         Err(_) => {
-            std::fs::copy(upload_source, destination)?;
+            trie.export_jsonl(destination)?;
             Ok(())
         }
-    };
-    if let Some(temp) = temporary {
-        let _ = std::fs::remove_file(temp);
     }
-    result
 }
 
 /// Ensure a requested archive is present.
 ///
-/// For a missing `.rkyv`, a local sibling legacy archive is always preferred:
-/// `roas_trie.bin.gz`/`.bin` is converted before attempting network bootstrap.
+/// Bootstrap precedence for missing `.rkyv`:
+/// 1. Local sibling `.bin.gz`/`.bin` → auto-convert
+/// 2. Remote `roas_trie.jsonl.gz` → stream-import → dump rkyv
+/// 3. Remote `roas_trie.bin.gz` → download → auto-convert (legacy fallback)
 fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
     const LEGACY_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.bin.gz";
 
@@ -542,6 +530,7 @@ fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
     }
 
     if is_rkyv_path(path) {
+        // 1. Local sibling legacy archive
         if let Some(bin_path) = find_sibling_bin(path) {
             info!(
                 "requested {} not found; auto-converting local sibling {} before bootstrap",
@@ -557,19 +546,15 @@ fn check_bootstrap_and_download(path: &str, bootstrap: bool) {
     }
 
     if is_rkyv_path(path) {
-        info!(
-            "no local legacy archive found; attempting compressed rkyv bootstrap {}",
-            REMOTE_BOOTSTRAP_URL
-        );
-        if let Err(rkyv_error) = download_rkyv_transport(REMOTE_BOOTSTRAP_URL, path) {
-            // During the transition the v1 archive remains the durable remote
-            // bootstrap source. Download it beside the requested rkyv path, then
-            // reuse the normal conversion path to create the mmap-ready archive.
-            let legacy_path = format!("{}.bin.gz", path.strip_suffix(".rkyv").unwrap_or(path));
+        // 2. Remote JSONL transport (platform-agnostic, low RAM)
+        info!("attempting JSONL bootstrap {}", REMOTE_BOOTSTRAP_URL);
+        if let Err(jsonl_error) = bootstrap_from_jsonl(REMOTE_BOOTSTRAP_URL, path) {
+            // 3. Fall back to legacy bin.gz
             warn!(
-                "rkyv bootstrap {} failed: {}; falling back to legacy bootstrap {}",
-                REMOTE_BOOTSTRAP_URL, rkyv_error, LEGACY_BOOTSTRAP_URL
+                "JSONL bootstrap {} failed: {}; falling back to legacy bootstrap {}",
+                REMOTE_BOOTSTRAP_URL, jsonl_error, LEGACY_BOOTSTRAP_URL
             );
+            let legacy_path = format!("{}.bin.gz", path.strip_suffix(".rkyv").unwrap_or(path));
             if let Err(legacy_error) = oneio::download(LEGACY_BOOTSTRAP_URL, &legacy_path) {
                 error!(
                     "legacy bootstrap {} also failed: {}",
@@ -629,7 +614,8 @@ fn ensure_data_available(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::Write;
+    use wayback_rpki::RoaEntry;
 
     fn unique_path(suffix: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -644,26 +630,60 @@ mod tests {
     }
 
     #[test]
-    fn rkyv_gzip_backup_is_transport_only() {
-        let source = unique_path(".rkyv");
-        let backup = unique_path(".rkyv.gz");
-        let payload = b"raw rkyv archive bytes: must remain mmap-ready locally";
-        std::fs::write(&source, payload).unwrap();
+    fn jsonl_round_trip_preserves_data() {
+        // Build a small trie via direct record insertion, export to JSONL.gz,
+        // re-import, and verify search results match.
+        let rkyv = unique_path(".rkyv");
+        let jsonl = unique_path(".jsonl.gz");
+        let rkyv2 = unique_path(".rkyv");
 
-        backup_archive(source.to_str().unwrap(), backup.to_str().unwrap()).unwrap();
-        assert!(backup.exists());
-        assert_ne!(std::fs::read(&backup).unwrap(), payload);
+        // Build a trie with known data via JSONL input
+        let jsonl_in = unique_path(".jsonl.gz");
+        {
+            let mut w =
+                std::io::BufWriter::new(oneio::get_writer(jsonl_in.to_str().unwrap()).unwrap());
+            let ts = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp();
+            for (p, m, o) in [("1.1.1.0/24", 24u8, 13335u32), ("8.8.8.0/24", 24, 15169)] {
+                let rec = serde_json::json!({"p": p, "m": m, "o": o, "r": [[ts, ts]]});
+                w.write_all(format!("{}\n", rec).as_bytes()).unwrap();
+            }
+            w.flush().unwrap();
+        }
 
-        let mut decoded = Vec::new();
-        oneio::get_reader(backup.to_str().unwrap())
-            .unwrap()
-            .read_to_end(&mut decoded)
-            .unwrap();
-        assert_eq!(decoded, payload);
-        assert_eq!(std::fs::read(&source).unwrap(), payload);
+        let mut builder = RoasTrieMut::from_jsonl(jsonl_in.to_str().unwrap()).unwrap();
+        builder.dump(rkyv.to_str().unwrap()).unwrap();
 
-        let _ = std::fs::remove_file(source);
-        let _ = std::fs::remove_file(backup);
+        let trie = RoasTrie::open(rkyv.to_str().unwrap()).unwrap();
+        trie.export_jsonl(jsonl.to_str().unwrap()).unwrap();
+
+        // Re-import the exported JSONL
+        let mut builder2 = RoasTrieMut::from_jsonl(jsonl.to_str().unwrap()).unwrap();
+        builder2.dump(rkyv2.to_str().unwrap()).unwrap();
+        let trie2 = RoasTrie::open(rkyv2.to_str().unwrap()).unwrap();
+
+        // Compare results
+        let prefix: IpNet = "1.1.1.0/24".parse().unwrap();
+        let orig = trie.search(Some(prefix), None, None, None, None, true);
+        let new = trie2.search(Some(prefix), None, None, None, None, true);
+        assert_eq!(orig.len(), 1);
+        assert_eq!(orig, new);
+        assert_eq!(orig[0].origin, 13335);
+
+        let prefix2: IpNet = "8.8.8.0/24".parse().unwrap();
+        let orig2 = trie.search(Some(prefix2), None, None, None, None, true);
+        let new2 = trie2.search(Some(prefix2), None, None, None, None, true);
+        assert_eq!(orig2, new2);
+        assert_eq!(orig2[0].origin, 15169);
+
+        let _ = std::fs::remove_file(rkyv);
+        let _ = std::fs::remove_file(jsonl);
+        let _ = std::fs::remove_file(rkyv2);
+        let _ = std::fs::remove_file(jsonl_in);
     }
 
     #[test]
