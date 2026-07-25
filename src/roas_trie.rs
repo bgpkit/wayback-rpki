@@ -741,6 +741,7 @@ impl RoasTrieMut {
         let reader = oneio::get_reader(path)?;
         let mut buf_reader = std::io::BufReader::new(reader);
         let mut line = String::new();
+        let mut line_no: u64 = 0;
         let mut count: u64 = 0;
 
         loop {
@@ -749,24 +750,29 @@ impl RoasTrieMut {
             if n == 0 {
                 break;
             }
+            line_no += 1;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             let rec: JsonlRecord = serde_json::from_str(trimmed)
-                .map_err(|e| anyhow!("JSONL parse error at line {}: {}", count + 1, e))?;
+                .map_err(|e| anyhow!("JSONL parse error at line {}: {}", line_no, e))?;
             let prefix: IpNet = rec
                 .p
                 .parse()
-                .map_err(|e| anyhow!("invalid prefix '{}' at line {}: {}", rec.p, count + 1, e))?;
+                .map_err(|e| anyhow!("invalid prefix '{}' at line {}: {}", rec.p, line_no, e))?;
 
-            // Track latest date before moving rec.r
             for &(start, end) in &rec.r {
+                if start > end {
+                    return Err(anyhow!(
+                        "invalid date range at line {}: start {} is after end {}",
+                        line_no,
+                        start,
+                        end
+                    ));
+                }
                 if end > self.latest_date {
                     self.latest_date = end;
-                }
-                if start > self.latest_date {
-                    self.latest_date = start;
                 }
             }
 
@@ -814,8 +820,9 @@ impl RoasTrieMut {
 }
 
 impl RoasTrie {
-    /// Stream-export the archive to a `.jsonl[.gz]` file. Reads the mmap'd
-    /// archive zero-copy — peak memory is just the I/O buffer (~10 MB).
+    /// Stream-export the archive to a `.jsonl[.gz]` file. Reads record data
+    /// directly from the mmap'd archive and keeps only one serialized record
+    /// in memory at a time.
     pub fn export_jsonl(&self, path: &str) -> Result<()> {
         info!("exporting JSONL to {} ...", path);
         let mut writer: Box<dyn std::io::Write> =
@@ -949,5 +956,42 @@ mod tests {
         let prefix: IpNet = "1.1.1.0/24".parse().unwrap();
         let results = trie.lookup_prefix(&prefix);
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn import_jsonl_reports_physical_line_number() {
+        let path = std::env::temp_dir().join(format!(
+            "wayback-rpki-invalid-jsonl-{}-{}.jsonl",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "\n{not valid json}\n").unwrap();
+
+        let err = RoasTrieMut::from_jsonl(path.to_str().unwrap())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("line 2"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn import_jsonl_rejects_inverted_date_range() {
+        let path = std::env::temp_dir().join(format!(
+            "wayback-rpki-invalid-range-{}-{}.jsonl",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, r#"{"p":"1.1.1.0/24","m":24,"o":13335,"r":[[2,1]]}"#).unwrap();
+
+        let err = RoasTrieMut::from_jsonl(path.to_str().unwrap())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("invalid date range at line 1"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

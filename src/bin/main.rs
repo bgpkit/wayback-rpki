@@ -490,7 +490,7 @@ fn bootstrap_from_jsonl(url: &str, rkyv_path: &str) -> anyhow::Result<()> {
 }
 
 /// Write a backup from the live `.rkyv` archive to a `.jsonl[.gz]` transport file.
-/// Streams zero-copy from the mmap'd archive — peak memory ~10 MB.
+/// Iterates the mmap'd archive and serializes one record at a time.
 fn backup_archive(source: &str, destination: &str) -> anyhow::Result<()> {
     let trie = RoasTrie::open(source)?;
     match oneio::s3_url_parse(destination) {
@@ -615,7 +615,6 @@ fn ensure_data_available(path: &str) {
 mod tests {
     use super::*;
     use std::io::Write;
-    use wayback_rpki::RoaEntry;
 
     fn unique_path(suffix: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
