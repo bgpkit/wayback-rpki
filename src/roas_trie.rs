@@ -13,9 +13,9 @@ use tracing::{info, warn};
 /// On-disk format version. v2: rkyv archive of [`RoasTrieData`].
 pub const FORMAT_VERSION: u32 = 2;
 
-/// Default remote bootstrap archive URL. This is gzip-compressed for transport;
-/// the client streams it into a raw local `.rkyv` file for mmap serving.
-pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.rkyv.gz";
+/// Default remote bootstrap URL. Platform-agnostic JSONL.gz transport format;
+/// the client streams it through a builder and dumps a local `.rkyv` for mmap serving.
+pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.jsonl.gz";
 
 pub(crate) const KNOWN_GAPS_STR: [(&str, &str); 24] = [
     ("2018-12-28", "2019-01-02"),
@@ -163,7 +163,7 @@ pub struct RoasTrieData {
     pub trie: JointPrefixMap<IpNet, Vec<RoaRecord>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoasLookupEntry {
     pub prefix: IpNet,
     pub origin: u32,
@@ -710,6 +710,144 @@ fn archived_lookup_entry(prefix: IpNet, r: &ArchivedRoaRecord) -> RoasLookupEntr
                 )
             })
             .collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSONL platform-agnostic transport format
+// ---------------------------------------------------------------------------
+
+/// One JSONL line: a single (prefix, max_len, origin) ROA record with compressed
+/// date ranges. This is the on-the-wire format for bootstrap downloads and
+/// remote backups — platform-agnostic and streamable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JsonlRecord {
+    /// Prefix in CIDR notation, e.g. "1.1.1.0/24"
+    pub p: String,
+    /// ROA max length
+    pub m: u8,
+    /// Origin ASN
+    pub o: u32,
+    /// Compressed date ranges as (start_ts, end_ts) pairs
+    pub r: Vec<(i64, i64)>,
+}
+
+impl RoasTrieMut {
+    /// Stream-import a `.jsonl[.gz]` file into this builder. Each line is one
+    /// `JsonlRecord`. The builder grows incrementally — peak memory is just
+    /// the builder itself (~200 MB for the full production dataset).
+    pub fn import_jsonl(&mut self, path: &str) -> Result<()> {
+        info!("importing JSONL from {} ...", path);
+        let reader = oneio::get_reader(path)?;
+        let mut buf_reader = std::io::BufReader::new(reader);
+        let mut line = String::new();
+        let mut count: u64 = 0;
+
+        loop {
+            line.clear();
+            let n = std::io::BufRead::read_line(&mut buf_reader, &mut line)?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let rec: JsonlRecord = serde_json::from_str(trimmed)
+                .map_err(|e| anyhow!("JSONL parse error at line {}: {}", count + 1, e))?;
+            let prefix: IpNet = rec
+                .p
+                .parse()
+                .map_err(|e| anyhow!("invalid prefix '{}' at line {}: {}", rec.p, count + 1, e))?;
+
+            // Track latest date before moving rec.r
+            for &(start, end) in &rec.r {
+                if end > self.latest_date {
+                    self.latest_date = end;
+                }
+                if start > self.latest_date {
+                    self.latest_date = start;
+                }
+            }
+
+            let record = RoaRecordMut {
+                max_len: rec.m,
+                origin: rec.o,
+                dates: HashSet::new(),
+                ranges: rec.r,
+            };
+
+            // Merge with existing records for the same prefix + (max_len, origin)
+            match self.trie.get_mut(&prefix) {
+                Some(recs) => {
+                    if let Some(existing) = recs
+                        .iter_mut()
+                        .find(|r| r.max_len == record.max_len && r.origin == record.origin)
+                    {
+                        existing.ranges.extend(record.ranges.iter().copied());
+                        existing.full_compress();
+                    } else {
+                        recs.push(record);
+                    }
+                }
+                None => {
+                    self.trie.insert(prefix, vec![record]);
+                }
+            }
+
+            count += 1;
+            if count % 200_000 == 0 {
+                info!("imported {} records...", count);
+            }
+        }
+
+        info!("imported {} records from JSONL", count);
+        Ok(())
+    }
+
+    /// Create a fresh builder from a JSONL file.
+    pub fn from_jsonl(path: &str) -> Result<Self> {
+        let mut builder = Self::new();
+        builder.import_jsonl(path)?;
+        Ok(builder)
+    }
+}
+
+impl RoasTrie {
+    /// Stream-export the archive to a `.jsonl[.gz]` file. Reads the mmap'd
+    /// archive zero-copy — peak memory is just the I/O buffer (~10 MB).
+    pub fn export_jsonl(&self, path: &str) -> Result<()> {
+        info!("exporting JSONL to {} ...", path);
+        let mut writer: Box<dyn std::io::Write> =
+            Box::new(std::io::BufWriter::new(oneio::get_writer(path)?));
+        let data = self.data();
+        let mut count: u64 = 0;
+
+        for (prefix, records) in data.trie.iter() {
+            for r in records.iter() {
+                let ranges: Vec<(i64, i64)> = r
+                    .dates
+                    .iter()
+                    .map(|range| (range.0.to_native(), range.1.to_native()))
+                    .collect();
+                let rec = JsonlRecord {
+                    p: prefix.to_string(),
+                    m: r.max_len,
+                    o: r.origin.to_native(),
+                    r: ranges,
+                };
+                serde_json::to_writer(&mut writer, &rec)?;
+                writer.write_all(b"\n")?;
+            }
+            count += 1;
+            if count % 200_000 == 0 {
+                info!("exported {} prefixes...", count);
+            }
+        }
+
+        writer.flush()?;
+        info!("exported {} prefixes to JSONL", count);
+        Ok(())
     }
 }
 
