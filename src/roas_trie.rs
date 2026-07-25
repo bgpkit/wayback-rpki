@@ -13,9 +13,9 @@ use tracing::{info, warn};
 /// On-disk format version. v2: rkyv archive of [`RoasTrieData`].
 pub const FORMAT_VERSION: u32 = 2;
 
-/// Default remote bootstrap archive URL. This is gzip-compressed for transport;
-/// the client streams it into a raw local `.rkyv` file for mmap serving.
-pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.rkyv.gz";
+/// Default remote bootstrap URL. Platform-agnostic JSONL.gz transport format;
+/// the client streams it through a builder and dumps a local `.rkyv` for mmap serving.
+pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.jsonl.gz";
 
 pub(crate) const KNOWN_GAPS_STR: [(&str, &str); 24] = [
     ("2018-12-28", "2019-01-02"),
@@ -163,7 +163,7 @@ pub struct RoasTrieData {
     pub trie: JointPrefixMap<IpNet, Vec<RoaRecord>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoasLookupEntry {
     pub prefix: IpNet,
     pub origin: u32,
@@ -713,6 +713,151 @@ fn archived_lookup_entry(prefix: IpNet, r: &ArchivedRoaRecord) -> RoasLookupEntr
     }
 }
 
+// ---------------------------------------------------------------------------
+// JSONL platform-agnostic transport format
+// ---------------------------------------------------------------------------
+
+/// One JSONL line: a single (prefix, max_len, origin) ROA record with compressed
+/// date ranges. This is the on-the-wire format for bootstrap downloads and
+/// remote backups — platform-agnostic and streamable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JsonlRecord {
+    /// Prefix in CIDR notation, e.g. "1.1.1.0/24"
+    pub p: String,
+    /// ROA max length
+    pub m: u8,
+    /// Origin ASN
+    pub o: u32,
+    /// Compressed date ranges as (start_ts, end_ts) pairs
+    pub r: Vec<(i64, i64)>,
+}
+
+impl RoasTrieMut {
+    /// Stream-import a `.jsonl[.gz]` file into this builder. Each line is one
+    /// `JsonlRecord`. The builder grows incrementally — peak memory is just
+    /// the builder itself (~200 MB for the full production dataset).
+    pub fn import_jsonl(&mut self, path: &str) -> Result<()> {
+        info!("importing JSONL from {} ...", path);
+        let reader = oneio::get_reader(path)?;
+        let mut buf_reader = std::io::BufReader::new(reader);
+        let mut line = String::new();
+        let mut line_no: u64 = 0;
+        let mut count: u64 = 0;
+
+        loop {
+            line.clear();
+            let n = std::io::BufRead::read_line(&mut buf_reader, &mut line)?;
+            if n == 0 {
+                break;
+            }
+            line_no += 1;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let rec: JsonlRecord = serde_json::from_str(trimmed)
+                .map_err(|e| anyhow!("JSONL parse error at line {}: {}", line_no, e))?;
+            let prefix: IpNet = rec
+                .p
+                .parse()
+                .map_err(|e| anyhow!("invalid prefix '{}' at line {}: {}", rec.p, line_no, e))?;
+
+            for &(start, end) in &rec.r {
+                if start > end {
+                    return Err(anyhow!(
+                        "invalid date range at line {}: start {} is after end {}",
+                        line_no,
+                        start,
+                        end
+                    ));
+                }
+                if end > self.latest_date {
+                    self.latest_date = end;
+                }
+            }
+
+            let record = RoaRecordMut {
+                max_len: rec.m,
+                origin: rec.o,
+                dates: HashSet::new(),
+                ranges: rec.r,
+            };
+
+            // Merge with existing records for the same prefix + (max_len, origin)
+            match self.trie.get_mut(&prefix) {
+                Some(recs) => {
+                    if let Some(existing) = recs
+                        .iter_mut()
+                        .find(|r| r.max_len == record.max_len && r.origin == record.origin)
+                    {
+                        existing.ranges.extend(record.ranges.iter().copied());
+                        existing.full_compress();
+                    } else {
+                        recs.push(record);
+                    }
+                }
+                None => {
+                    self.trie.insert(prefix, vec![record]);
+                }
+            }
+
+            count += 1;
+            if count % 200_000 == 0 {
+                info!("imported {} records...", count);
+            }
+        }
+
+        info!("imported {} records from JSONL", count);
+        Ok(())
+    }
+
+    /// Create a fresh builder from a JSONL file.
+    pub fn from_jsonl(path: &str) -> Result<Self> {
+        let mut builder = Self::new();
+        builder.import_jsonl(path)?;
+        Ok(builder)
+    }
+}
+
+impl RoasTrie {
+    /// Stream-export the archive to a `.jsonl[.gz]` file. Reads record data
+    /// directly from the mmap'd archive and keeps only one serialized record
+    /// in memory at a time.
+    pub fn export_jsonl(&self, path: &str) -> Result<()> {
+        info!("exporting JSONL to {} ...", path);
+        let mut writer: Box<dyn std::io::Write> =
+            Box::new(std::io::BufWriter::new(oneio::get_writer(path)?));
+        let data = self.data();
+        let mut count: u64 = 0;
+
+        for (prefix, records) in data.trie.iter() {
+            for r in records.iter() {
+                let ranges: Vec<(i64, i64)> = r
+                    .dates
+                    .iter()
+                    .map(|range| (range.0.to_native(), range.1.to_native()))
+                    .collect();
+                let rec = JsonlRecord {
+                    p: prefix.to_string(),
+                    m: r.max_len,
+                    o: r.origin.to_native(),
+                    r: ranges,
+                };
+                serde_json::to_writer(&mut writer, &rec)?;
+                writer.write_all(b"\n")?;
+            }
+            count += 1;
+            if count % 200_000 == 0 {
+                info!("exported {} prefixes...", count);
+            }
+        }
+
+        writer.flush()?;
+        info!("exported {} prefixes to JSONL", count);
+        Ok(())
+    }
+}
+
 // Re-export for convenience of the API layer.
 pub use rkyv::vec::ArchivedVec;
 
@@ -811,5 +956,42 @@ mod tests {
         let prefix: IpNet = "1.1.1.0/24".parse().unwrap();
         let results = trie.lookup_prefix(&prefix);
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn import_jsonl_reports_physical_line_number() {
+        let path = std::env::temp_dir().join(format!(
+            "wayback-rpki-invalid-jsonl-{}-{}.jsonl",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "\n{not valid json}\n").unwrap();
+
+        let err = RoasTrieMut::from_jsonl(path.to_str().unwrap())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("line 2"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn import_jsonl_rejects_inverted_date_range() {
+        let path = std::env::temp_dir().join(format!(
+            "wayback-rpki-invalid-range-{}-{}.jsonl",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, r#"{"p":"1.1.1.0/24","m":24,"o":13335,"r":[[2,1]]}"#).unwrap();
+
+        let err = RoasTrieMut::from_jsonl(path.to_str().unwrap())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("invalid date range at line 1"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
