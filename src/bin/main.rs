@@ -1,3 +1,8 @@
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static ALLOC: Jemalloc = Jemalloc;
+
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
