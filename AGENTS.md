@@ -26,10 +26,9 @@ wayback-rpki/
 ├── Dockerfile          # cargo-chef multi-stage build (rust:1.90 → debian:trixie-slim)
 ├── Cargo.toml          # Crate metadata; bin name = wayback-rpki
 └── .github/workflows/
-    ├── rust.yml        # Push/PR to main: cargo build + clippy -D warnings
-    ├── release.yml     # Tag-triggered: GitHub release + cargo publish + binary uploads
-    ├── docker.yml      # Tag/dispatch-triggered: native multi-arch Docker Hub push
-    └── docker-main.yml # Push to main: branch-tagged image via reusable docker/github-builder workflow
+    ├── rust.yml        # Push/PR to main: cargo fmt --check + clippy -D warnings + tests
+    ├── release.yml     # Tag-triggered: build-test gate → GitHub release → binaries → cargo publish
+    └── docker.yml      # Main/tag/dispatch-triggered: native multi-arch Docker Hub push
 ```
 
 ## Key Modules
@@ -155,16 +154,21 @@ cargo test                                # All tests (lib.rs crawler tests need
 
 ## CI/CD
 
-- **`rust.yml`** — On push/PR to main: `cargo build` + `cargo clippy -- -D warnings`.
-- **`release.yml`** — On `v*` tag: GitHub release (from `CHANGELOG.md`), `cargo publish`,
-  binary uploads for `aarch64-linux`, `x86_64-linux`, `universal-apple-darwin`.
-- **`docker.yml`** — On `v*` tag (or `workflow_dispatch` with a version input): builds
-  `linux/amd64` + `linux/arm64` natively (`ubuntu-latest` / `ubuntu-24.04-arm` matrix,
-  no QEMU), pushes per-arch images by digest with registry cache, then merges into
-  multi-arch manifests on Docker Hub (`bgpkit/wayback-rpki`) with semver tags + `latest`.
-- **`docker-main.yml`** — On push to main touching `src/`, `Dockerfile`, or Cargo
-  manifests: builds and pushes a branch-tagged image via the reusable
-  `docker/github-builder` workflow.
+CI mirrors the monocle repo's workflow layout.
+
+- **`rust.yml`** — On push/PR to main (`**.md` ignored): `cargo fmt --check`,
+  `cargo clippy --all-features -- -D warnings`, `cargo test --all-features --verbose`.
+- **`release.yml`** — On `v*` tag: `build-test` gate (fmt, clippy, build, test) →
+  GitHub release (from `CHANGELOG.md`) → binary uploads for `aarch64-linux`,
+  `x86_64-linux`, `universal-apple-darwin` (`macos-14` runner) → `cargo publish`
+  runs last, only after binaries are uploaded.
+- **`docker.yml`** — One workflow for all image builds. On push to main (filtered to
+  `Dockerfile`, `src/**`, Cargo manifests, `.dockerignore`): pushes
+  `bgpkit/wayback-rpki:main`. On `v*` tag: pushes semver tags + `latest`. Also
+  supports `workflow_dispatch` with a version input for manual multi-tag rebuilds.
+  Builds `linux/amd64` + `linux/arm64` natively (`ubuntu-latest` / `ubuntu-24.04-arm`
+  matrix, no QEMU), pushes per-arch images by digest with registry cache, then merges
+  into multi-arch manifests on Docker Hub.
 
 ## Conventions
 
