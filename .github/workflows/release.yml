@@ -26,7 +26,7 @@ jobs:
         run: cargo test --all-features --verbose
 
   create-release:
-    needs: build-test
+    needs: cargo-publish
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +56,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   cargo-publish:
-    needs: upload-assets
+    needs: build-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
