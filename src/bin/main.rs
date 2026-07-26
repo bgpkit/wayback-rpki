@@ -104,6 +104,12 @@ enum Opts {
         #[clap(short, long)]
         from: String,
     },
+    /// Export a v2 rkyv archive as a portable JSONL transport file
+    Export {
+        /// output path, typically ending in .jsonl.gz
+        #[clap(short, long)]
+        output: String,
+    },
     /// Serve the API
     Serve {
         /// Additional path to backup the trie
@@ -156,6 +162,15 @@ fn auto_convert(bin_path: &str, rkyv_path: &str) -> anyhow::Result<()> {
     let mut builder = legacy.to_builder();
     builder.dump(rkyv_path)?;
     info!("auto-conversion complete: {}", rkyv_path);
+    Ok(())
+}
+
+fn export_archive(path: &str, output: &str) -> anyhow::Result<()> {
+    if !is_rkyv_path(path) {
+        anyhow::bail!("JSONL export requires a v2 .rkyv archive: {path}");
+    }
+    let trie = RoasTrie::open(path)?;
+    trie.export_jsonl(output)?;
     Ok(())
 }
 
@@ -327,6 +342,14 @@ fn main() {
             builder.dump(&path).unwrap();
             info!("converted legacy archive {} -> {}", from, path);
         }
+
+        Opts::Export { output } => match export_archive(&path, &output) {
+            Ok(()) => info!("exported {} to {}", path, output),
+            Err(err) => {
+                error!("failed to export {} to {}: {}", path, output, err);
+                exit(1);
+            }
+        },
 
         Opts::Serve {
             backup_to,
@@ -688,6 +711,49 @@ mod tests {
         let _ = std::fs::remove_file(jsonl);
         let _ = std::fs::remove_file(rkyv2);
         let _ = std::fs::remove_file(jsonl_in);
+    }
+
+    #[test]
+    fn export_archive_writes_portable_jsonl() {
+        let rkyv = unique_path(".rkyv");
+        let input = unique_path(".jsonl.gz");
+        let output = unique_path(".jsonl.gz");
+        {
+            let mut writer =
+                std::io::BufWriter::new(oneio::get_writer(input.to_str().unwrap()).unwrap());
+            writer
+                .write_all(b"{\"p\":\"1.1.1.0/24\",\"m\":24,\"o\":13335,\"r\":[[1704067200,1704067200]]}\n")
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        let mut builder = RoasTrieMut::from_jsonl(input.to_str().unwrap()).unwrap();
+        builder.dump(rkyv.to_str().unwrap()).unwrap();
+
+        export_archive(rkyv.to_str().unwrap(), output.to_str().unwrap()).unwrap();
+        let imported = RoasTrieMut::from_jsonl(output.to_str().unwrap()).unwrap();
+        assert_eq!(imported.len(), 1);
+
+        let _ = std::fs::remove_file(rkyv);
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn export_subcommand_parses_archive_and_output_paths() {
+        let cli = Cli::try_parse_from([
+            "wayback-rpki",
+            "input.rkyv",
+            "export",
+            "--output",
+            "backup.jsonl.gz",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.path, "input.rkyv");
+        match cli.subcommands {
+            Opts::Export { output } => assert_eq!(output, "backup.jsonl.gz"),
+            _ => panic!("expected export subcommand"),
+        }
     }
 
     #[test]

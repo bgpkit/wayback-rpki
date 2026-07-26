@@ -70,6 +70,7 @@ Commands:
   update    Find new ROA files and apply incremental changes
   search    Search for ROAs in history
   fix       Fill known historical data gaps
+  export    Export a v2 rkyv archive as a portable JSONL transport file
   serve     Start the API server
 
 Options:
@@ -119,6 +120,16 @@ wayback-rpki search --prefix 193.0.14.0/24 --exact false
 
 Options: `--asn`, `--prefix`, `--max-len`, `--date` (YYYY-MM-DD), `--current` (bool),
 `--exact` (bool, default `true`).
+
+### `export` — Portable JSONL Export
+
+Export a local v2 `.rkyv` archive to the portable JSONL transport format. Use a `.jsonl.gz`
+output path for gzip compression. This supports backups and transfers across architectures; it
+does not modify the source archive.
+
+```bash
+wayback-rpki export --output roas_trie.jsonl.gz roas_trie.rkyv
+```
 
 ### `serve` — API Server
 
