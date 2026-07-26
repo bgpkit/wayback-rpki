@@ -17,10 +17,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ------------------------------------------------------------------------------
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=wayback-rpki-cargo-registry,target=/usr/local/cargo/registry \
     cargo chef cook --release --recipe-path recipe.json
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=wayback-rpki-cargo-registry,target=/usr/local/cargo/registry \
     cargo build --release && \
     cp /app/target/release/wayback-rpki /usr/local/bin/wayback-rpki
 
