@@ -15,10 +15,10 @@ rust-version = "1.81"
 name = "wayback-rpki"
 path = "src/bin/main.rs"
 
-
 [dependencies]
 
 anyhow = "1"
+tikv-jemallocator = "0.6"
 oneio = { version = "0.24", default-features = false, features = ["https", "xz", "gz", "s3"] }
 chrono = "0.4.38"
 dotenvy = "0.15"
