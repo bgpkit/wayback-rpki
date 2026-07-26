@@ -3,9 +3,15 @@
 ## Overview
 
 Rust service that crawls historical RPKI ROA dumps from RIPE (`ftp.ripe.net/rpki/`),
-stores them in an in-memory `IpnetTrie`, and serves a REST API for querying ROA
-history by prefix, ASN, max-length, date, and currency. Ships as a CLI binary
-and a Docker image.
+stores them in a `prefix-trie` `JointPrefixMap`, and serves a REST API for querying ROA
+history by prefix, ASN, max-length, date, and currency. Ships as a CLI binary and a
+Docker image.
+
+Since v2.0.0 the on-disk format is an `rkyv` archive (`roas_trie.rkyv`) that is
+memory-mapped at startup — RSS drops from ~756 MB to ~5 MB and startup from ~2.3 s to
+~23 ms. Bootstrap downloads and remote backups use a platform-agnostic JSONL.gz
+transport. Legacy v1 `.bin`/`.bin.gz` archives (bincode + `ipnet-trie`) are still
+supported via a dual-backend design and auto-convert on first run.
 
 ## Project Structure
 
@@ -13,15 +19,17 @@ and a Docker image.
 wayback-rpki/
 ├── src/
 │   ├── lib.rs          # Crawler: TAL URL discovery, ROA CSV parsing, public types
-│   ├── roas_trie.rs    # Core data structure: IpnetTrie-backed ROA storage + search
-│   ├── api.rs          # Axum HTTP API: /search and /health endpoints
-│   └── bin/main.rs     # CLI entry point: rebuild, update, search, fix, serve subcommands
-├── Dockerfile          # Multi-stage build (rust:1.90 → debian:bookworm-slim)
+│   ├── roas_trie.rs    # v2 core: rkyv archive, JointPrefixMap storage, JSONL transport
+│   ├── legacy.rs       # v1 backend: bincode + ipnet-trie, kept for transition
+│   ├── api.rs          # Axum HTTP API: /search, /validate, /health; TrieBackend enum
+│   └── bin/main.rs     # CLI: rebuild, update, fix, search, convert, serve
+├── Dockerfile          # cargo-chef multi-stage build (rust:1.90 → debian:trixie-slim)
 ├── Cargo.toml          # Crate metadata; bin name = wayback-rpki
 └── .github/workflows/
-    ├── rust.yml        # PR CI: cargo build + clippy -D warnings
+    ├── rust.yml        # Push/PR to main: cargo build + clippy -D warnings
     ├── release.yml     # Tag-triggered: GitHub release + cargo publish + binary uploads
-    └── docker.yml      # Tag/main-triggered: multi-arch Docker Hub push
+    ├── docker.yml      # Tag/dispatch-triggered: native multi-arch Docker Hub push
+    └── docker-main.yml # Push to main: branch-tagged image via reusable docker/github-builder workflow
 ```
 
 ## Key Modules
@@ -34,94 +42,147 @@ wayback-rpki/
   Each entry has `tal`, `prefix` (`IpNet`), `max_len`, `asn`, `date` (`NaiveDate`).
 - **`get_tal_urls(tal)`** — Returns RIPE RPKI TAL URLs for the 5 RIRs (afrinic, apnic, arin,
   lacnic, ripencc). `None` → all TALs.
-- **Public types**: `RoaEntry`, `RoaFile` — re-exported at crate root.
+- **Public types**: `RoaEntry`, `RoaFile` — re-exported at crate root along with
+  `api::*` and `roas_trie::*`.
 
-### `src/roas_trie.rs` — Core Data Structure
+### `src/roas_trie.rs` — v2 Core Data Structure
 
-- **`RoasTrie`** — Wraps `IpnetTrie<HashMap<(u8, u32), RoasTrieEntry>>`. Each trie node
-  stores a map keyed by `(max_len, origin_asn)` → `RoasTrieEntry`.
-- **`RoasTrieEntry`** — Stores `max_len`, `origin`, and date ranges. Uses dual storage:
-  `dates: HashSet<i64>` during bootstrap, `dates_compressed: VecDeque<(i64, i64)>` after
-  `compress_dates()` merges consecutive days into ranges.
-- **Key methods**:
-  - `load(path)` / `dump(path)` — Serialize/deserialize via `bincode` + `oneio` (supports
-    `.gz` compression).
-  - `process_entries(entries, bootstrap)` — Insert ROA entries; `bootstrap=true` uses
-    `HashSet` dates, `bootstrap=false` uses compressed `VecDeque`.
-  - `search(prefix, origin, max_len, date, current, exact)` — Query with filters.
-    `exact=true` (default) uses `exact_match()` for the prefix; `exact=false` uses
-    `matches()` which includes supernets and subnets.
-  - `update(tal, until)` — Incremental update: crawl new files since `latest_date`,
-    process, and update in place.
-  - `compress_dates()` — Convert all `HashSet` dates to compressed `VecDeque` ranges.
-  - `fill_gaps()` — Fill known historical data gaps (see `KNOWN_GAPS_STR` constant).
+- **`RoasTrieData`** — The serialized archive (rkyv): header (`format_version`,
+  `latest_date`, `ipv4_count`, `ipv6_count`) plus `trie: JointPrefixMap<IpNet,
+  Vec<RoaRecord>>`. `FORMAT_VERSION = 2` is checked on every open/load.
+- **`RoaRecord`** — One archived ROA: `max_len`, `origin`, and compressed date
+  `ranges: Vec<(i64, i64)>` (UTC day-granularity timestamps).
+- **`RoasTrieMut`** — Mutable builder used by rebuild/update/fix/convert. Wraps
+  `JointPrefixMap<IpNet, Vec<RoaRecordMut>>`; `RoaRecordMut` dual-stores
+  `dates: HashSet<i64>` during bootstrap and `ranges` after compression.
+  - `load(path)` — Reads a v2 archive into a mutable trie (full deserialize).
+  - `dump(path)` — Compresses dates, serializes with rkyv, writes to `path.tmp` then
+    atomically renames (safe hot-reload while the API is serving the old mmap).
+  - `process_entries(entries, bootstrap)` / `update(tal, until)` / `fill_gaps()` —
+    same semantics as v1.
+- **`RoasTrie`** — Read-only query handle. `open(path)` memory-maps the archive with
+  `memmap2` and validates once; queries run zero-copy on the mapped bytes.
+  `from_bytes(bytes)` does the same over owned bytes.
+  - `search(prefix, origin, max_len, date, current, exact)` — `exact=true` (default)
+    does an exact trie `get()`; `exact=false` reproduces the old `matches()` semantics
+    (shortest covering prefix + its entire subtree, i.e. supernets and subnets).
   - `validate(prefix, origin, date_ts)` — RPKI validation: `Valid` / `Invalid` / `Unknown`.
-  - `lookup_prefix(prefix)` — Return all ROAs matching a prefix (includes super/subnets).
+  - `lookup_prefix(prefix)` — All ROAs matching a prefix, including supernets/subnets.
+- **JSONL transport** — `JsonlRecord { p, m, o, r }`, one record per line. Platform-agnostic
+  and streamable; used for bootstrap downloads and remote backups (the `.rkyv` archive
+  itself is platform-specific).
+  - `RoasTrieMut::import_jsonl(path)` / `from_jsonl(path)` — Streams one record at a
+    time; validates input and reports physical line numbers on error. Peak memory is
+    just the builder (~200 MB for the full dataset).
+  - `RoasTrie::export_jsonl(path)` — Streams zero-copy from the mmap archive.
+- **`REMOTE_BOOTSTRAP_URL`** — `https://spaces.bgpkit.org/broker/roas_trie.jsonl.gz`.
+
+### `src/legacy.rs` — v1 Backend (transition only)
+
+- **`LegacyRoasTrie`** — The v1 in-memory implementation: `IpnetTrie<HashMap<(u8, u32),
+  LegacyRoasTrieEntry>>` serialized with bincode (via `oneio`, `.gz`-aware). Implements
+  the same query surface (`search`, `validate`, `lookup_prefix`, `counts` via iteration,
+  `update`, `fill_gaps`).
+- **`to_builder()`** — Converts a loaded legacy trie into a `RoasTrieMut` for writing
+  a v2 archive. Used by `convert` and by automatic first-run migration.
+- The v1 deps (`ipnet-trie`, `bincode`) are always compiled in during the transition
+  period. Note: `bincode` 2.x is flagged unmaintained by `cargo audit` — acceptable
+  while legacy support is retained.
 
 ### `src/api.rs` — HTTP API (Axum)
 
-- **`/search`** — Query ROAs. Parameters: `asn`, `prefix`, `max_len`, `date`, `current`,
-  `page`, `page_size` (max 1000), `exact` (default `true`). Returns paginated JSON.
-  Malformed `prefix` or `date` returns `400` with a JSON error.
-- **`/health`** — Returns IPv4/IPv6 ROA counts and `latest_date`.
-- **`start_api_service(trie, host, port, root)`** — Starts the Axum server with CORS.
-  `root` parameter nests routes under a path prefix (e.g., `/api`).
+- **`TrieBackend`** — `V2(RoasTrie)` | `V1(LegacyRoasTrie)`; uniform
+  `search`/`validate`/`counts`/`latest_date_ts`/`format_version` surface.
+  `format_version()` returns 2 for rkyv, 1 for legacy.
+- **`/search`** — Params: `asn`, `prefix`, `max_len`, `date`, `current`, `page`,
+  `page_size` (max 1000), `exact` (default `true`). Paginated JSON; `meta` includes
+  `latest_date` and `format_version`. Malformed `prefix`/`date` → `400` JSON error.
+- **`/validate`** — Params: `prefix` (required), `asn` (required), `date` (default:
+  latest). Returns `valid` / `invalid` / `unknown`.
+- **`/health`** — IPv4/IPv6 ROA counts, `latest_date`, `format_version`.
+- **`start_api_service(trie, host, port, root)`** — Axum server with CORS;
+  `root != "/"` nests routes under a path prefix.
 
 ### `src/bin/main.rs` — CLI
 
-- **Global args**: `path` (default `roas_trie.bin.gz`), `--bootstrap` (download from
-  `spaces.bgpkit.org` if file missing), `--env` (dotenv path).
+- **Global args**: `path` (default `roas_trie.rkyv`; suffix selects the backend:
+  `.rkyv` → v2 mmap, `.bin`/`.bin.gz` → v1 legacy in-memory), `--bootstrap`,
+  `--env` (dotenv path).
 - **Subcommands**:
-  - `rebuild` — Full historical rebuild from scratch (parallel, with progress bar).
-  - `update` — Incremental update from latest data.
-  - `search` — CLI search with `--prefix`, `--asn`, `--max_len`, `--date`, `--current`,
-    `--exact`. Outputs a markdown table.
-  - `fix` — Fill known data gaps.
-  - `serve` — Start the API server. `--host` (default `0.0.0.0`), `--port` (default
-    `40065`), `--backup-to` (additional backup path). Background thread updates the trie
-    every 8 hours and uploads backups to R2/S3/local.
+  - `rebuild` — Full historical rebuild (`--tal`, `--chunks`, `--from`, `--until`);
+    parallel parse + progress bar, single writer thread.
+  - `update` — Incremental update from `latest_date + 1` (`--tal`, `--until`).
+  - `fix` — Fill known data gaps (`KNOWN_GAPS_STR`).
+  - `search` — CLI search (`--asn`, `--prefix`, `--max_len`, `--date`, `--current`,
+    `--exact`); markdown table output.
+  - `convert --from <legacy.bin.gz>` — Convert a v1 archive to the v2 rkyv format.
+  - `serve` — API server: `--host` (default `0.0.0.0`), `--port` (default `40065`),
+    `--backup-to`, `--update-interval` (seconds, default `28800` = 8 h). A background
+    thread reloads the trie from disk, dumps it atomically, writes backups, then swaps
+    the serving `TrieBackend` behind an `RwLock`.
+
+## Bootstrap & Migration
+
+`check_bootstrap_and_download` precedence when the requested `.rkyv` is missing:
+
+1. **Local sibling** `roas_trie.bin.gz` / `roas_trie.bin` → auto-convert to `.rkyv`.
+2. **Remote JSONL** `roas_trie.jsonl.gz` (`--bootstrap`) → stream-import → dump `.rkyv`.
+3. **Remote legacy** `roas_trie.bin.gz` (`--bootstrap`, fallback) → download → auto-convert.
+
+A `.bin`/`.bin.gz` `path` keeps working directly in legacy mode without conversion.
 
 ## Architecture Notes
 
-- **Data flow**: RIPE CSV dumps → `parse_roas_csv` → `RoasTrie.process_entries` →
-  in-memory trie → serialized to `.bin.gz` via `bincode`.
-- **Bootstrap file**: `https://spaces.bgpkit.org/broker/roas_trie.bin.gz` — pre-built
-  trie with full history. Downloaded automatically with `--bootstrap` if no local file.
-- **Backup**: `WAYBACK_BACKUP_TO=r2://spaces/broker/roas_trie.bin.gz` uploads to Cloudflare
-  R2 after each background update cycle. Requires `AWS_*` env vars.
+- **Data flow**: RIPE CSV dumps → `parse_roas_csv` → `RoasTrieMut.process_entries` →
+  rkyv-serialized `RoasTrieData` (`.rkyv`) → memory-mapped by `RoasTrie` for serving.
+- **Backups**: after each background update cycle, `backup_archive` streams the mmap
+  archive to `.jsonl.gz` and uploads to S3/R2 (`s3://`/`r2://` via `oneio::s3_upload`,
+  requires `AWS_*` env vars) or writes locally. Destinations: `--backup-to` plus
+  `WAYBACK_BACKUP_TO` env var. `WAYBACK_BACKUP_HEARTBEAT_URL` is GET-pinged after a
+  successful backup.
 - **Production deployment**: Docker Compose on `bh-01`/`bh-02` (Tailscale), proxied by
-  Cloudflare Worker at `alpha.api.bgpkit.com` with failover.
+  Cloudflare Worker at `alpha.api.bgpkit.com` with failover. Container entrypoint:
+  `wayback-rpki serve --bootstrap --host 0.0.0.0 --port 40065`.
 
 ## Build & Test
 
 ```bash
 cargo build                              # Build
 cargo clippy --all-features -- -D warnings  # Lint (CI-enforced)
-cargo test --lib roas_trie::tests         # Run offline unit tests only
-cargo test                                # Run all tests (some require network)
+cargo test --lib roas_trie::tests         # Offline unit tests (plus src/bin/main.rs tests)
+cargo test                                # All tests (lib.rs crawler tests need network to ftp.ripe.net)
 ```
 
 ## CI/CD
 
-- **`rust.yml`** — On PR to main: `cargo build` + `cargo clippy -- -D warnings`.
+- **`rust.yml`** — On push/PR to main: `cargo build` + `cargo clippy -- -D warnings`.
 - **`release.yml`** — On `v*` tag: GitHub release (from `CHANGELOG.md`), `cargo publish`,
   binary uploads for `aarch64-linux`, `x86_64-linux`, `universal-apple-darwin`.
-- **`docker.yml`** — On `v*` tag: builds `linux/amd64` + `linux/arm64` natively (no
-  QEMU — uses `ubuntu-latest` and `ubuntu-24.04-arm` runners in a matrix), merges into
-  multi-arch manifests, pushes to `bgpkit/wayback-rpki` on Docker Hub with semver tags
-  + `latest`.
+- **`docker.yml`** — On `v*` tag (or `workflow_dispatch` with a version input): builds
+  `linux/amd64` + `linux/arm64` natively (`ubuntu-latest` / `ubuntu-24.04-arm` matrix,
+  no QEMU), pushes per-arch images by digest with registry cache, then merges into
+  multi-arch manifests on Docker Hub (`bgpkit/wayback-rpki`) with semver tags + `latest`.
+- **`docker-main.yml`** — On push to main touching `src/`, `Dockerfile`, or Cargo
+  manifests: builds and pushes a branch-tagged image via the reusable
+  `docker/github-builder` workflow.
 
 ## Conventions
 
 - Clippy must pass with `-D warnings` — CI enforces this.
 - `sort_by_key` is preferred over `sort_by(|a, b| ...)` (newer clippy lint).
-- Type aliases are used for complex generics (see `RoasTrieMap`) to satisfy
-  `clippy::type_complexity`.
-- The `IpnetTrie::matches()` method returns all children of the shortest supernet, NOT
-  just the queried prefix — this caused issue #9. Always use `exact_match()` for exact
-  prefix lookups unless inclusive matching is explicitly desired.
+- Type aliases are used for complex generics (see `RoasTrieMap` in `legacy.rs`) to
+  satisfy `clippy::type_complexity`.
+- Exact-match semantics: `/search?prefix=` and CLI `search` default to exact prefix
+  match (`exact=true`); `exact=false` includes supernets and subnets (the pre-v1.0.5
+  `matches()` behavior that caused issue #9). Keep `exact=true` as the default for
+  prefix lookups unless inclusive matching is explicitly requested.
+- The `.rkyv` archive is platform-specific (endianness/layout) — never distribute it
+  across machines; use the JSONL.gz transport for bootstrap/backup exchange.
+- v2 search results are deterministically ordered (trie lexicographic prefix order,
+  then `(origin, max_len)` within a prefix); v1 legacy order is nondeterministic
+  HashMap order.
 
 ## Known Gaps
 
-`KNOWN_GAPS_STR` in `roas_trie.rs` lists dates where RIPE data was missing. The `fix`
-subcommand fills these by interpolating adjacent date ranges.
+`KNOWN_GAPS_STR` in `src/roas_trie.rs` lists 24 date ranges where RIPE data was missing.
+The `fix` subcommand fills these by interpolating adjacent date ranges.
