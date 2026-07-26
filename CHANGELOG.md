@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
 * Platform-agnostic JSONL.gz transport: bootstrap and backups now stream a portable
   `.jsonl.gz` format instead of platform-specific `.rkyv.gz`, cutting bootstrap peak RAM from
   ~1 GB to ~200 MB (#13)
+* jemalloc global allocator: RSS drops from ~1.28 GB to ~569 MB steady-state by returning
+  freed pages to the OS after bootstrap/update spikes — fits Railway's 1 GB plan (#14)
 * Smooth v1 → v2 transition: legacy `.bin`/`.bin.gz` archives (local sibling or remote
   bootstrap) are auto-converted on first run — no manual migration or prompts (#12)
 
@@ -35,6 +37,8 @@ All notable changes to this project will be documented in this file.
   archive (#13)
 * Archive updates write to a temp file and atomically rename for safe hot-reload during
   background updates (#12)
+* jemalloc global allocator (`tikv_jemallocator`) returns freed pages to the OS after
+  bootstrap/update, cutting steady-state RSS by 55% (#14)
 
 ### Bug Fixes
 
