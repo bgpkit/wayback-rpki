@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version for manual rebuild (e.g. 2.0.0) — pushes {version}, {major}.{minor}, and latest'
+        description: 'Version for manual rebuild (e.g. 1.1.0) — pushes {version}, {major}.{minor}, and latest'
         required: true
-        default: '2.0.0'
+        default: '1.1.0'
 
 permissions:
   contents: read
@@ -56,7 +56,7 @@ jobs:
         with:
           images: bgpkit/wayback-rpki
           # On branch push to main: type=ref,event=branch → "main"
-          # On tag push v2.0.0: type=semver → "2.0.0", "2.0", and "latest"
+          # On tag push v1.1.0: type=semver → "1.1.0", "1.1", and "latest"
           # On manual dispatch: type=raw uses the input version
           tags: |
             type=ref,event=branch
@@ -118,7 +118,7 @@ jobs:
         with:
           images: bgpkit/wayback-rpki
           # On branch push to main: type=ref,event=branch → "main"
-          # On tag push v2.0.0: type=semver → "2.0.0", "2.0", and "latest"
+          # On tag push v1.1.0: type=semver → "1.1.0", "1.1", and "latest"
           # On manual dispatch: type=raw uses the input version
           tags: |
             type=ref,event=branch
