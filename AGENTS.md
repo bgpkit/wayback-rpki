@@ -25,6 +25,7 @@ wayback-rpki/
 │   └── bin/main.rs     # CLI: rebuild, update, fix, search, convert, serve
 ├── Dockerfile          # cargo-chef multi-stage build (rust:1.90 → debian:trixie-slim)
 ├── Cargo.toml          # Crate metadata; bin name = wayback-rpki
+├── DEVELOPMENT.md      # Reproducible data-integrity and transport-generation operations
 └── .github/workflows/
     ├── rust.yml        # Push/PR to main: cargo fmt --check + clippy -D warnings + tests
     ├── release.yml     # Tag-triggered: build-test gate → GitHub release → binaries → cargo publish
@@ -111,7 +112,9 @@ wayback-rpki/
   - `rebuild` — Full historical rebuild (`--tal`, `--chunks`, `--from`, `--until`);
     parallel parse + progress bar, single writer thread.
   - `update` — Incremental update from `latest_date + 1` (`--tal`, `--until`).
-  - `fix` — Fill known data gaps (`KNOWN_GAPS_STR`).
+  - `fix <input.jsonl[.gz]> [-o <output.jsonl[.gz]>]` — Apply the known-gap
+    policy to a portable JSONL transport. Without `-o/--output`, overwrites the
+    input in place via atomic rename; see `DEVELOPMENT.md`.
   - `search` — CLI search (`--asn`, `--prefix`, `--max_len`, `--date`, `--current`,
     `--exact`); markdown table output.
   - `convert --from <legacy.bin.gz>` — Convert a v1 archive to the v2 rkyv format.
@@ -186,7 +189,13 @@ CI mirrors the monocle repo's workflow layout.
   then `(origin, max_len)` within a prefix); v1 legacy order is nondeterministic
   HashMap order.
 
-## Known Gaps
+## Known Gaps and Data Repair
 
-`KNOWN_GAPS_STR` in `src/roas_trie.rs` lists 24 date ranges where RIPE data was missing.
-The `fix` subcommand fills these by interpolating adjacent date ranges.
+`KNOWN_GAPS_STR` in `roas_trie.rs` defines an interpolation policy; the `fix`
+subcommand fills listed intervals only where an identical record exists on both
+boundaries. A range discontinuity may be a product-history omission, a raw-
+source discontinuity, or both. Do not label interpolated data as observed.
+
+Read `DEVELOPMENT.md` before investigating a gap, modifying `KNOWN_GAPS_STR`,
+or generating a replacement JSONL transport. It contains the D-1/D/D+1 source
+comparison, provenance requirements, helper command, and required validation.

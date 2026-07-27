@@ -16,6 +16,9 @@ All notable changes to this project will be documented in this file.
   freed pages to the OS after bootstrap/update spikes — fits Railway's 1 GB plan (#14)
 * Smooth v1 → v2 transition: legacy `.bin`/`.bin.gz` archives (local sibling or remote
   bootstrap) are auto-converted on first run — no manual migration or prompts (#12)
+* Repurposed `fix` subcommand: operates on portable JSONL transports with optional
+  in-place repair via atomic rename; see `DEVELOPMENT.md` for the gap-investigation
+  and transport-generation procedure
 
 ### Breaking Changes
 
@@ -39,6 +42,10 @@ All notable changes to this project will be documented in this file.
   background updates (#12)
 * jemalloc global allocator (`tikv_jemallocator`) returns freed pages to the OS after
   bootstrap/update, cutting steady-state RSS by 55% (#14)
+* `fix <input.jsonl[.gz]> [-o <output.jsonl[.gz]>]` — applies `KNOWN_GAPS_STR` to a
+  portable JSONL transport; without `-o`, overwrites in place via atomic rename
+* `DEVELOPMENT.md` documents the historical-gap investigation and transport-generation
+  procedure
 
 ### Bug Fixes
 

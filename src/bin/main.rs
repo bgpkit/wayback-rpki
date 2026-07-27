@@ -70,8 +70,15 @@ enum Opts {
         #[clap(short, long)]
         until: Option<NaiveDate>,
     },
-    /// Fix potential data issues
-    Fix {},
+    /// Apply the known-gap policy to a JSONL transport (`.jsonl` or `.jsonl.gz`)
+    Fix {
+        /// input JSONL transport (`.jsonl` or `.jsonl.gz`)
+        input: String,
+
+        /// output JSONL transport; if omitted, overwrites the input in place
+        #[clap(short, long)]
+        output: Option<String>,
+    },
     /// Search for ROAs in history
     Search {
         /// filter results by ASN exact match
@@ -172,6 +179,31 @@ fn export_archive(path: &str, output: &str) -> anyhow::Result<()> {
     let trie = RoasTrie::open(path)?;
     trie.export_jsonl(output)?;
     Ok(())
+}
+
+/// Import a JSONL transport, apply `KNOWN_GAPS_STR`, and export a new JSONL transport.
+/// Uses a temporary rkyv archive internally; it is deleted after export.
+fn fix_jsonl_transport(input: &str, output: &str) -> anyhow::Result<()> {
+    let mut trie = RoasTrieMut::from_jsonl(input)?;
+    trie.fill_gaps();
+
+    let archive_path = std::env::temp_dir().join(format!(
+        "wayback-rpki-fix-{}-{}.rkyv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let archive_path = archive_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("temporary archive path is not valid UTF-8"))?;
+
+    let result = (|| {
+        trie.dump(archive_path)?;
+        RoasTrie::open(archive_path)?.export_jsonl(output)
+    })();
+    let _ = std::fs::remove_file(archive_path);
+    result
 }
 
 fn main() {
@@ -321,18 +353,41 @@ fn main() {
             println!("{}", Table::new(results).with(Style::markdown()));
         }
 
-        Opts::Fix {} => {
-            check_bootstrap_and_download(&path, opts.bootstrap);
-            ensure_data_available(&path);
-
-            if is_rkyv_path(&path) {
-                let mut trie = RoasTrieMut::load(&path).unwrap();
-                trie.fill_gaps();
-                trie.dump(&path).unwrap();
+        Opts::Fix { input, output } => {
+            let output = output.unwrap_or_else(|| input.clone());
+            if input == output {
+                // In-place: write to a temp file (preserving extension for oneio
+                // compression), then atomically rename over the original.
+                let suffix = std::path::Path::new(&input)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("tmp");
+                let tmp_path = std::env::temp_dir().join(format!(
+                    "wayback-rpki-fix-{}-{}.{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_nanos()),
+                    suffix
+                ));
+                let tmp_str = tmp_path.to_str().expect("temporary path is valid UTF-8");
+                if let Err(e) = fix_jsonl_transport(&input, tmp_str) {
+                    error!("failed to generate fixed JSONL transport: {e}");
+                    let _ = std::fs::remove_file(tmp_str);
+                    exit(1);
+                }
+                if let Err(e) = std::fs::rename(tmp_str, &output) {
+                    error!("failed to rename temporary file to {output}: {e}");
+                    let _ = std::fs::remove_file(tmp_str);
+                    exit(1);
+                }
+                info!("fixed JSONL transport written in-place to {output}");
             } else {
-                let mut trie = wayback_rpki::legacy::LegacyRoasTrie::load(&path).unwrap();
-                trie.fill_gaps();
-                trie.dump(&path).unwrap();
+                if let Err(e) = fix_jsonl_transport(&input, &output) {
+                    error!("failed to generate fixed JSONL transport: {e}");
+                    exit(1);
+                }
+                info!("fixed JSONL transport written to {output}");
             }
         }
 
@@ -754,6 +809,26 @@ mod tests {
             Opts::Export { output } => assert_eq!(output, "backup.jsonl.gz"),
             _ => panic!("expected export subcommand"),
         }
+    }
+
+    #[test]
+    fn fix_bridges_a_known_gap() -> anyhow::Result<()> {
+        let input = unique_path(".input.jsonl");
+        let output = unique_path(".output.jsonl");
+        std::fs::write(
+            &input,
+            r#"{"p":"1.1.1.0/24","m":24,"o":13335,"r":[[1687478400,1687478400],[1687651200,1687651200]]}"#,
+        )?;
+
+        fix_jsonl_transport(input.to_str().unwrap(), output.to_str().unwrap())?;
+
+        let contents = std::fs::read_to_string(&output)?;
+        let record: serde_json::Value = serde_json::from_str(contents.trim())?;
+        assert_eq!(record["r"], serde_json::json!([[1687478400, 1687651200]]));
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+        Ok(())
     }
 
     #[test]
