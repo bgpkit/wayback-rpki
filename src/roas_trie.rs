@@ -17,7 +17,7 @@ pub const FORMAT_VERSION: u32 = 2;
 /// the client streams it through a builder and dumps a local `.rkyv` for mmap serving.
 pub const REMOTE_BOOTSTRAP_URL: &str = "https://spaces.bgpkit.org/broker/roas_trie.jsonl.gz";
 
-pub(crate) const KNOWN_GAPS_STR: [(&str, &str); 24] = [
+pub(crate) const KNOWN_GAPS_STR: [(&str, &str); 26] = [
     ("2018-12-28", "2019-01-02"),
     ("2019-10-22", "2019-10-22"),
     ("2019-11-24", "2019-11-24"),
@@ -42,6 +42,8 @@ pub(crate) const KNOWN_GAPS_STR: [(&str, &str); 24] = [
     ("2022-02-16", "2022-02-16"),
     ("2023-06-24", "2023-06-24"),
     ("2023-07-14", "2023-07-17"),
+    ("2026-04-04", "2026-04-04"),
+    ("2026-06-13", "2026-06-13"),
 ];
 
 const ONE_DAY_SECONDS: i64 = 86400;
