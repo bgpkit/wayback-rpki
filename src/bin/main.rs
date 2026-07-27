@@ -457,6 +457,7 @@ fn main() {
                                 .map_err(|e| e.to_string())
                                 .and_then(|mut t| {
                                     t.update(None, None).map_err(|e| e.to_string())?;
+                                    t.fill_gaps();
                                     t.dump(&rkyv_path).map_err(|e| e.to_string())?;
                                     Ok(())
                                 })
@@ -465,6 +466,7 @@ fn main() {
                                 .map_err(|e| e.to_string())
                                 .and_then(|mut t| {
                                     t.update(None, None).map_err(|e| e.to_string())?;
+                                    t.fill_gaps();
                                     t.dump(&rkyv_path).map_err(|e| e.to_string())?;
                                     Ok(())
                                 })
