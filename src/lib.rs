@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod legacy;
+pub mod pg_ingest;
 mod roas_trie;
 
 use anyhow::{anyhow, Result};

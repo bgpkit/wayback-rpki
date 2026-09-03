@@ -133,6 +133,24 @@ enum Opts {
         #[clap(short, long, default_value = "28800")]
         update_interval: u64,
     },
+    /// Backfill ROA history into the v2.1 PostgreSQL store (object-grain)
+    PgBackfill {
+        /// PostgreSQL connection config, e.g. "host=127.0.0.1 user=scouty dbname=wayback_poc password=..."
+        #[clap(long)]
+        pg_config: String,
+
+        /// Date to start from (inclusive), format YYYY-MM-DD
+        #[clap(short, long)]
+        from: NaiveDate,
+
+        /// Date to stop at (inclusive), format YYYY-MM-DD
+        #[clap(short, long)]
+        until: NaiveDate,
+
+        /// limit to specific tal(s), comma-separated: afrinic,apnic,arin,lacnic,ripencc
+        #[clap(short, long)]
+        tal: Option<String>,
+    },
 }
 
 fn num_threads() -> usize {
@@ -234,6 +252,19 @@ fn main() {
     let path = opts.path.clone();
 
     match opts.subcommands {
+        Opts::PgBackfill {
+            pg_config,
+            from,
+            until,
+            tal,
+        } => {
+            let tals: Option<Vec<String>> =
+                tal.map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+            if let Err(e) = wayback_rpki::pg_ingest::pg_backfill(&pg_config, from, until, tals) {
+                eprintln!("pg-backfill failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
         Opts::Rebuild {
             tal,
             chunks_opt,
