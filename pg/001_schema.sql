@@ -89,6 +89,12 @@ FROM covered
 GROUP BY prefix, origin_asn, max_len;
 
 -- Change events: attribute changes and lifecycle boundaries.
+-- Noise policy (storage stays raw; only this view filters):
+--   * short-lived versions (span <= 3 days) are excluded by default -- they are
+--     publication-window oscillation (e.g. APNIC 22% of objects, LACNIC re-signs),
+--     not authorization changes; pass raw=true / drop the filter for audits.
+--   * objects flipping >= 3 versions inside 7 days are classified as
+--     publication_flap (publisher health signal) instead of cert_window_changed.
 CREATE OR REPLACE VIEW wayback.roa_change_event_view AS
 SELECT
   nv.roa_obj_id,
@@ -100,12 +106,22 @@ SELECT
   CASE
     WHEN ov.roa_obj_id IS NULL THEN 'appeared'
     WHEN nv.max_len <> ov.max_len THEN 'maxlen_changed'
+    WHEN (SELECT count(*) FROM wayback.roa_version f
+          WHERE f.roa_obj_id = nv.roa_obj_id
+            AND f.first_seen >= nv.first_seen - 7
+            AND f.first_seen <= nv.first_seen) >= 3
+      THEN 'publication_flap'
     ELSE 'cert_window_changed'
-  END AS change_type
+  END AS change_type,
+  COALESCE(nv.last_seen, CURRENT_DATE) - nv.first_seen + 1 AS span_days
 FROM wayback.roa_version nv
 JOIN wayback.roa_object o USING (roa_obj_id)
 LEFT JOIN wayback.roa_version ov
   ON ov.roa_obj_id = nv.roa_obj_id
  AND ov.last_seen = nv.first_seen - 1
-WHERE ov.roa_obj_id IS NULL OR nv.max_len <> ov.max_len
-   OR nv.not_before <> ov.not_before OR nv.not_after <> ov.not_after;
+WHERE (ov.roa_obj_id IS NULL OR nv.max_len <> ov.max_len
+    OR nv.not_before <> ov.not_before OR nv.not_after <> ov.not_after)
+  -- noise floor: drop events whose PREVIOUS span was a short-lived flip;
+  -- real renewals have long preceding spans. appeared/maxlen always kept.
+  AND (ov.roa_obj_id IS NULL OR nv.max_len <> ov.max_len
+       OR COALESCE(ov.last_seen, CURRENT_DATE) - ov.first_seen + 1 > 3);
