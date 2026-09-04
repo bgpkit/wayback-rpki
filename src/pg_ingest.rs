@@ -240,8 +240,10 @@ pub fn ingest_day(
                     )?;
                     tx.execute(
                         "INSERT INTO wayback.roa_version
-                           (roa_obj_id, max_len, not_before, not_after, first_seen)
-                         VALUES ($1, $2, $3::timestamp AT TIME ZONE 'UTC', $4::timestamp AT TIME ZONE 'UTC', $5)
+                           (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
+                         VALUES ($1, $2, $3::timestamp AT TIME ZONE 'UTC', $4::timestamp AT TIME ZONE 'UTC', $5,
+                                 (SELECT min(w.first_seen) - 1 FROM wayback.roa_version w
+                                   WHERE w.roa_obj_id = $1 AND w.first_seen > $5))
                          ON CONFLICT (roa_obj_id, first_seen) DO NOTHING",
                         &[
                             &cur.roa_obj_id,
@@ -360,11 +362,15 @@ pub fn ingest_day(
                 )",
             &[&tal, &day],
         )?;
-        // Versions: one per staged tuple unless an identical current version
-        // already exists (idempotent replay).
+        // Versions: one per staged tuple unless a matching span already covers
+        // the day (idempotent replay). When backfilling an earlier day
+        // (out-of-order repair), bound the new span by the object's next
+        // existing span instead of leaving it open-ended.
         let n_ver = tx.execute(
-            "INSERT INTO wayback.roa_version (roa_obj_id, max_len, not_before, not_after, first_seen)
-             SELECT o.roa_obj_id, d.max_len, d.not_before, d.not_after, $2
+            "INSERT INTO wayback.roa_version (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
+             SELECT o.roa_obj_id, d.max_len, d.not_before, d.not_after, $2::date,
+                    (SELECT min(w.first_seen) - 1 FROM wayback.roa_version w
+                      WHERE w.roa_obj_id = o.roa_obj_id AND w.first_seen > $2::date)
              FROM (
                SELECT DISTINCT ON (uri, prefix, origin) uri, prefix, origin, max_len, not_before, not_after
                FROM stage_day ORDER BY uri, prefix, origin
@@ -373,7 +379,11 @@ pub fn ingest_day(
                ON o.ta = $1 AND o.uri = d.uri AND o.prefix::text = d.prefix AND o.origin_asn = d.origin
              WHERE NOT EXISTS (
                SELECT 1 FROM wayback.roa_version v
-               WHERE v.roa_obj_id = o.roa_obj_id AND v.last_seen IS NULL
+               WHERE v.roa_obj_id = o.roa_obj_id
+                 AND v.max_len = d.max_len
+                 AND v.not_before = d.not_before AND v.not_after = d.not_after
+                 AND v.first_seen <= $2::date
+                 AND (v.last_seen IS NULL OR v.last_seen >= $2::date - 1)
              )",
             &[&tal, &day],
         )?;
