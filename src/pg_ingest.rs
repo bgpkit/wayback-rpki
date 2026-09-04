@@ -325,6 +325,23 @@ pub fn ingest_day(
                    first_seen = LEAST(wayback.roa_object.first_seen, EXCLUDED.first_seen)",
             &[&tal, &day],
         )?;
+        // Window alignment: ARIN (and others) shift certificate windows by a
+        // few hours between snapshots (tz drift in publication). A staged row
+        // whose window is within 36h of an existing span for the same object
+        // and identical max_len is treated as the same certificate: adopt the
+        // stored window so the coverage guard matches instead of inserting a
+        // duplicate span.
+        tx.execute(
+            "UPDATE stage_day s
+                SET not_before = v.not_before, not_after = v.not_after
+               FROM wayback.roa_object o
+               JOIN wayback.roa_version v ON v.roa_obj_id = o.roa_obj_id
+              WHERE o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix AND o.origin_asn = s.origin
+                AND v.max_len = s.max_len
+                AND abs(extract(epoch from (v.not_before - s.not_before))) < 129600
+                AND abs(extract(epoch from (v.not_after - s.not_after))) < 129600",
+            &[&tal],
+        )?;
         // Rewind: out-of-order backfill moves an existing current version's
         // first_seen back instead of creating an overlapping open-ended span.
         tx.execute(
