@@ -251,7 +251,7 @@ pub fn ingest_day(
                     // prev_day so the new span starting at `day` cannot overlap.
                     tx.execute(
                         "UPDATE wayback.roa_version
-                            SET last_seen = LEAST(COALESCE(last_seen, 'infinity'::date), $1)
+                            SET last_seen = GREATEST(LEAST(COALESCE(last_seen, 'infinity'::date), $1), first_seen)
                           WHERE roa_obj_id = $2
                             AND COALESCE(last_seen, 'infinity'::date) >= $1::date + 1
                             AND first_seen <= $1::date + 1",
