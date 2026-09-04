@@ -81,19 +81,32 @@ fn check_date(
     check_month: bool,
     check_day: bool,
 ) -> bool {
+    // Boundary months only apply to the boundary year itself: comparing
+    // `month` across ALL years silently drops whole months (e.g. until
+    // 2026-09-03 excluded Oct-Dec of every earlier year).
     let from_match = match from {
         Some(from_date) => {
-            date.year() >= from_date.year()
-                && (check_month && date.month() >= from_date.month() || !check_month)
-                && (check_day && date >= from_date || !check_day)
+            if !check_month {
+                date.year() >= from_date.year()
+            } else if !check_day {
+                date.year() > from_date.year()
+                    || (date.year() == from_date.year() && date.month() >= from_date.month())
+            } else {
+                date >= from_date
+            }
         }
         None => true,
     };
     let until_match = match until {
         Some(until_date) => {
-            date.year() <= until_date.year()
-                && (check_month && date.month() <= until_date.month() || !check_month)
-                && (check_day && date <= until_date || !check_day)
+            if !check_month {
+                date.year() <= until_date.year()
+            } else if !check_day {
+                date.year() < until_date.year()
+                    || (date.year() == until_date.year() && date.month() <= until_date.month())
+            } else {
+                date <= until_date
+            }
         }
         None => true,
     };
@@ -288,5 +301,35 @@ mod tests {
                 dbg!(entry);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod check_date_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn until_boundary_month_excludes_only_boundary_year() {
+        // Regression: until 2026-09-03 must NOT drop Oct-Dec of earlier years.
+        let until = d("2026-09-03");
+        assert!(check_date(d("2025-10-24"), None, Some(until), true, true));
+        assert!(check_date(d("2020-12-31"), None, Some(until), true, true));
+        assert!(!check_date(d("2026-10-01"), None, Some(until), true, true));
+        // month-grain (used for month listing)
+        assert!(check_date(d("2025-12-01"), None, Some(until), true, false));
+        assert!(!check_date(d("2026-10-01"), None, Some(until), true, false));
+    }
+
+    #[test]
+    fn from_boundary_month_excludes_only_boundary_year() {
+        let from = d("2015-03-10");
+        assert!(check_date(d("2016-01-05"), Some(from), None, true, true));
+        assert!(check_date(d("2016-01-01"), Some(from), None, true, false));
+        assert!(!check_date(d("2015-02-28"), Some(from), None, true, true));
     }
 }
