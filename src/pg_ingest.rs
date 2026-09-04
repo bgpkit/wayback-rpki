@@ -441,13 +441,27 @@ pub fn pg_backfill(
             let fetched = if std::path::Path::new(&local).exists() {
                 true
             } else {
-                match oneio::download(&url, &local) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        eprintln!("  {} download failed: {e}", f.file_date);
-                        false
+                let mut ok = false;
+                for attempt in 1..=3 {
+                    match oneio::download(&url, &local) {
+                        Ok(_) => {
+                            ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  {} download failed (attempt {attempt}/3): {e}",
+                                f.file_date
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(5 * attempt as u64));
+                        }
                     }
                 }
+                if !ok {
+                    // leave no half file behind
+                    let _ = std::fs::remove_file(&local);
+                }
+                ok
             };
             if !fetched {
                 let _ = ingest_day(
