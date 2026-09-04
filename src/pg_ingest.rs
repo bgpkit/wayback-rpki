@@ -205,15 +205,21 @@ pub fn ingest_day(
     // Normalize today's set keyed like the DB rows.
     let mut today: HashMap<(String, String, String, i64), &RoaFullEntry> = HashMap::new();
     for e in entries {
-        today.insert(
-            (
-                tal.to_string(),
-                e.uri.clone(),
-                e.prefix.clone(),
-                e.origin_asn as i64,
-            ),
-            e,
+        // One (uri, prefix, origin) can carry several max_len rows in a single
+        // day (publisher-side quirk); keep the smallest deterministically so
+        // day-to-day comparisons are stable.
+        let key = (
+            tal.to_string(),
+            e.uri.clone(),
+            e.prefix.clone(),
+            e.origin_asn as i64,
         );
+        match today.get(&key) {
+            Some(prev) if prev.max_len <= e.max_len => {}
+            _ => {
+                today.insert(key, e);
+            }
+        }
     }
 
     let current = load_current_objects(&mut tx, day)?;
@@ -390,7 +396,7 @@ pub fn ingest_day(
                       WHERE w.roa_obj_id = o.roa_obj_id AND w.first_seen > $2::date)
              FROM (
                SELECT DISTINCT ON (uri, prefix, origin) uri, prefix, origin, max_len, not_before, not_after
-               FROM stage_day ORDER BY uri, prefix, origin
+               FROM stage_day ORDER BY uri, prefix, origin, max_len
              ) d
              JOIN wayback.roa_object o
                ON o.ta = $1 AND o.uri = d.uri AND o.prefix::text = d.prefix AND o.origin_asn = d.origin
