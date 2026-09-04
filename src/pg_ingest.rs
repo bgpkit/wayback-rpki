@@ -234,14 +234,27 @@ pub fn ingest_day(
     for (key, cur) in &current {
         match today.get(key) {
             Some(e) => {
-                if e.max_len != cur.max_len
-                    || e.not_before != cur.not_before
-                    || e.not_after != cur.not_after
-                {
-                    // Attribute change: close old version, open new one.
+                let window_drift = {
+                    use chrono::Duration;
+                    let nb = (e.not_before - cur.not_before).num_seconds().abs();
+                    let na = (e.not_after - cur.not_after).num_seconds().abs();
+                    nb < 129_600 && na < 129_600
+                };
+                if e.max_len != cur.max_len || !window_drift {
+                    let (nb, na) = if window_drift && e.max_len == cur.max_len {
+                        (cur.not_before, cur.not_after)
+                    } else {
+                        (e.not_before, e.not_after)
+                    };
+                    // Attribute change: close old version, open new one. Trim
+                    // any span still covering `day` (open or closed) back to
+                    // prev_day so the new span starting at `day` cannot overlap.
                     tx.execute(
-                        "UPDATE wayback.roa_version SET last_seen = GREATEST($1, first_seen)
-                         WHERE roa_obj_id = $2 AND last_seen IS NULL AND first_seen <= $1::date + 1",
+                        "UPDATE wayback.roa_version
+                            SET last_seen = LEAST(COALESCE(last_seen, 'infinity'::date), $1)
+                          WHERE roa_obj_id = $2
+                            AND COALESCE(last_seen, 'infinity'::date) >= $1::date + 1
+                            AND first_seen <= $1::date + 1",
                         &[&prev_day, &cur.roa_obj_id],
                     )?;
                     tx.execute(
@@ -254,8 +267,8 @@ pub fn ingest_day(
                         &[
                             &cur.roa_obj_id,
                             &(e.max_len as i16),
-                            &e.not_before,
-                            &e.not_after,
+                            &nb,
+                            &na,
                             &day,
                         ],
                     )?;
