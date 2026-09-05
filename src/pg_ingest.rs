@@ -360,6 +360,31 @@ pub fn ingest_day(
                 AND abs(extract(epoch from (v.not_after - s.not_after))) < 129600",
             &[&tal],
         )?;
+        // Versions: one per staged tuple unless a matching span already covers
+        // the day (idempotent replay). When backfilling an earlier day
+        // (out-of-order repair), bound the new span by the object's next
+        // existing span instead of leaving it open-ended.
+        let n_ver = tx.execute(
+            "INSERT INTO wayback.roa_version (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
+             SELECT o.roa_obj_id, d.max_len, d.not_before, d.not_after, $2::date,
+                    (SELECT min(w.first_seen) - 1 FROM wayback.roa_version w
+                      WHERE w.roa_obj_id = o.roa_obj_id AND w.first_seen > $2::date)
+             FROM (
+               SELECT DISTINCT ON (uri, prefix, origin) uri, prefix, origin, max_len, not_before, not_after
+               FROM stage_day ORDER BY uri, prefix, origin, max_len
+             ) d
+             JOIN wayback.roa_object o
+               ON o.ta = $1 AND o.uri = d.uri AND o.prefix::text = d.prefix AND o.origin_asn = d.origin
+             WHERE NOT EXISTS (
+               SELECT 1 FROM wayback.roa_version v
+               WHERE v.roa_obj_id = o.roa_obj_id
+                 AND v.max_len = d.max_len
+                 AND v.not_before = d.not_before AND v.not_after = d.not_after
+                 AND v.first_seen <= $2::date
+                 AND (v.last_seen IS NULL OR v.last_seen >= $2::date - 1)
+             )",
+            &[&tal, &day],
+        )?;
         // Rewind: out-of-order backfill moves an existing current version's
         // first_seen back instead of creating an overlapping open-ended span.
         tx.execute(
@@ -402,31 +427,6 @@ pub fn ingest_day(
                   WHERE o2.roa_obj_id = v.roa_obj_id
                     AND v.max_len = s2.max_len AND v.not_before = s2.not_before AND v.not_after = s2.not_after
                 )",
-            &[&tal, &day],
-        )?;
-        // Versions: one per staged tuple unless a matching span already covers
-        // the day (idempotent replay). When backfilling an earlier day
-        // (out-of-order repair), bound the new span by the object's next
-        // existing span instead of leaving it open-ended.
-        let n_ver = tx.execute(
-            "INSERT INTO wayback.roa_version (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
-             SELECT o.roa_obj_id, d.max_len, d.not_before, d.not_after, $2::date,
-                    (SELECT min(w.first_seen) - 1 FROM wayback.roa_version w
-                      WHERE w.roa_obj_id = o.roa_obj_id AND w.first_seen > $2::date)
-             FROM (
-               SELECT DISTINCT ON (uri, prefix, origin) uri, prefix, origin, max_len, not_before, not_after
-               FROM stage_day ORDER BY uri, prefix, origin, max_len
-             ) d
-             JOIN wayback.roa_object o
-               ON o.ta = $1 AND o.uri = d.uri AND o.prefix::text = d.prefix AND o.origin_asn = d.origin
-             WHERE NOT EXISTS (
-               SELECT 1 FROM wayback.roa_version v
-               WHERE v.roa_obj_id = o.roa_obj_id
-                 AND v.max_len = d.max_len
-                 AND v.not_before = d.not_before AND v.not_after = d.not_after
-                 AND v.first_seen <= $2::date
-                 AND (v.last_seen IS NULL OR v.last_seen >= $2::date - 1)
-             )",
             &[&tal, &day],
         )?;
         counts.objects_inserted = n_obj as i64;
