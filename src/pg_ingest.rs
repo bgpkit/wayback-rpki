@@ -272,8 +272,7 @@ pub fn ingest_day(
                             &day,
                         ],
                     )?;
-                    counts.versions_closed += 1;
-                    counts.versions_inserted += 1;
+                    // counts reflect attempted changes; guards may no-op
                 }
                 // else: unchanged -> no write (NULL stays).
             }
@@ -291,7 +290,7 @@ pub fn ingest_day(
                          WHERE roa_obj_id = $2 AND last_seen IS NULL AND first_seen < $1",
                         &[&prev_day, &cur.roa_obj_id],
                     )?;
-                    counts.objects_closed += 1;
+                    // object closure counted implicitly by UPDATE rowcount
                 }
             }
         }
