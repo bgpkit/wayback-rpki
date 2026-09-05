@@ -39,6 +39,8 @@ DO $$ BEGIN
   END IF;
 END $$;
 CREATE INDEX IF NOT EXISTS roa_version_maxlen_idx ON wayback.roa_version (max_len);
+CREATE INDEX IF NOT EXISTS roa_version_span_idx ON wayback.roa_version (first_seen, last_seen);
+CREATE INDEX IF NOT EXISTS roa_version_obj_first_idx ON wayback.roa_version (roa_obj_id, first_seen);
 
 -- Completeness ledger: one row per (tal, date, artifact) actually attempted.
 CREATE TABLE IF NOT EXISTS wayback.source_file (
