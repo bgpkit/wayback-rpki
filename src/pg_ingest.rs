@@ -369,10 +369,17 @@ pub fn ingest_day(
              FROM stage_day s
              JOIN wayback.roa_object o
                ON o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix AND o.origin_asn = s.origin
-            WHERE v.roa_obj_id = o.roa_obj_id AND v.last_seen IS NULL
+            WHERE v.roa_obj_id = o.roa_obj_id
               AND v.max_len = s.max_len
               AND v.not_before = s.not_before AND v.not_after = s.not_after
-              AND v.first_seen > $2::date",
+              AND v.first_seen > $2::date
+              AND NOT EXISTS (
+                SELECT 1 FROM wayback.roa_version w
+                WHERE w.roa_obj_id = v.roa_obj_id
+                  AND w.max_len = s.max_len
+                  AND w.not_before = s.not_before AND w.not_after = s.not_after
+                  AND w.first_seen < v.first_seen
+              )",
             &[&tal, &day],
         )?;
         // Close current versions whose attributes no longer match any staged row
