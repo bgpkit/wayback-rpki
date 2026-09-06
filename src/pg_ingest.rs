@@ -4,7 +4,7 @@
 //! - new (ta, uri, prefix, origin)          -> INSERT object + first version row
 //! - present, attributes unchanged          -> no write at all
 //! - same URI, max_len or cert window moved -> close old version (last_seen=D-1),
-//!                                             open new version (first_seen=D)
+//!   open new version (first_seen=D)
 //! - in current set but absent from file    -> close object (last_seen=D-1)
 //! - absent file (HTTP failure / no file)   -> no disappearance decisions; ledger row only
 //!
@@ -235,7 +235,6 @@ pub fn ingest_day(
         match today.get(key) {
             Some(e) => {
                 let window_drift = {
-                    use chrono::Duration;
                     let nb = (e.not_before - cur.not_before).num_seconds().abs();
                     let na = (e.not_after - cur.not_after).num_seconds().abs();
                     nb < 129_600 && na < 129_600
