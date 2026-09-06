@@ -127,3 +127,14 @@ WHERE (ov.roa_obj_id IS NULL OR nv.max_len <> ov.max_len
   -- real renewals have long preceding spans. appeared/maxlen always kept.
   AND (ov.roa_obj_id IS NULL OR nv.max_len <> ov.max_len
        OR COALESCE(ov.last_seen, CURRENT_DATE) - ov.first_seen + 1 > 3);
+
+-- ---------------------------------------------------------------------------
+-- roa_counts_view: per-TAL per-day total ROA counts straight from the source
+-- file ledger. One row per (tal, day). Doubles as publisher-health input:
+-- days where roa_count collapses (e.g. APNIC half-snapshot days dropping from
+-- ~80k to ~40k rows) are publication-side artifacts, not real withdrawals.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE VIEW wayback.roa_counts_view AS
+SELECT tal, file_date AS day, roa_count, gap_class
+FROM wayback.source_file
+WHERE artifact = 'roas.csv.xz' AND roa_count IS NOT NULL;
