@@ -213,17 +213,26 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
                 {
                     updated += tx.execute(
                         "UPDATE wayback.aspa_object SET last_seen = $1
-                          WHERE aspa_obj_id = $2 AND last_seen IS NULL",
+                          WHERE aspa_obj_id = $2 AND last_seen IS NULL AND first_seen <= $1",
                         &[&last_seen, &current_row.aspa_obj_id],
                     )? as i64;
                 }
                 if let Some(last_seen) =
                     last_seen_before_absence(current_row.version_first_seen, day)
                 {
+                    // Scope the closure to the version observed on `day`: an
+                    // object can already hold a later open span when days are
+                    // ingested out of order (a repair, or a backfill that
+                    // started at the recent end), and closing that row would
+                    // invert its range.
                     updated += tx.execute(
                         "UPDATE wayback.aspa_version SET last_seen = $1
-                          WHERE aspa_obj_id = $2 AND last_seen IS NULL",
-                        &[&last_seen, &current_row.aspa_obj_id],
+                          WHERE aspa_obj_id = $2 AND first_seen = $3 AND last_seen IS NULL",
+                        &[
+                            &last_seen,
+                            &current_row.aspa_obj_id,
+                            &current_row.version_first_seen,
+                        ],
                     )? as i64;
                 }
             }

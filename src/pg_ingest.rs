@@ -325,15 +325,19 @@ pub fn ingest_day(
                 if let Some(last_seen) = last_seen_before_absence(cur.object_first_seen, day) {
                     counts.objects_closed += tx.execute(
                         "UPDATE wayback.roa_object SET last_seen = $1
-                         WHERE roa_obj_id = $2 AND last_seen IS NULL",
+                         WHERE roa_obj_id = $2 AND last_seen IS NULL AND first_seen <= $1",
                         &[&last_seen, &cur.roa_obj_id],
                     )? as i64;
                 }
                 if let Some(last_seen) = last_seen_before_absence(cur.version_first_seen, day) {
+                    // Scope the closure to the version observed on `day`: with
+                    // out-of-order ingest (repair windows) an object can
+                    // already hold a later open span, and closing that row
+                    // would invert its range.
                     counts.versions_closed += tx.execute(
                         "UPDATE wayback.roa_version SET last_seen = $1
-                         WHERE roa_obj_id = $2 AND last_seen IS NULL",
-                        &[&last_seen, &cur.roa_obj_id],
+                         WHERE roa_obj_id = $2 AND first_seen = $3 AND last_seen IS NULL",
+                        &[&last_seen, &cur.roa_obj_id, &cur.version_first_seen],
                     )? as i64;
                 }
             }
