@@ -2,6 +2,8 @@
 
 pub mod api;
 pub mod legacy;
+pub mod pg_aspa;
+pub mod pg_ingest;
 mod roas_trie;
 
 use anyhow::{anyhow, Result};
@@ -255,6 +257,80 @@ pub fn get_tal_urls(tal: Option<String>) -> Vec<String> {
             vec![url]
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PostgreSQL ingest support (the `wayback-pg` binary). These additions do not
+// change any v1 code path: the trie archive, the HTTP API, and the CLI above
+// stay as they are.
+// ---------------------------------------------------------------------------
+
+/// ROA payload artifact inside a day directory.
+pub const ROA_ARTIFACT: &str = "roas.csv.xz";
+
+/// A daily RIPE RPKI archive file: `roas.csv.xz` for ROAs, `output.json.xz` for
+/// ASPA (and router keys).
+#[derive(Debug, Clone)]
+pub struct ArchiveFile {
+    pub url: String,
+    pub file_date: NaiveDate,
+}
+
+/// Crawl RIPE's directory listings and return daily archive files for one
+/// artifact in a range. `crawl_tal_after` is the `roas.csv.xz` special case;
+/// ASPA needs the same listing walk for `output.json.xz`.
+pub fn crawl_tal_artifact(
+    tal_url: &str,
+    from: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    artifact: &str,
+) -> Vec<ArchiveFile> {
+    let years: Vec<i32> = __crawl_years(tal_url)
+        .into_iter()
+        .filter_map(|year| year.parse::<i32>().ok())
+        .filter(|year| {
+            NaiveDate::from_ymd_opt(*year, 1, 1)
+                .map(|date| check_date(date, from, until, false, false))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    years
+        .par_iter()
+        .map(|year| {
+            info!("scanning {artifact} snapshots for {tal_url}/{year}");
+            let year_url = format!("{tal_url}/{year}");
+            let months: Vec<u32> = __crawl_months_days(year_url.as_str())
+                .into_iter()
+                .filter_map(|month| month.parse::<u32>().ok())
+                .filter(|month| {
+                    NaiveDate::from_ymd_opt(*year, *month, 1)
+                        .map(|date| check_date(date, from, until, true, false))
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            months
+                .par_iter()
+                .map(|month| {
+                    let month_url = format!("{year_url}/{month:02}");
+                    __crawl_months_days(month_url.as_str())
+                        .into_iter()
+                        .filter_map(|day| {
+                            let day: u32 = day.parse().ok()?;
+                            let file_date = NaiveDate::from_ymd_opt(*year, *month, day)?;
+                            check_date(file_date, from, until, true, true).then(|| ArchiveFile {
+                                url: format!("{month_url}/{day:02}/{artifact}"),
+                                file_date,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]
