@@ -146,6 +146,27 @@ A `.bin`/`.bin.gz` `path` keeps working directly in legacy mode without conversi
   Cloudflare Worker at `alpha.api.bgpkit.com` with failover. Container entrypoint:
   `wayback-rpki serve --bootstrap --host 0.0.0.0 --port 40065`.
 
+### `wayback-pg` — PostgreSQL ingest (additive)
+
+A second binary that writes RIPE RPKI observations into PostgreSQL instead of a
+trie. It shares the crawler and touches no v1 code path: the trie, the HTTP API,
+and the `wayback-rpki` CLI behave exactly as before.
+
+- **Commands**: `wayback-pg update --pg-config ...` and `wayback-pg backfill
+  --pg-config ... --from --until`, both accepting `--tal afrinic,apnic` and
+  `--types roa,aspa` (default: both families, each resuming from its own
+  source-file cursor).
+- **Storage**: `pg/001_schema.sql` (ROA object/version SCD-2, the per-file
+  `source_file` ledger, `ingest_run` accounting) and `pg/002_aspa.sql`
+  (ASN-keyed `aspa_object` / `aspa_version`, plus `aspa_providers_of()` and
+  `aspa_customers_of()`, which apply cross-TAL union and the U-SPAS AS0 rule).
+- **Coverage**: ROA from `2015-03-10`, ASPA from `2023-10-11` (the first day the
+  `output.json.xz` artifact exists); ASPA input is clamped to that era start.
+- **Modules**: `src/pg_ingest.rs`, `src/pg_aspa.rs`, `src/bin/pg.rs`,
+  `tests/pg_cli_contract.rs`.
+- Serving is out of scope here: the API is rebuilt on the PostgreSQL store
+  elsewhere, not in this repository.
+
 ## Build & Test
 
 ```bash

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+* `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.
+* ASPA support in that binary: `pg/002_aspa.sql` adds ASN-keyed `aspa_object` / `aspa_version` tables that write a row only when a customer's provider set changes, plus `aspa_providers_of(customer_asn, day)` and `aspa_customers_of(provider_asn, day)` for either query direction as of a date. Cross-TAL unioning and the U-SPAS AS0 rule live in the views and functions. Coverage starts `2023-10-11`, the first day RIPE's `output.json.xz` artifact exists.
+* `pg/001_schema.sql` carries the ROA SCD-2 store, the per-file `source_file` ledger, and the `ingest_run` accounting that the binary writes.
+* `src/lib.rs` gains `crawl_tal_artifact()` for archive artifacts other than `roas.csv.xz`; no v1 function changed.
+
 ## v1.1.0 - 2026-07-25
 
 ### Highlights
