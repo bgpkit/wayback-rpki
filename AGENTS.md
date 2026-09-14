@@ -22,7 +22,13 @@ wayback-rpki/
 │   ├── roas_trie.rs    # v2 core: rkyv archive, JointPrefixMap storage, JSONL transport
 │   ├── legacy.rs       # v1 backend: bincode + ipnet-trie, kept for transition
 │   ├── api.rs          # Axum HTTP API: /search, /validate, /health; TrieBackend enum
-│   └── bin/main.rs     # CLI: rebuild, update, fix, search, convert, serve
+│   ├── pg_ingest.rs    # ROA → PostgreSQL ingest and run accounting (wayback-pg)
+│   ├── pg_aspa.rs      # ASPA JSON parsing and SCD-2 ingestion (wayback-pg)
+│   ├── bin/main.rs     # CLI: rebuild, update, fix, search, convert, serve
+│   └── bin/pg.rs       # wayback-pg CLI: update, backfill
+├── pg/
+│   ├── 001_schema.sql  # PostgreSQL store: ROA SCD-2, source ledger, run ledger
+│   └── 002_aspa.sql    # PostgreSQL store: ASPA SCD-2, views, direction functions
 ├── Dockerfile          # cargo-chef multi-stage build (rust:1.90 → debian:trixie-slim)
 ├── Cargo.toml          # Crate metadata; bin name = wayback-rpki
 ├── DEVELOPMENT.md      # Reproducible data-integrity and transport-generation operations
