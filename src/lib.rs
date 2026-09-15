@@ -6,12 +6,12 @@ pub mod pg_aspa;
 pub mod pg_ingest;
 mod roas_trie;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, NaiveDate};
 use ipnet::IpNet;
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::str::FromStr;
 use tracing::{debug, info, warn};
 
@@ -36,44 +36,25 @@ pub struct RoaFile {
     pub processed: bool,
 }
 
-fn __crawl_years(tal_url: &str) -> Vec<String> {
-    let year_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d\d\d)/</a>.*"#).unwrap();
+/// Numeric `<a href="...">NN/</a>` entries of a RIPE directory listing:
+/// `width` is 4 for years and 2 for months and days. A listing that cannot be
+/// fetched or parsed is an error, never an empty listing: the ingest layer must
+/// not read an outage as "the archive published nothing".
+fn crawl_links(url: &str, width: usize) -> Result<Vec<u32>> {
+    let pattern = format!(r#"<a href=".*">\s*(\d{{{width}}})/</a>.*"#);
+    let entry_pattern = Regex::new(pattern.as_str())
+        .with_context(|| format!("compile listing pattern {pattern}"))?;
+    let body = oneio::read_to_string_lossy(url)
+        .with_context(|| format!("fetch directory listing {url}"))?;
 
-    // get all years
-    let body = match oneio::read_to_string_lossy(tal_url) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("failed to fetch years listing {}: {}", tal_url, e);
-            return Vec::new();
-        }
-    };
-    let years: Vec<String> = year_pattern
+    entry_pattern
         .captures_iter(body.as_str())
-        .map(|cap| cap[1].to_owned())
-        .collect();
-
-    years
-}
-
-fn __crawl_months_days(months_days_url: &str) -> Vec<String> {
-    let month_day_pattern: Regex = Regex::new(r#"<a href=".*">\s*(\d\d)/</a>.*"#).unwrap();
-
-    let body = match oneio::read_to_string_lossy(months_days_url) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                "failed to fetch months/days listing {}: {}",
-                months_days_url, e
-            );
-            return Vec::new();
-        }
-    };
-    let months_days: Vec<String> = month_day_pattern
-        .captures_iter(body.as_str())
-        .map(|cap| cap[1].to_owned())
-        .collect();
-
-    months_days
+        .map(|capture| {
+            capture[1]
+                .parse::<u32>()
+                .with_context(|| format!("parse listing entry {:?} of {url}", &capture[1]))
+        })
+        .collect()
 }
 
 fn check_date(
@@ -116,6 +97,64 @@ fn check_date(
     from_match && until_match
 }
 
+/// Day files of one artifact in the RIPE archive:
+/// `{tal_url}/{year}/{month}/{day}/{artifact}`.
+fn crawl_artifact_days(
+    tal_url: &str,
+    from: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    artifact: &str,
+) -> Result<Vec<ArchiveFile>> {
+    let years: Vec<u32> = crawl_links(tal_url, 4)?
+        .into_iter()
+        .filter(|year| {
+            NaiveDate::from_ymd_opt(*year as i32, 1, 1)
+                .is_some_and(|date| check_date(date, from, until, false, false))
+        })
+        .collect();
+
+    let per_year = years
+        .par_iter()
+        .map(|year| -> Result<Vec<ArchiveFile>> {
+            let year = *year as i32;
+            info!("scanning {artifact} files for {tal_url}/{year} ...");
+            let year_url = format!("{tal_url}/{year}");
+            let months: Vec<u32> = crawl_links(&year_url, 2)?
+                .into_iter()
+                .filter(|month| {
+                    NaiveDate::from_ymd_opt(year, *month, 1)
+                        .is_some_and(|date| check_date(date, from, until, true, false))
+                })
+                .collect();
+
+            let per_month = months
+                .par_iter()
+                .map(|month| -> Result<Vec<ArchiveFile>> {
+                    debug!("scraping data for {year_url}/{month:02} ...");
+                    let month_url = format!("{year_url}/{month:02}");
+                    let mut files = Vec::new();
+                    for day in crawl_links(&month_url, 2)? {
+                        let Some(file_date) = NaiveDate::from_ymd_opt(year, *month, day) else {
+                            continue;
+                        };
+                        if check_date(file_date, from, until, true, true) {
+                            files.push(ArchiveFile {
+                                url: format!("{month_url}/{day:02}/{artifact}"),
+                                file_date,
+                            });
+                        }
+                    }
+                    Ok(files)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(per_month.into_iter().flatten().collect())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(per_year.into_iter().flatten().collect())
+}
+
 /// Crawl and return all RIPE ROA file metadata after a given date
 ///
 /// The ROA files URLs has the following format:
@@ -125,68 +164,43 @@ pub fn crawl_tal_after(
     from: Option<NaiveDate>,
     until: Option<NaiveDate>,
 ) -> Vec<RoaFile> {
-    let fields: Vec<&str> = tal_url.split('/').collect();
-    let tal = fields[4].split('.').collect::<Vec<&str>>()[0].to_owned();
+    match try_crawl_tal_after(tal_url, from, until) {
+        Ok(files) => files,
+        Err(error) => {
+            warn!("failed to crawl {tal_url}: {error:#}");
+            Vec::new()
+        }
+    }
+}
 
-    // get all years
-    let years: Vec<i32> = __crawl_years(tal_url)
+/// `crawl_tal_after` with the crawl failure kept as an error: an ingest run
+/// must not read an unreachable listing as "the archive published nothing".
+pub fn try_crawl_tal_after(
+    tal_url: &str,
+    from: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+) -> Result<Vec<RoaFile>> {
+    let tal = tal_name_from_url(tal_url);
+    Ok(crawl_artifact_days(tal_url, from, until, ROA_ARTIFACT)?
         .into_iter()
-        .map(|y| y.parse::<i32>().unwrap())
-        .filter(|y| {
-            let date = NaiveDate::from_ymd_opt(*y, 1, 1).unwrap();
-            check_date(date, from, until, false, false)
+        .map(|file| RoaFile {
+            tal: tal.clone(),
+            url: file.url,
+            file_date: file.file_date,
+            rows_count: 0,
+            processed: false,
         })
-        .collect();
+        .collect())
+}
 
-    years
-        .par_iter()
-        .map(|year| {
-            info!("scanning roas.csv.xz files for {}/{} ...", &tal_url, &year);
-            let year_url = format!("{}/{}", tal_url, year);
-
-            let months: Vec<u32> = __crawl_months_days(year_url.as_str())
-                .into_iter()
-                .map(|m| m.parse::<u32>().unwrap())
-                .filter(|m| {
-                    let date = NaiveDate::from_ymd_opt(*year, *m, 1).unwrap();
-                    check_date(date, from, until, true, false)
-                })
-                .collect();
-
-            months
-                .par_iter()
-                .map(|month| {
-                    debug!("scraping data for {}/{:02} ...", &year_url, &month);
-                    let month_url = format!("{}/{:02}", year_url, month);
-
-                    let days: Vec<u32> = __crawl_months_days(month_url.as_str())
-                        .into_iter()
-                        .map(|d| d.parse::<u32>().unwrap())
-                        .filter(|d| {
-                            let date = NaiveDate::from_ymd_opt(*year, *month, *d).unwrap();
-                            check_date(date, from, until, true, true)
-                        })
-                        .collect();
-
-                    days.into_iter()
-                        .map(|day| {
-                            let url = format!("{}/{:02}/roas.csv.xz", month_url, day);
-                            let file_date = NaiveDate::from_ymd_opt(*year, *month, day).unwrap();
-                            RoaFile {
-                                tal: tal.clone(),
-                                url,
-                                file_date,
-                                rows_count: 0,
-                                processed: false,
-                            }
-                        })
-                        .collect::<Vec<RoaFile>>()
-                })
-                .flat_map(|x| x)
-                .collect::<Vec<RoaFile>>()
-        })
-        .flat_map(|x| x)
-        .collect::<Vec<RoaFile>>()
+/// TAL name as it appears in its archive URL: `.../afrinic.tal` -> `afrinic`.
+fn tal_name_from_url(tal_url: &str) -> String {
+    tal_url
+        .split('/')
+        .nth(4)
+        .map(|segment| segment.split('.').next().unwrap_or(segment))
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 /// Parse a RIPE ROA CSV file and return a set of ROA entries.
@@ -238,24 +252,38 @@ pub fn parse_roas_csv(csv_url: &str) -> Result<Vec<RoaEntry>> {
     Ok(roas.into_iter().collect::<Vec<RoaEntry>>())
 }
 
-pub fn get_tal_urls(tal: Option<String>) -> Vec<String> {
-    let tal_map = HashMap::from([
-        ("afrinic", "https://ftp.ripe.net/rpki/afrinic.tal"),
-        ("lacnic", "https://ftp.ripe.net/rpki/lacnic.tal"),
-        ("apnic", "https://ftp.ripe.net/rpki/apnic.tal"),
-        ("ripencc", "https://ftp.ripe.net/rpki/ripencc.tal"),
-        ("arin", "https://ftp.ripe.net/rpki/arin.tal"),
-    ]);
+/// RIPE archive entry point of each RIR TAL.
+const TAL_URLS: [(&str, &str); 5] = [
+    ("afrinic", "https://ftp.ripe.net/rpki/afrinic.tal"),
+    ("lacnic", "https://ftp.ripe.net/rpki/lacnic.tal"),
+    ("apnic", "https://ftp.ripe.net/rpki/apnic.tal"),
+    ("ripencc", "https://ftp.ripe.net/rpki/ripencc.tal"),
+    ("arin", "https://ftp.ripe.net/rpki/arin.tal"),
+];
 
+/// Resolve one TAL name to its RIPE archive URL. An unknown name is `None`, so
+/// callers can report the bad input instead of tripping the panic inside
+/// `get_tal_urls`.
+pub fn tal_url(name: &str) -> Option<&'static str> {
+    TAL_URLS
+        .iter()
+        .find(|(tal, _)| *tal == name)
+        .map(|(_, url)| *url)
+}
+
+/// Names accepted by `tal_url` and `get_tal_urls`.
+pub fn tal_names() -> Vec<&'static str> {
+    TAL_URLS.iter().map(|(tal, _)| *tal).collect()
+}
+
+pub fn get_tal_urls(tal: Option<String>) -> Vec<String> {
     match tal {
-        None => tal_map.values().map(|url| url.to_string()).collect(),
-        Some(tal) => {
-            let url = tal_map
-                .get(tal.as_str())
-                .expect(r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#)
-                .to_string();
-            vec![url]
-        }
+        None => TAL_URLS.iter().map(|(_, url)| url.to_string()).collect(),
+        Some(tal) => vec![tal_url(tal.as_str())
+            .expect(
+                r#"can only be one of the following "ripencc"|"afrinic"|"apnic"|"arin"|"lacnic""#,
+            )
+            .to_string()],
     }
 }
 
@@ -278,59 +306,32 @@ pub struct ArchiveFile {
 
 /// Crawl RIPE's directory listings and return daily archive files for one
 /// artifact in a range. `crawl_tal_after` is the `roas.csv.xz` special case;
-/// ASPA needs the same listing walk for `output.json.xz`.
+/// ASPA needs the same listing walk for `output.json.xz`. A crawl failure is
+/// logged and reported as an empty vector; `try_crawl_tal_artifact` keeps it.
 pub fn crawl_tal_artifact(
     tal_url: &str,
     from: Option<NaiveDate>,
     until: Option<NaiveDate>,
     artifact: &str,
 ) -> Vec<ArchiveFile> {
-    let years: Vec<i32> = __crawl_years(tal_url)
-        .into_iter()
-        .filter_map(|year| year.parse::<i32>().ok())
-        .filter(|year| {
-            NaiveDate::from_ymd_opt(*year, 1, 1)
-                .map(|date| check_date(date, from, until, false, false))
-                .unwrap_or(false)
-        })
-        .collect();
+    match try_crawl_tal_artifact(tal_url, from, until, artifact) {
+        Ok(files) => files,
+        Err(error) => {
+            warn!("failed to crawl {tal_url} for {artifact}: {error:#}");
+            Vec::new()
+        }
+    }
+}
 
-    years
-        .par_iter()
-        .map(|year| {
-            info!("scanning {artifact} snapshots for {tal_url}/{year}");
-            let year_url = format!("{tal_url}/{year}");
-            let months: Vec<u32> = __crawl_months_days(year_url.as_str())
-                .into_iter()
-                .filter_map(|month| month.parse::<u32>().ok())
-                .filter(|month| {
-                    NaiveDate::from_ymd_opt(*year, *month, 1)
-                        .map(|date| check_date(date, from, until, true, false))
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            months
-                .par_iter()
-                .map(|month| {
-                    let month_url = format!("{year_url}/{month:02}");
-                    __crawl_months_days(month_url.as_str())
-                        .into_iter()
-                        .filter_map(|day| {
-                            let day: u32 = day.parse().ok()?;
-                            let file_date = NaiveDate::from_ymd_opt(*year, *month, day)?;
-                            check_date(file_date, from, until, true, true).then(|| ArchiveFile {
-                                url: format!("{month_url}/{day:02}/{artifact}"),
-                                file_date,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        })
-        .flatten()
-        .collect()
+/// `crawl_tal_artifact` with the crawl failure kept as an error: a run that
+/// cannot read the listing has to fail instead of ingesting nothing.
+pub fn try_crawl_tal_artifact(
+    tal_url: &str,
+    from: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    artifact: &str,
+) -> Result<Vec<ArchiveFile>> {
+    crawl_artifact_days(tal_url, from, until, artifact)
 }
 
 #[cfg(test)]

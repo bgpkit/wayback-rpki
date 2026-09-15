@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed (wayback-pg ingest correctness, from review of #19)
+
+* Applying a day out of order no longer drops the observation: a span that ends the day before is extended, and an absent day in the middle of a span is split so days observed after it keep their own span.
+* `roa_object.last_seen` and `aspa_object.last_seen` are derived from the version spans instead of being written by the day being applied, so replaying an older day neither reopens nor closes an object that later history still covers.
+* ASPA `era_start` requires the archive's own listing as evidence; a fetch or parse failure now fails the run instead of fabricating an era start.
+* Backfills record every calendar day they did not ingest as a `source_file` gap instead of skipping it, and a listing that cannot be read fails the run instead of reporting success with no work.
+* `roa_counts_view` no longer reports a missing file as an observed zero count, and an unknown `--tal` name is a CLI error instead of a panic.
+* `roa_tuple_view` returns one row per contiguous span, so a tuple that disappeared and returned is two rows rather than one range with the gap filled in.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.

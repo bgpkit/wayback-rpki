@@ -14,8 +14,8 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::pg_ingest::selected_tal_urls;
-use crate::pg_ingest::{last_observed_day, run_ingest, tal_from_url, RunCounts};
-use crate::{crawl_tal_artifact, ArchiveFile};
+use crate::pg_ingest::{last_observed_day, run_ingest, tal_from_url, MissingDays, RunCounts};
+use crate::{try_crawl_tal_artifact, ArchiveFile};
 
 /// Ledger artifact that carries ASPA objects (Routinator JSON).
 pub const ASPA_ARTIFACT: &str = "output.json.xz";
@@ -125,7 +125,6 @@ pub fn parse_output_json_aspas(path: &str) -> Result<(Vec<AspaEntry>, AspaQualit
 
 struct CurrentAspa {
     aspa_obj_id: i64,
-    object_first_seen: NaiveDate,
     version_first_seen: NaiveDate,
     providers: Vec<i64>,
 }
@@ -141,6 +140,54 @@ pub struct AspaFile<'a> {
     pub sha256: Option<&'a str>,
     /// The day lies before this TAL's first observed ASPA artifact.
     pub era_start: bool,
+}
+
+/// Close the span that covers `day` on `last_seen`, keeping the days after
+/// `day` as their own span. Trimming alone would drop coverage that later
+/// ingests already observed.
+fn close_aspa_span_with_split(
+    tx: &mut postgres::Transaction<'_>,
+    aspa_obj_id: i64,
+    version_first_seen: NaiveDate,
+    day: NaiveDate,
+    last_seen: NaiveDate,
+) -> Result<i64> {
+    // An open span only reaches as far as the days the TAL actually observed:
+    // without an observed day after `day` there is no later part to carry, and
+    // inventing one would claim coverage past the archive frontier.
+    tx.execute(
+        "INSERT INTO stage_aspa_split
+           (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
+         SELECT v.aspa_obj_id, v.providers, v.provider_count, v.has_as0, v.as0_only, $1::date + 1, v.last_seen
+           FROM wayback.aspa_version v
+          WHERE v.aspa_obj_id = $2 AND v.first_seen = $3
+            AND COALESCE(v.last_seen, 'infinity'::date) > $1::date
+            AND (v.last_seen IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM wayback.aspa_object o
+                              JOIN wayback.source_file f
+                                ON f.tal = o.ta AND f.artifact = 'output.json.xz'
+                             WHERE o.aspa_obj_id = v.aspa_obj_id
+                               AND f.file_date >= $1::date + 1
+                               AND f.gap_class = 'observed'))",
+        &[&day, &aspa_obj_id, &version_first_seen],
+    )?;
+    let trimmed = tx.execute(
+        "UPDATE wayback.aspa_version
+            SET last_seen = $1
+          WHERE aspa_obj_id = $2 AND first_seen = $3
+            AND COALESCE(last_seen, 'infinity'::date) > $1::date
+            AND first_seen <= $1::date",
+        &[&last_seen, &aspa_obj_id, &version_first_seen],
+    )? as i64;
+    let carried = tx.execute(
+        "INSERT INTO wayback.aspa_version
+           (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
+         SELECT aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen
+           FROM stage_aspa_split",
+        &[],
+    )? as i64;
+    tx.execute("TRUNCATE stage_aspa_split", &[])?;
+    Ok(trimmed + carried)
 }
 
 /// Apply one day of ASPA objects for one TAL. `file_ok = false` records the gap
@@ -192,6 +239,16 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
 
     let mut updated = 0i64;
 
+    // Days after a repaired day that a span still covers are carried over here.
+    tx.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS stage_aspa_split (
+           aspa_obj_id bigint, providers bigint[], provider_count smallint,
+           has_as0 boolean, as0_only boolean, first_seen date, last_seen date)
+         ON COMMIT DROP",
+        &[],
+    )?;
+    tx.execute("TRUNCATE stage_aspa_split", &[])?;
+
     // 1. Closures: a changed provider set closes its span; a customer missing
     //    from a successfully ingested day disappears.
     for (customer_asn, current_row) in &current {
@@ -209,31 +266,17 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
             Some(_) => {}
             None => {
                 if let Some(last_seen) =
-                    last_seen_before_absence(current_row.object_first_seen, day)
-                {
-                    updated += tx.execute(
-                        "UPDATE wayback.aspa_object SET last_seen = $1
-                          WHERE aspa_obj_id = $2 AND last_seen IS NULL AND first_seen <= $1",
-                        &[&last_seen, &current_row.aspa_obj_id],
-                    )? as i64;
-                }
-                if let Some(last_seen) =
                     last_seen_before_absence(current_row.version_first_seen, day)
                 {
-                    // Scope the closure to the version observed on `day`: an
-                    // object can already hold a later open span when days are
-                    // ingested out of order (a repair, or a backfill that
-                    // started at the recent end), and closing that row would
-                    // invert its range.
-                    updated += tx.execute(
-                        "UPDATE wayback.aspa_version SET last_seen = $1
-                          WHERE aspa_obj_id = $2 AND first_seen = $3 AND last_seen IS NULL",
-                        &[
-                            &last_seen,
-                            &current_row.aspa_obj_id,
-                            &current_row.version_first_seen,
-                        ],
-                    )? as i64;
+                    // Close the span that covers `day`, keeping any later
+                    // observed days: the customer is absent from this day only.
+                    updated += close_aspa_span_with_split(
+                        &mut tx,
+                        current_row.aspa_obj_id,
+                        current_row.version_first_seen,
+                        day,
+                        last_seen,
+                    )?;
                 }
             }
         }
@@ -284,10 +327,23 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
             "INSERT INTO wayback.aspa_object (ta, customer_asn, first_seen)
              SELECT $1::text, s.customer, $2::date FROM stage_aspa s
              ON CONFLICT (ta, customer_asn) DO UPDATE
-               SET last_seen = NULL,
-                   first_seen = LEAST(wayback.aspa_object.first_seen, EXCLUDED.first_seen)",
+               SET first_seen = LEAST(wayback.aspa_object.first_seen, EXCLUDED.first_seen)",
             &[&file.tal, &day],
         )?;
+        // A repaired day next to an existing span continues that span: extend
+        // the span that ends the day before `day` instead of opening a second
+        // row for the same provider set.
+        updated += tx.execute(
+            "UPDATE wayback.aspa_version v
+                SET last_seen = (SELECT min(w.first_seen) - 1 FROM wayback.aspa_version w
+                                  WHERE w.aspa_obj_id = v.aspa_obj_id AND w.first_seen > $2::date)
+               FROM stage_aspa s
+               JOIN wayback.aspa_object o ON o.ta = $1 AND o.customer_asn = s.customer
+              WHERE v.aspa_obj_id = o.aspa_obj_id
+                AND v.providers = s.providers
+                AND v.last_seen = $2::date - 1",
+            &[&file.tal, &day],
+        )? as i64;
         inserted = tx.execute(
             "INSERT INTO wayback.aspa_version
                (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
@@ -301,14 +357,53 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
                WHERE v.aspa_obj_id = o.aspa_obj_id
                  AND v.providers = s.providers
                  AND v.first_seen <= $2::date
-                 AND (v.last_seen IS NULL OR v.last_seen >= $2::date - 1))
+                 AND (v.last_seen IS NULL OR v.last_seen >= $2::date))
              ON CONFLICT (aspa_obj_id, first_seen) DO NOTHING",
             &[&file.tal, &day],
         )? as i64;
     }
 
+    // `aspa_object.last_seen` is a denormalized current-state marker, not a
+    // second history axis. A repair can replay an older day after a later span
+    // was already closed; derive the marker from the latest version for every
+    // touched customer so that replay cannot reopen the object by itself.
+    let current_ids: Vec<i64> = current.values().map(|row| row.aspa_obj_id).collect();
+    updated += tx.execute(
+        "WITH touched AS (
+            SELECT o.aspa_obj_id
+            FROM stage_aspa s
+            JOIN wayback.aspa_object o ON o.ta = $1 AND o.customer_asn = s.customer
+            UNION
+            SELECT unnest($2::bigint[])
+          ), latest AS (
+            SELECT DISTINCT ON (v.aspa_obj_id) v.aspa_obj_id, v.last_seen
+            FROM wayback.aspa_version v
+            JOIN touched t USING (aspa_obj_id)
+            ORDER BY v.aspa_obj_id, v.first_seen DESC
+          )
+          UPDATE wayback.aspa_object o
+             SET last_seen = latest.last_seen
+            FROM latest
+           WHERE o.aspa_obj_id = latest.aspa_obj_id
+             AND o.last_seen IS DISTINCT FROM latest.last_seen",
+        &[&file.tal, &current_ids],
+    )? as i64;
+
     tx.commit().context("commit transaction")?;
     Ok((inserted, updated))
+}
+
+/// Whether the archive carries this artifact right now. `oneio::exists` asks
+/// the server; `None` means the probe itself failed, which is not evidence.
+fn artifact_published(url: &str) -> Option<bool> {
+    oneio::exists(url).ok()
+}
+
+/// An era start is recorded only with positive evidence: nothing observed for
+/// this TAL yet and the archive listing does not carry the artifact. Every other
+/// failure counts as a run failure rather than a silent era start.
+fn verified_era_start(observed_any: bool, published: Option<bool>) -> bool {
+    !observed_any && published == Some(false)
 }
 
 /// The version that was current ON `day`: the latest span covering it. Diffing
@@ -321,7 +416,7 @@ fn load_current_aspa(
 ) -> Result<HashMap<i64, CurrentAspa>> {
     let mut map = HashMap::new();
     for row in tx.query(
-        "SELECT o.aspa_obj_id, o.customer_asn, o.first_seen, v.providers, v.first_seen
+        "SELECT o.aspa_obj_id, o.customer_asn, v.providers, v.first_seen
            FROM wayback.aspa_object o
            JOIN wayback.aspa_version v USING (aspa_obj_id)
           WHERE o.ta = $1 AND v.first_seen <= $2 AND (v.last_seen IS NULL OR v.last_seen >= $2)",
@@ -333,9 +428,8 @@ fn load_current_aspa(
             customer_asn,
             CurrentAspa {
                 aspa_obj_id,
-                object_first_seen: row.get(2),
-                providers: row.get(3),
-                version_first_seen: row.get(4),
+                providers: row.get(2),
+                version_first_seen: row.get(3),
             },
         );
     }
@@ -395,7 +489,10 @@ fn ingest_aspa_file(
             Ok(())
         }
         Err(error) => {
-            let era_start = !*observed_any;
+            // A listed file that cannot be read is not evidence that the
+            // artifact was never published: only the archive's own listing can
+            // say that, and anything unverified fails the run.
+            let era_start = verified_era_start(*observed_any, artifact_published(&file.url));
             if era_start {
                 println!(
                     "  {} era-start (ASPA artifact not published yet)",
@@ -423,57 +520,70 @@ fn ingest_aspa_file(
     }
 }
 
+fn record_aspa_gap(
+    client: &mut Client,
+    tal: &str,
+    day: NaiveDate,
+    era_start: bool,
+    fail_run: bool,
+    counts: &mut RunCounts,
+) -> Result<()> {
+    if era_start {
+        println!("  {day} era-start (ASPA artifact not published yet)");
+    } else {
+        eprintln!("  MISSING {day}: not listed by RIPE FTP");
+        if fail_run {
+            counts.files_failed += 1;
+        }
+    }
+    ingest_aspa_day(
+        client,
+        &AspaFile {
+            tal,
+            day,
+            entries: &[],
+            quality: &AspaQuality::default(),
+            file_ok: false,
+            http_status: None,
+            sha256: None,
+            era_start,
+        },
+    )?;
+    Ok(())
+}
+
 fn ingest_aspa_tal_range(
     client: &mut Client,
     tal_url: &str,
     from: NaiveDate,
     until: NaiveDate,
-    require_every_day: bool,
+    missing: MissingDays,
     counts: &mut RunCounts,
 ) -> Result<()> {
     let tal = tal_from_url(tal_url);
     println!("== TAL {tal} (aspa) ==");
-    let mut files = crawl_tal_artifact(tal_url, Some(from), Some(until), ASPA_ARTIFACT);
+    let mut files = try_crawl_tal_artifact(tal_url, Some(from), Some(until), ASPA_ARTIFACT)?;
     files.sort_by_key(|file| file.file_date);
     let mut observed_any = last_observed_day(client, tal, ASPA_ARTIFACT)?.is_some();
-
-    if !require_every_day {
-        for file in &files {
-            ingest_aspa_file(client, tal, file, &mut observed_any, counts)?;
-        }
-        return Ok(());
-    }
 
     let mut files_by_day = BTreeMap::new();
     for file in files {
         files_by_day.insert(file.file_date, file);
     }
+    // Every calendar day of the range gets a ledger row, so a listing that could
+    // not be read cannot pass as "nothing was published".
     let mut day = from;
     while day <= until {
         match files_by_day.remove(&day) {
             Some(file) => ingest_aspa_file(client, tal, &file, &mut observed_any, counts)?,
-            None => {
-                let era_start = !observed_any;
-                if era_start {
-                    println!("  {day} era-start (ASPA artifact not published yet)");
-                } else {
-                    eprintln!("  MISSING {day}: not listed by RIPE FTP");
-                    counts.files_failed += 1;
-                }
-                ingest_aspa_day(
-                    client,
-                    &AspaFile {
-                        tal,
-                        day,
-                        entries: &[],
-                        quality: &AspaQuality::default(),
-                        file_ok: false,
-                        http_status: None,
-                        sha256: None,
-                        era_start,
-                    },
-                )?;
-            }
+            None => record_aspa_gap(
+                client,
+                tal,
+                day,
+                !observed_any,
+                missing == MissingDays::FailRun,
+                counts,
+            )?,
         }
         day += chrono::Duration::days(1);
     }
@@ -496,7 +606,7 @@ pub fn pg_aspa_update(config: &str, until: Option<NaiveDate>, tals: &[String]) -
                 println!("== TAL {tal} (aspa) == already observed through {until}");
                 continue;
             }
-            ingest_aspa_tal_range(client, tal_url, from, until, true, counts)?;
+            ingest_aspa_tal_range(client, tal_url, from, until, MissingDays::FailRun, counts)?;
         }
         Ok(())
     })
@@ -504,7 +614,8 @@ pub fn pg_aspa_update(config: &str, until: Option<NaiveDate>, tals: &[String]) -
 
 /// Historical ASPA ingest over an explicit range. The range is clamped to the
 /// JSON era (2023-10-11); days before a TAL's first published artifact are
-/// recorded as `era_start`, not as failures.
+/// recorded as `era_start`, and other days the archive does not list are
+/// recorded as gaps, neither of them failing the run.
 pub fn pg_aspa_backfill(
     config: &str,
     from: NaiveDate,
@@ -520,7 +631,14 @@ pub fn pg_aspa_backfill(
 
     run_ingest(&mut client, "backfill-aspa", |client, counts| {
         for tal_url in &tal_urls {
-            ingest_aspa_tal_range(client, tal_url, from, until, false, counts)?;
+            ingest_aspa_tal_range(
+                client,
+                tal_url,
+                from,
+                until,
+                MissingDays::RecordOnly,
+                counts,
+            )?;
         }
         Ok(())
     })
@@ -599,5 +717,212 @@ mod tests {
             Some(day - chrono::Duration::days(1))
         );
         assert_eq!(last_seen_before_absence(day, day), None);
+    }
+
+    #[test]
+    fn era_start_requires_verified_publication_evidence() {
+        // Nothing observed yet and the archive says the artifact is not there.
+        assert!(verified_era_start(false, Some(false)));
+        // A TAL with ASPA history never starts an era again.
+        assert!(!verified_era_start(true, Some(false)));
+        // The artifact is published: the failure to read it is transient.
+        assert!(!verified_era_start(false, Some(true)));
+        // The probe itself failed, so there is no evidence either way.
+        assert!(!verified_era_start(false, None));
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use super::*;
+    use crate::pg_ingest::test_db;
+
+    fn day(value: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("valid test date")
+    }
+
+    fn aspa(providers: &[i64]) -> AspaEntry {
+        AspaEntry {
+            customer_asn: 64_512,
+            providers: providers.to_vec(),
+            has_as0: false,
+            as0_only: false,
+        }
+    }
+
+    fn apply(client: &mut Client, day: NaiveDate, entries: &[AspaEntry]) -> (i64, i64) {
+        let quality = AspaQuality {
+            objects: entries.len() as u64,
+            ..AspaQuality::default()
+        };
+        ingest_aspa_day(
+            client,
+            &AspaFile {
+                tal: "test",
+                day,
+                entries,
+                quality: &quality,
+                file_ok: true,
+                http_status: Some(200),
+                sha256: None,
+                era_start: false,
+            },
+        )
+        .expect("apply one day")
+    }
+
+    /// Observation spans of the stored customer, oldest first.
+    fn spans(client: &mut Client) -> Vec<(NaiveDate, Option<NaiveDate>)> {
+        client
+            .query(
+                "SELECT first_seen, last_seen FROM wayback.aspa_version ORDER BY first_seen",
+                &[],
+            )
+            .expect("query spans")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    fn object_marker(client: &mut Client) -> Option<NaiveDate> {
+        client
+            .query_one("SELECT last_seen FROM wayback.aspa_object", &[])
+            .expect("query object marker")
+            .get(0)
+    }
+
+    fn count(client: &mut Client, sql: &str) -> i64 {
+        client.query_one(sql, &[]).expect("count query").get(0)
+    }
+
+    #[test]
+    fn replaying_a_day_writes_nothing() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let entry = aspa(&[64_513]);
+
+        assert!(apply(&mut client, first, std::slice::from_ref(&entry)).0 > 0);
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+
+        let replay = apply(&mut client, first, std::slice::from_ref(&entry));
+        assert_eq!(replay, (0, 0));
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+        assert_eq!(
+            count(
+                &mut client,
+                "SELECT count(*) FROM wayback.aspa_version_current_view"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_provider_set_change_closes_the_previous_span() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        apply(&mut client, first, &[aspa(&[64_513])]);
+        apply(&mut client, second, &[aspa(&[64_514])]);
+
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(first)), (second, None)]
+        );
+        assert_eq!(object_marker(&mut client), None);
+    }
+
+    #[test]
+    fn a_disappearance_closes_the_span_and_the_marker() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        apply(&mut client, first, &[aspa(&[64_513])]);
+        // A readable file without the customer: it withdrew its ASPA.
+        apply(&mut client, second, &[]);
+
+        assert_eq!(spans(&mut client), vec![(first, Some(first))]);
+        assert_eq!(object_marker(&mut client), Some(first));
+        assert_eq!(
+            count(
+                &mut client,
+                "SELECT count(*) FROM wayback.aspa_object_current_view"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn reapplying_a_day_recorded_as_absent_continues_the_span() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        let entry = aspa(&[64_513]);
+        apply(&mut client, first, std::slice::from_ref(&entry));
+        apply(&mut client, second, &[]);
+        assert_eq!(spans(&mut client), vec![(first, Some(first))]);
+
+        // The day is now known to carry the customer again: the span that ended
+        // the day before has to gain the day, not stay closed.
+        let applied = apply(&mut client, second, std::slice::from_ref(&entry));
+        assert!(applied.1 > 0, "the re-applied day must write: {applied:?}");
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+        assert_eq!(object_marker(&mut client), None);
+    }
+
+    #[test]
+    fn repairing_an_absent_middle_day_keeps_the_later_span() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let days: Vec<NaiveDate> = ["2026-09-10", "2026-09-11", "2026-09-12", "2026-09-13"]
+            .iter()
+            .map(|value| day(value))
+            .collect();
+        let entry = aspa(&[64_513]);
+        for present_day in &days {
+            apply(&mut client, *present_day, std::slice::from_ref(&entry));
+        }
+        assert_eq!(spans(&mut client), vec![(days[0], None)]);
+
+        // The customer was absent on day 2 after all: days 3-4 keep their
+        // coverage and the object stays current, so the span is split.
+        apply(&mut client, days[1], &[]);
+        assert_eq!(
+            spans(&mut client),
+            vec![(days[0], Some(days[0])), (days[2], None)]
+        );
+        assert_eq!(object_marker(&mut client), None);
+    }
+
+    #[test]
+    fn out_of_order_replay_does_not_reopen_a_closed_object() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let day_one = day("2026-09-10");
+        let day_two = day_one + chrono::Duration::days(1);
+        let entry = aspa(&[64_513]);
+
+        apply(&mut client, day_one, std::slice::from_ref(&entry));
+        apply(&mut client, day_two, &[]);
+        let replay = apply(&mut client, day_one, std::slice::from_ref(&entry));
+
+        assert_eq!(replay, (0, 0));
+        assert_eq!(object_marker(&mut client), Some(day_one));
+        assert_eq!(
+            count(
+                &mut client,
+                "SELECT count(*) FROM wayback.aspa_version WHERE last_seen IS NULL"
+            ),
+            0
+        );
     }
 }

@@ -16,6 +16,22 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Runs the PostgreSQL ingest tests against the service above; they skip
+      # themselves when this is unset.
+      WAYBACK_PG_TEST_CONFIG: host=localhost user=postgres password=postgres dbname=postgres
     steps:
       - uses: actions/checkout@v4
       - name: Check formatting

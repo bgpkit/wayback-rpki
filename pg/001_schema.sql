@@ -81,18 +81,25 @@ CREATE OR REPLACE VIEW wayback.roa_version_current_view AS
   SELECT * FROM wayback.roa_version WHERE last_seen IS NULL;
 
 -- Tuple-grain compatibility view: folds object+version spans to
--- (prefix, origin_asn, max_len) maximal spans — trie semantics.
+-- (prefix, origin_asn, max_len) contiguous islands — trie semantics. Disjoint
+-- islands stay separate rows: a tuple that disappeared and came back is two
+-- spans, not one span with the days in between filled in.
 CREATE OR REPLACE VIEW wayback.roa_tuple_view AS
 WITH covered AS (
   SELECT o.prefix, o.origin_asn, v.max_len,
          generate_series(v.first_seen, COALESCE(v.last_seen, CURRENT_DATE), interval '1 day')::date AS d
   FROM wayback.roa_object o
   JOIN wayback.roa_version v USING (roa_obj_id)
+),
+islands AS (
+  SELECT prefix, origin_asn, max_len, d,
+         d - (row_number() OVER (PARTITION BY prefix, origin_asn, max_len ORDER BY d))::int AS island
+  FROM covered
 )
 SELECT prefix, origin_asn, max_len, min(d) AS first_seen,
        CASE WHEN max(d) = CURRENT_DATE THEN NULL ELSE max(d) END AS last_seen
-FROM covered
-GROUP BY prefix, origin_asn, max_len;
+FROM islands
+GROUP BY prefix, origin_asn, max_len, island;
 
 -- Change events: attribute changes and lifecycle boundaries.
 -- Noise policy (storage stays raw; only this view filters):

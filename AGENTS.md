@@ -44,6 +44,11 @@ wayback-rpki/
 
 - **`crawl_tal_after(tal_url, from, until)`** — Scrapes RIPE's year/month/day directory
   listing for a given TAL, returns `Vec<RoaFile>` metadata. Uses `rayon` for parallel crawling.
+- **`try_crawl_tal_after` / `try_crawl_tal_artifact`** — the same listing walk with the crawl
+  failure kept as an `Err`, so an unreadable listing cannot pass as "nothing was published".
+  The `crawl_tal_*` forms stay the v1 contract (warning + empty vector).
+- **`tal_url(name)` / `tal_names()`** — resolve or validate a TAL name without the panic in
+  `get_tal_urls`, which keeps its v1 behaviour.
 - **`parse_roas_csv(url)`** — Downloads and parses a `roas.csv.xz` file into `Vec<RoaEntry>`.
   Each entry has `tal`, `prefix` (`IpNet`), `max_len`, `asn`, `date` (`NaiveDate`).
 - **`get_tal_urls(tal)`** — Returns RIPE RPKI TAL URLs for the 5 RIRs (afrinic, apnic, arin,
@@ -161,7 +166,17 @@ and the `wayback-rpki` CLI behave exactly as before.
 - **Commands**: `wayback-pg update --pg-config ...` and `wayback-pg backfill
   --pg-config ... --from --until`, both accepting `--tal afrinic,apnic` and
   `--types roa,aspa` (default: both families, each resuming from its own
-  source-file cursor).
+  source-file cursor). An unknown `--tal` name is a CLI error, not a panic.
+- **Repair semantics**: applying a day out of order continues an adjacent span, splits the
+  span that covers the day when the file says the object was absent (days observed after it
+  keep their own span, gated on `source_file`), and derives `roa_object.last_seen` /
+  `aspa_object.last_seen` from the version spans, so replaying an older day neither reopens
+  nor closes an object that later history still covers.
+- **Gaps**: every calendar day of a range gets a `source_file` row. A day the archive does
+  not list is recorded as `missing` (an incremental run fails on it, a backfill does not);
+  a listed file that cannot be fetched or parsed is always a failure. ASPA records
+  `era_start` only with the archive's own listing as evidence (`oneio::exists`), never from a
+  fetch or parse error.
 - **Storage**: `pg/001_schema.sql` (ROA object/version SCD-2, the per-file
   `source_file` ledger, `ingest_run` accounting) and `pg/002_aspa.sql`
   (ASN-keyed `aspa_object` / `aspa_version`, plus `aspa_providers_of()` and
@@ -180,6 +195,10 @@ cargo build                              # Build
 cargo clippy --all-features -- -D warnings  # Lint (CI-enforced)
 cargo test --lib roas_trie::tests         # Offline unit tests (plus src/bin/main.rs tests)
 cargo test                                # All tests (lib.rs crawler tests need network to ftp.ripe.net)
+
+# PostgreSQL ingest tests: skipped unless a disposable database is named.
+WAYBACK_PG_TEST_CONFIG="host=127.0.0.1 user=postgres password=postgres dbname=postgres" \
+  cargo test --all-features --lib pg_tests
 ```
 
 ## CI/CD
@@ -188,6 +207,8 @@ CI mirrors the monocle repo's workflow layout.
 
 - **`rust.yml`** — On push/PR to main (`**.md` ignored): `cargo fmt --check`,
   `cargo clippy --all-features -- -D warnings`, `cargo test --all-features --verbose`.
+  A throwaway `postgres:17` service is provided through `WAYBACK_PG_TEST_CONFIG`, which is
+  what makes the PostgreSQL ingest tests run.
 - **`release.yml`** — On `v*` tag: `build-test` gate (fmt, clippy, build, test) →
   GitHub release (from `CHANGELOG.md`) → binary uploads for `aarch64-linux`,
   `x86_64-linux`, `universal-apple-darwin` (`macos-14` runner) → `cargo publish`
