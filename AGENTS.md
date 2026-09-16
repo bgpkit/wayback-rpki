@@ -171,7 +171,8 @@ and the `wayback-rpki` CLI behave exactly as before.
   source-file cursor). An unknown `--tal` name is a CLI error, not a panic.
 - **Repair semantics**: a span written for a repaired day covers that day only (it stays open
   only when the repaired day is the latest the TAL observed), because nothing observed the
-  days up to a later span. Applying a day out of order continues an adjacent span, splits the
+  days up to a later span. Applying a day out of order continues an adjacent span (merging the
+  identical span that starts the next day), splits the
   span that covers the day (absence closes it, changed attributes or a changed provider set
   keep the days after it under the previous values, gated on days the TAL observed in
   `source_file`), replaces that day's own row instead of colliding with its primary key (a

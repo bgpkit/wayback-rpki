@@ -554,7 +554,19 @@ pub fn ingest_day(
               WHERE v.roa_obj_id = o.roa_obj_id
                 AND v.max_len = s.max_len
                 AND v.not_before = s.not_before AND v.not_after = s.not_after
-                AND v.last_seen = $2::date - 1",
+                AND v.last_seen = $2::date - 1
+                -- only when the day is not covered by the same attributes
+                -- already: extending then would overlap that span. The staging
+                -- filter above already excludes covered objects, so this guard is
+                -- what keeps a future change to that filter from overlapping rows.
+                AND NOT EXISTS (
+                  SELECT 1 FROM wayback.roa_version c
+                  WHERE c.roa_obj_id = v.roa_obj_id
+                    AND c.max_len = s.max_len
+                    AND c.not_before = s.not_before AND c.not_after = s.not_after
+                    AND c.first_seen <= $2::date
+                    AND (c.last_seen IS NULL OR c.last_seen >= $2::date)
+                )",
             &[&tal, &day],
         )? as i64;
         // Versions: one per staged tuple unless a matching span actually covers
@@ -585,27 +597,35 @@ pub fn ingest_day(
              )",
             &[&tal, &day],
         )?;
-        // Rewind: out-of-order backfill moves an existing current version's
-        // first_seen back instead of creating an overlapping open-ended span.
+        // Merge the identical span that begins the next day into this day's
+        // row, so repairing the day before an existing span leaves one span
+        // instead of two adjacent ones. The next-day row is removed first (its
+        // end is kept aside) because extending over a row that still exists
+        // would trip the span exclusion constraint.
         tx.execute(
-            "UPDATE wayback.roa_version v
-               SET first_seen = LEAST(v.first_seen, $2::date)
-             FROM stage_day s
-             JOIN wayback.roa_object o
-               ON o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix AND o.origin_asn = s.origin
-            WHERE v.roa_obj_id = o.roa_obj_id
-              AND v.max_len = s.max_len
-              AND v.not_before = s.not_before AND v.not_after = s.not_after
-              AND v.first_seen > $2::date
-              AND NOT EXISTS (
-                SELECT 1 FROM wayback.roa_version w
-                WHERE w.roa_obj_id = v.roa_obj_id
-                  AND w.max_len = s.max_len
-                  AND w.not_before = s.not_before AND w.not_after = s.not_after
-                  AND w.first_seen < v.first_seen
-              )",
+            "WITH moved AS (
+               DELETE FROM wayback.roa_version v
+                 USING wayback.roa_object o, stage_day s
+                WHERE v.roa_obj_id = o.roa_obj_id
+                  AND o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix
+                  AND o.origin_asn = s.origin
+                  AND v.max_len = s.max_len
+                  AND v.not_before = s.not_before AND v.not_after = s.not_after
+                  AND v.first_seen = $2::date + 1
+               RETURNING v.roa_obj_id, v.max_len, v.not_before, v.not_after, v.last_seen
+             )
+             INSERT INTO stage_split (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
+             SELECT roa_obj_id, max_len, not_before, not_after, $2::date, last_seen FROM moved",
             &[&tal, &day],
         )?;
+        tx.execute(
+            "UPDATE wayback.roa_version v
+                SET last_seen = g.last_seen
+               FROM stage_split g
+              WHERE v.roa_obj_id = g.roa_obj_id AND v.first_seen = $1::date",
+            &[&day],
+        )?;
+        tx.execute("TRUNCATE stage_split", &[])?;
         // Close current versions whose attributes no longer match any staged row
         // for the same object (attribute change), then insert new versions.
         tx.execute(
@@ -1425,6 +1445,112 @@ mod pg_tests {
             .expect("ledger row")
             .get(0);
         assert_eq!(after, Some(1));
+    }
+
+    #[test]
+    fn repairing_the_day_before_an_existing_span_merges_it() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-02");
+        let second = day("2026-09-03");
+        present(&mut client, second);
+        assert_eq!(spans(&mut client), vec![(second, None)]);
+
+        // The same version is observed for the day before: one span, not two
+        // adjacent rows.
+        present(&mut client, first);
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+
+        // Replaying the later day must not extend a predecessor over the row
+        // that already covers it.
+        let replay = ingest_day(
+            &mut client,
+            "test",
+            second,
+            &[roa(24)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("replay the later day");
+        assert_eq!(replay, (0, 0));
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+    }
+
+    #[test]
+    fn a_reappearance_merges_into_the_predecessor_and_replays_stable() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        let third = day("2026-09-03");
+        present(&mut client, first);
+        present(&mut client, second);
+        ingest_day(&mut client, "test", third, &[], true, Some(200), None).expect("absent day");
+
+        // The object is back on the third day with the same attributes: the span
+        // that ended the day before takes the day back instead of sitting next to
+        // a second row.
+        present(&mut client, third);
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+
+        let replay = ingest_day(
+            &mut client,
+            "test",
+            third,
+            &[roa(24)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("replay the reappearance day");
+        assert_eq!(replay, (0, 0));
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+    }
+
+    #[test]
+    fn a_covered_day_replays_without_writes() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        let third = day("2026-09-03");
+        // A store that already holds a bounded span ending the day before, plus a
+        // row covering the day itself with the same attributes.
+        client
+            .batch_execute(&format!(
+                "INSERT INTO wayback.roa_object (prefix, origin_asn, ta, uri, first_seen)
+                 VALUES ('192.0.2.0/24', 64496, 'test', 'rsync://rpki.example/roa/test.cer', '{first}');
+                 INSERT INTO wayback.roa_version
+                   (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
+                 SELECT roa_obj_id, 24, '2026-01-01 00:00:00+00', '2027-01-01 00:00:00+00', '{first}', '{second}'
+                   FROM wayback.roa_object;
+                 INSERT INTO wayback.roa_version
+                   (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
+                 SELECT roa_obj_id, 24, '2026-01-01 00:00:00+00', '2027-01-01 00:00:00+00', '{third}', NULL
+                   FROM wayback.roa_object;"
+            ))
+            .expect("seed the store");
+
+        let applied = ingest_day(
+            &mut client,
+            "test",
+            third,
+            &[roa(24)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("replay an already covered day");
+
+        assert_eq!(applied, (0, 0));
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(second)), (third, None)]
+        );
     }
 
     #[test]

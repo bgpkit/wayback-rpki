@@ -424,7 +424,16 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
                JOIN wayback.aspa_object o ON o.ta = $1 AND o.customer_asn = s.customer
               WHERE v.aspa_obj_id = o.aspa_obj_id
                 AND v.providers = s.providers
-                AND v.last_seen = $2::date - 1",
+                AND v.last_seen = $2::date - 1
+                -- only when the day is not covered by the same provider set
+                -- already: extending then would overlap that span
+                AND NOT EXISTS (
+                  SELECT 1 FROM wayback.aspa_version c
+                  WHERE c.aspa_obj_id = v.aspa_obj_id
+                    AND c.providers = s.providers
+                    AND c.first_seen <= $2::date
+                    AND (c.last_seen IS NULL OR c.last_seen >= $2::date)
+                )",
             &[&file.tal, &day],
         )? as i64;
         inserted = tx.execute(
@@ -451,6 +460,35 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
                    last_seen = EXCLUDED.last_seen",
             &[&file.tal, &day],
         )? as i64;
+        // Merge the identical span that begins the next day into this day's
+        // row, so repairing the day before an existing span leaves one span
+        // instead of two adjacent ones. The next-day row is removed first (its
+        // end is kept aside) because extending over a row that still exists
+        // would trip the span exclusion constraint.
+        tx.execute(
+            "WITH moved AS (
+               DELETE FROM wayback.aspa_version v
+                 USING wayback.aspa_object o, stage_aspa s
+                WHERE v.aspa_obj_id = o.aspa_obj_id
+                  AND o.ta = $1 AND o.customer_asn = s.customer
+                  AND v.providers = s.providers
+                  AND v.first_seen = $2::date + 1
+               RETURNING v.aspa_obj_id, v.providers, v.provider_count, v.has_as0, v.as0_only, v.last_seen
+             )
+             INSERT INTO stage_aspa_split
+               (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
+             SELECT aspa_obj_id, providers, provider_count, has_as0, as0_only, $2::date, last_seen
+               FROM moved",
+            &[&file.tal, &day],
+        )?;
+        tx.execute(
+            "UPDATE wayback.aspa_version v
+                SET last_seen = g.last_seen
+               FROM stage_aspa_split g
+              WHERE v.aspa_obj_id = g.aspa_obj_id AND v.first_seen = $1::date",
+            &[&day],
+        )?;
+        tx.execute("TRUNCATE stage_aspa_split", &[])?;
     }
 
     // An object whose observations are all gone (a repair that removes its first
@@ -1270,6 +1308,80 @@ mod pg_tests {
             .get(0);
         assert_eq!(gap, "missing");
         assert_eq!(counts.files_failed, 1);
+    }
+
+    #[test]
+    fn repairing_the_day_before_an_existing_span_merges_it() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-11");
+        let second = day("2026-09-12");
+        let entry = aspa(&[64_513]);
+        apply(&mut client, second, std::slice::from_ref(&entry));
+        assert_eq!(spans(&mut client), vec![(second, None)]);
+
+        apply(&mut client, first, std::slice::from_ref(&entry));
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+
+        let replay = apply(&mut client, second, std::slice::from_ref(&entry));
+        assert_eq!(replay, (0, 0));
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+    }
+
+    #[test]
+    fn a_reappearance_merges_into_the_predecessor_and_replays_stable() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        let third = day("2026-09-12");
+        let entry = aspa(&[64_513]);
+        apply(&mut client, first, std::slice::from_ref(&entry));
+        apply(&mut client, second, std::slice::from_ref(&entry));
+        apply(&mut client, third, &[]);
+
+        // The customer is back on the third day with the same set: the span that
+        // ended the day before takes the day back.
+        apply(&mut client, third, std::slice::from_ref(&entry));
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+
+        let replay = apply(&mut client, third, std::slice::from_ref(&entry));
+        assert_eq!(replay, (0, 0));
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+    }
+
+    #[test]
+    fn a_matching_span_covering_the_day_blocks_the_predecessor_extension() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        let third = day("2026-09-12");
+        client
+            .batch_execute(&format!(
+                "INSERT INTO wayback.aspa_object (ta, customer_asn, first_seen)
+                 VALUES ('test', 64512, '{first}');
+                 INSERT INTO wayback.aspa_version
+                   (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
+                 SELECT aspa_obj_id, ARRAY[64513], 1, false, false, '{first}', '{second}'
+                   FROM wayback.aspa_object;
+                 INSERT INTO wayback.aspa_version
+                   (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
+                 SELECT aspa_obj_id, ARRAY[64513], 1, false, false, '{third}', NULL
+                   FROM wayback.aspa_object;"
+            ))
+            .expect("seed the store");
+
+        let applied = apply(&mut client, third, &[aspa(&[64_513])]);
+
+        assert_eq!(applied, (0, 0));
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(second)), (third, None)]
+        );
     }
 
     #[test]

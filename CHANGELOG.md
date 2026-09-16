@@ -40,6 +40,9 @@ All notable changes to this project will be documented in this file.
 * The `source_file` ledger only ever gains evidence: a failed replay of a day that was already observed records the run failure but keeps the `observed` row and its counts instead of downgrading the day to `missing` and clearing its provenance.
 * An ASPA artifact that exists but does not parse marks publication as begun, so a backfill that continues past the failure records the days after it as gaps instead of era starts.
 
+* Repairing the day before an existing span merges the identical span that starts the next day into one span instead of leaving two adjacent rows, which a later replay of that day would have extended over, violating the span exclusion constraint and aborting the day.
+* The predecessor extension refuses to run when a span with the same attributes already covers the day, which makes such a replay a no-op instead of an overlapping update.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.
