@@ -174,6 +174,7 @@ struct IngestCounts {
 /// Load all current objects (last_seen IS NULL) keyed by (ta, uri, prefix, origin).
 fn load_current_objects(
     client: &mut postgres::Transaction,
+    tal: &str,
     day: NaiveDate,
 ) -> Result<HashMap<(String, String, String, i64), CurrentVersion>> {
     let mut map = HashMap::new();
@@ -186,8 +187,8 @@ fn load_current_objects(
                     v.max_len, v.not_before, v.not_after, v.first_seen
              FROM wayback.roa_object o
              JOIN wayback.roa_version v ON v.roa_obj_id = o.roa_obj_id
-             WHERE v.first_seen <= $1 AND (v.last_seen IS NULL OR v.last_seen >= $1)",
-            &[&day],
+             WHERE o.ta = $2 AND v.first_seen <= $1 AND (v.last_seen IS NULL OR v.last_seen >= $1)",
+            &[&day, &tal],
         )
         .context("load current objects")?
     {
@@ -223,21 +224,16 @@ fn last_seen_before_absence(first_seen: NaiveDate, day: NaiveDate) -> Option<Nai
     (first_seen <= previous_day).then_some(previous_day)
 }
 
-/// Close the span that covers `day` on `last_seen`, keeping the days after
-/// `day` as their own span. Trimming alone would drop coverage that later
-/// ingests already observed, and closing only an open span would leave the
-/// repaired day covered by a span the file says is not there.
-fn close_span_with_split(
+/// Stage the days after `day` that the span still covers, so a repair can keep
+/// them as their own span. An open span only reaches as far as the days the TAL
+/// actually observed: without an observed day after `day` there is no later part
+/// to carry, and inventing one would claim coverage past the archive frontier.
+fn stage_span_tail(
     tx: &mut postgres::Transaction<'_>,
     roa_obj_id: i64,
     version_first_seen: NaiveDate,
     day: NaiveDate,
-    last_seen: NaiveDate,
-    counts: &mut IngestCounts,
 ) -> Result<()> {
-    // An open span only reaches as far as the days the TAL actually observed:
-    // without an observed day after `day` there is no later part to carry, and
-    // inventing one would claim coverage past the archive frontier.
     tx.execute(
         "INSERT INTO stage_split (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
          SELECT v.roa_obj_id, v.max_len, v.not_before, v.not_after, $1::date + 1, v.last_seen
@@ -253,20 +249,54 @@ fn close_span_with_split(
                                AND f.gap_class = 'observed'))",
         &[&day, &roa_obj_id, &version_first_seen],
     )?;
-    counts.versions_closed += tx.execute(
+    Ok(())
+}
+
+/// Trim the span observed on `day` back to `last_seen`, never inverting a range
+/// and never touching a span that starts after it.
+fn trim_span_to_day_before(
+    tx: &mut postgres::Transaction<'_>,
+    roa_obj_id: i64,
+    version_first_seen: NaiveDate,
+    last_seen: NaiveDate,
+) -> Result<i64> {
+    Ok(tx.execute(
         "UPDATE wayback.roa_version
             SET last_seen = $1
           WHERE roa_obj_id = $2 AND first_seen = $3
             AND COALESCE(last_seen, 'infinity'::date) > $1::date
             AND first_seen <= $1::date",
         &[&last_seen, &roa_obj_id, &version_first_seen],
-    )? as i64;
-    counts.versions_inserted += tx.execute(
+    )? as i64)
+}
+
+/// Write the carried-over tail of a split span and clear the scratch list.
+fn insert_staged_tail(tx: &mut postgres::Transaction<'_>) -> Result<i64> {
+    let inserted = tx.execute(
         "INSERT INTO wayback.roa_version (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
          SELECT roa_obj_id, max_len, not_before, not_after, first_seen, last_seen FROM stage_split",
         &[],
     )? as i64;
     tx.execute("TRUNCATE stage_split", &[])?;
+    Ok(inserted)
+}
+
+/// Close the span that covers `day` on `last_seen`, keeping the days after
+/// `day` as their own span. Trimming alone would drop coverage that later
+/// ingests already observed, and closing only an open span would leave the
+/// repaired day covered by a span the file says is not there.
+fn close_span_with_split(
+    tx: &mut postgres::Transaction<'_>,
+    roa_obj_id: i64,
+    version_first_seen: NaiveDate,
+    day: NaiveDate,
+    last_seen: NaiveDate,
+    counts: &mut IngestCounts,
+) -> Result<()> {
+    stage_span_tail(tx, roa_obj_id, version_first_seen, day)?;
+    counts.versions_closed +=
+        trim_span_to_day_before(tx, roa_obj_id, version_first_seen, last_seen)?;
+    counts.versions_inserted += insert_staged_tail(tx)?;
     Ok(())
 }
 
@@ -326,7 +356,7 @@ pub fn ingest_day(
         }
     }
 
-    let current = load_current_objects(&mut tx, day)?;
+    let current = load_current_objects(&mut tx, tal, day)?;
     let mut counts = IngestCounts::default();
 
     // Days after a repaired day that a span still covers are carried over here.
@@ -353,9 +383,12 @@ pub fn ingest_day(
                     } else {
                         (e.not_before, e.not_after)
                     };
-                    // Attribute change: close old version, open new one. Trim
-                    // any span still covering `day` (open or closed) back to
-                    // prev_day so the new span starting at `day` cannot overlap.
+                    // Attribute change: close the version observed on `day`,
+                    // keep the days after it as their own span, then write the
+                    // day's attributes. The old tail matters when a repair
+                    // re-applies an older day: later days were ingested with the
+                    // previous attributes and must not inherit the new ones.
+                    stage_span_tail(&mut tx, cur.roa_obj_id, cur.version_first_seen, day)?;
                     counts.versions_closed += tx.execute(
                         "UPDATE wayback.roa_version
                             SET last_seen = GREATEST(LEAST(COALESCE(last_seen, 'infinity'::date), $1), first_seen)
@@ -364,13 +397,18 @@ pub fn ingest_day(
                             AND first_seen <= $1::date + 1",
                         &[&prev_day, &cur.roa_obj_id],
                     )? as i64;
+                    counts.versions_inserted += insert_staged_tail(&mut tx)?;
                     counts.versions_inserted += tx.execute(
                         "INSERT INTO wayback.roa_version
                            (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
                          VALUES ($1, $2, $3::timestamp AT TIME ZONE 'UTC', $4::timestamp AT TIME ZONE 'UTC', $5,
                                  (SELECT min(w.first_seen) - 1 FROM wayback.roa_version w
                                    WHERE w.roa_obj_id = $1 AND w.first_seen > $5))
-                         ON CONFLICT (roa_obj_id, first_seen) DO NOTHING",
+                         ON CONFLICT (roa_obj_id, first_seen) DO UPDATE
+                           SET max_len = EXCLUDED.max_len,
+                               not_before = EXCLUDED.not_before,
+                               not_after = EXCLUDED.not_after,
+                               last_seen = EXCLUDED.last_seen",
                         &[
                             &cur.roa_obj_id,
                             &(e.max_len as i16),
@@ -382,7 +420,7 @@ pub fn ingest_day(
                 }
                 // else: unchanged -> no write (NULL stays).
             }
-            None if file_ok && key.0 == tal => {
+            None if file_ok => {
                 // Same TAL current row is absent from today's file. A row
                 // observed only yesterday is a valid one-day span and must be
                 // closed, while a span that begins today cannot be rewound.
@@ -599,7 +637,7 @@ pub(crate) struct RunCounts {
 fn next_update_day(last_observed: Option<NaiveDate>) -> Result<NaiveDate> {
     last_observed
         .map(|day| day + chrono::Duration::days(1))
-        .context("no observed source_file rows; run `wayback backfill` first")
+        .context("no observed source_file rows; run `wayback-pg backfill` first")
 }
 
 pub(crate) fn tal_from_url(tal_url: &str) -> &str {
@@ -1159,6 +1197,176 @@ mod pg_tests {
             0
         );
         assert_eq!(gap_class(&mut client, only_day), "missing");
+    }
+
+    #[test]
+    fn ingesting_one_tal_leaves_another_tal_alone() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        // The same tuple authorized under two TALs: one TAL's absence must not
+        // close the other TAL's object.
+        for tal in ["test-a", "test-b"] {
+            ingest_day(&mut client, tal, first, &[roa(24)], true, Some(200), None)
+                .expect("first day");
+            ingest_day(&mut client, tal, second, &[roa(24)], true, Some(200), None)
+                .expect("second day");
+        }
+        ingest_day(&mut client, "test-a", second, &[], true, Some(200), None)
+            .expect("test-a absent on the second day");
+
+        let markers: Vec<(String, Option<NaiveDate>)> = client
+            .query(
+                "SELECT ta, last_seen FROM wayback.roa_object ORDER BY ta",
+                &[],
+            )
+            .expect("query object markers")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            markers,
+            vec![
+                ("test-a".to_string(), Some(first)),
+                ("test-b".to_string(), None)
+            ]
+        );
+        let open_spans: i64 = client
+            .query_one(
+                "SELECT count(*) FROM wayback.roa_object o
+                   JOIN wayback.roa_version v USING (roa_obj_id)
+                  WHERE o.ta = 'test-b' AND v.last_seen IS NULL",
+                &[],
+            )
+            .expect("query test-b spans")
+            .get(0);
+        assert_eq!(open_spans, 1);
+    }
+
+    #[test]
+    fn repairing_an_attribute_change_keeps_the_later_span() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let days: Vec<NaiveDate> = ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+            .iter()
+            .map(|value| day(value))
+            .collect();
+        for present_day in &days {
+            present(&mut client, *present_day);
+        }
+        assert_eq!(spans(&mut client), vec![(days[0], None)]);
+
+        // Day 2 is re-applied with a different max_len: only that day changes.
+        // Days 3-4 were observed with the old attribute and keep it.
+        ingest_day(
+            &mut client,
+            "test",
+            days[1],
+            &[roa(25)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("repair day 2");
+
+        assert_eq!(
+            spans(&mut client),
+            vec![
+                (days[0], Some(days[0])),
+                (days[1], Some(days[1])),
+                (days[2], None)
+            ]
+        );
+        let max_lens: Vec<i16> = client
+            .query(
+                "SELECT max_len FROM wayback.roa_version ORDER BY first_seen",
+                &[],
+            )
+            .expect("query max_len")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(max_lens, vec![24, 25, 24]);
+        assert_eq!(object_marker(&mut client), None);
+    }
+
+    #[test]
+    fn reapplying_a_day_with_new_attributes_replaces_its_own_row() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        // The span starts on the second day, so the repair has to replace that
+        // row instead of finding the primary key taken.
+        ingest_day(&mut client, "test", first, &[], true, Some(200), None).expect("day 1 absent");
+        present(&mut client, second);
+        assert_eq!(spans(&mut client), vec![(second, None)]);
+
+        ingest_day(
+            &mut client,
+            "test",
+            second,
+            &[roa(25)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("re-apply day 2");
+
+        assert_eq!(spans(&mut client), vec![(second, None)]);
+        let max_len: i16 = client
+            .query_one("SELECT max_len FROM wayback.roa_version", &[])
+            .expect("query max_len")
+            .get(0);
+        assert_eq!(max_len, 25);
+    }
+
+    #[test]
+    fn the_tuple_view_folds_objects_that_share_a_tuple() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        // Two objects (different certificate URIs) authorize the same tuple on
+        // both days: the tuple view must still return one contiguous row.
+        for uri in [
+            "rsync://rpki.example/roa/a.cer",
+            "rsync://rpki.example/roa/b.cer",
+        ] {
+            for each_day in [first, second] {
+                let entry = RoaFullEntry {
+                    uri: uri.to_string(),
+                    ..roa(24)
+                };
+                ingest_day(
+                    &mut client,
+                    "test",
+                    each_day,
+                    &[entry],
+                    true,
+                    Some(200),
+                    None,
+                )
+                .expect("ingest shared tuple");
+            }
+        }
+
+        let islands: Vec<(NaiveDate, Option<NaiveDate>)> = client
+            .query(
+                "SELECT first_seen, last_seen FROM wayback.roa_tuple_view
+                  WHERE prefix = '192.0.2.0/24' ORDER BY first_seen",
+                &[],
+            )
+            .expect("query tuple view")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(islands, vec![(first, None)]);
     }
 
     #[test]

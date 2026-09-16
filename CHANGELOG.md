@@ -13,6 +13,12 @@ All notable changes to this project will be documented in this file.
 * `roa_counts_view` no longer reports a missing file as an observed zero count, and an unknown `--tal` name is a CLI error instead of a panic.
 * `roa_tuple_view` returns one row per contiguous span, so a tuple that disappeared and returned is two rows rather than one range with the gap filled in.
 
+* A repaired day whose attributes changed (ROA) or whose provider set changed (ASPA) now keeps the days after it under the previous values and replaces that day's own row, instead of writing the new values over later observations or dropping the change on a primary-key clash.
+* `roa_tuple_view` numbers the distinct day set, so several objects authorizing the same tuple no longer fragment one contiguous span.
+* The ROA ingest loads only the TAL being applied, so another TAL's objects can neither be closed nor marked by it.
+* ASPA `era_start` also requires the walk to have begun at the archive's ASPA era; a range that starts mid-history records absent days as gaps.
+* `next_update_day` points at `wayback-pg backfill`, and the ROA/ASPA storage comments state the invariants the tables actually hold.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.

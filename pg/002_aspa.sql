@@ -24,7 +24,8 @@ CREATE INDEX IF NOT EXISTS aspa_object_customer_idx
 
 CREATE TABLE IF NOT EXISTS wayback.aspa_version (
   aspa_obj_id    bigint   NOT NULL REFERENCES wayback.aspa_object,
-  providers      bigint[] NOT NULL,  -- canonical: ascending, unique, AS0 alone or absent
+  providers      bigint[] NOT NULL,  -- ascending + deduplicated; AS0 alone in a
+                                     -- conforming publication, stored as published otherwise
   provider_count smallint NOT NULL,
   has_as0        boolean  NOT NULL,
   as0_only       boolean  NOT NULL,

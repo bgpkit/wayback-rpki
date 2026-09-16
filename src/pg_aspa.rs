@@ -47,7 +47,9 @@ struct RawAspa {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AspaEntry {
     pub customer_asn: i64,
-    /// Ascending, deduplicated; AS0 only ever appears alone.
+    /// Ascending and deduplicated. AS0 appears alone in a conforming
+    /// publication; a publisher that lists it next to other providers keeps that
+    /// set here (counted in `AspaQuality`, never repaired).
     pub providers: Vec<i64>,
     pub has_as0: bool,
     pub as0_only: bool,
@@ -142,19 +144,16 @@ pub struct AspaFile<'a> {
     pub era_start: bool,
 }
 
-/// Close the span that covers `day` on `last_seen`, keeping the days after
-/// `day` as their own span. Trimming alone would drop coverage that later
-/// ingests already observed.
-fn close_aspa_span_with_split(
+/// Stage the days after `day` that the span still covers, so a repair can keep
+/// them as their own span. An open span only reaches as far as the days the TAL
+/// actually observed: without an observed day after `day` there is no later part
+/// to carry, and inventing one would claim coverage past the archive frontier.
+fn stage_aspa_span_tail(
     tx: &mut postgres::Transaction<'_>,
     aspa_obj_id: i64,
     version_first_seen: NaiveDate,
     day: NaiveDate,
-    last_seen: NaiveDate,
-) -> Result<i64> {
-    // An open span only reaches as far as the days the TAL actually observed:
-    // without an observed day after `day` there is no later part to carry, and
-    // inventing one would claim coverage past the archive frontier.
+) -> Result<()> {
     tx.execute(
         "INSERT INTO stage_aspa_split
            (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
@@ -171,14 +170,29 @@ fn close_aspa_span_with_split(
                                AND f.gap_class = 'observed'))",
         &[&day, &aspa_obj_id, &version_first_seen],
     )?;
-    let trimmed = tx.execute(
+    Ok(())
+}
+
+/// Trim the span observed on `day` back to `last_seen`, never inverting a range
+/// and never touching a span that starts after it.
+fn trim_aspa_span_to_day_before(
+    tx: &mut postgres::Transaction<'_>,
+    aspa_obj_id: i64,
+    version_first_seen: NaiveDate,
+    last_seen: NaiveDate,
+) -> Result<i64> {
+    Ok(tx.execute(
         "UPDATE wayback.aspa_version
             SET last_seen = $1
           WHERE aspa_obj_id = $2 AND first_seen = $3
             AND COALESCE(last_seen, 'infinity'::date) > $1::date
             AND first_seen <= $1::date",
         &[&last_seen, &aspa_obj_id, &version_first_seen],
-    )? as i64;
+    )? as i64)
+}
+
+/// Write the carried-over tail of a split span and clear the scratch list.
+fn insert_staged_aspa_tail(tx: &mut postgres::Transaction<'_>) -> Result<i64> {
     let carried = tx.execute(
         "INSERT INTO wayback.aspa_version
            (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
@@ -187,7 +201,22 @@ fn close_aspa_span_with_split(
         &[],
     )? as i64;
     tx.execute("TRUNCATE stage_aspa_split", &[])?;
-    Ok(trimmed + carried)
+    Ok(carried)
+}
+
+/// Close the span that covers `day` on `last_seen`, keeping the days after
+/// `day` as their own span. Trimming alone would drop coverage that later
+/// ingests already observed.
+fn close_aspa_span_with_split(
+    tx: &mut postgres::Transaction<'_>,
+    aspa_obj_id: i64,
+    version_first_seen: NaiveDate,
+    day: NaiveDate,
+    last_seen: NaiveDate,
+) -> Result<i64> {
+    stage_aspa_span_tail(tx, aspa_obj_id, version_first_seen, day)?;
+    let trimmed = trim_aspa_span_to_day_before(tx, aspa_obj_id, version_first_seen, last_seen)?;
+    Ok(trimmed + insert_staged_aspa_tail(tx)?)
 }
 
 /// Apply one day of ASPA objects for one TAL. `file_ok = false` records the gap
@@ -254,6 +283,17 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
     for (customer_asn, current_row) in &current {
         match today.get(customer_asn) {
             Some(entry) if entry.providers != current_row.providers => {
+                // The set changed on this day: close the span observed on
+                // `day`, keep the days after it under the previous set, then let
+                // the insert below write the new set for `day` alone. Without
+                // the tail a repair would push the new set over days that were
+                // already observed with the old one.
+                stage_aspa_span_tail(
+                    &mut tx,
+                    current_row.aspa_obj_id,
+                    current_row.version_first_seen,
+                    day,
+                )?;
                 updated += tx.execute(
                     "UPDATE wayback.aspa_version
                         SET last_seen = GREATEST(LEAST(COALESCE(last_seen, 'infinity'::date), $1), first_seen)
@@ -262,6 +302,7 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
                         AND first_seen <= $1::date + 1",
                     &[&prev_day, &current_row.aspa_obj_id],
                 )? as i64;
+                updated += insert_staged_aspa_tail(&mut tx)?;
             }
             Some(_) => {}
             None => {
@@ -358,7 +399,12 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
                  AND v.providers = s.providers
                  AND v.first_seen <= $2::date
                  AND (v.last_seen IS NULL OR v.last_seen >= $2::date))
-             ON CONFLICT (aspa_obj_id, first_seen) DO NOTHING",
+             ON CONFLICT (aspa_obj_id, first_seen) DO UPDATE
+               SET providers = EXCLUDED.providers,
+                   provider_count = EXCLUDED.provider_count,
+                   has_as0 = EXCLUDED.has_as0,
+                   as0_only = EXCLUDED.as0_only,
+                   last_seen = EXCLUDED.last_seen",
             &[&file.tal, &day],
         )? as i64;
     }
@@ -399,11 +445,13 @@ fn artifact_published(url: &str) -> Option<bool> {
     oneio::exists(url).ok()
 }
 
-/// An era start is recorded only with positive evidence: nothing observed for
-/// this TAL yet and the archive listing does not carry the artifact. Every other
-/// failure counts as a run failure rather than a silent era start.
-fn verified_era_start(observed_any: bool, published: Option<bool>) -> bool {
-    !observed_any && published == Some(false)
+/// An era start needs positive evidence, not just "nothing read yet": the TAL
+/// has no ASPA observation so far, the walk began at the archive's ASPA era (a
+/// range that starts later is mid-history, where an absent day is a gap), and the
+/// artifact is verifiably not published (`None` means the probe itself failed,
+/// which proves nothing). Everything else counts as a run failure.
+fn verified_era_start(observed_any: bool, walk_from_era: bool, published: Option<bool>) -> bool {
+    !observed_any && walk_from_era && published == Some(false)
 }
 
 /// The version that was current ON `day`: the latest span covering it. Diffing
@@ -457,6 +505,7 @@ fn ingest_aspa_file(
     tal: &str,
     file: &ArchiveFile,
     observed_any: &mut bool,
+    walk_from_era: bool,
     counts: &mut RunCounts,
 ) -> Result<()> {
     match parse_output_json_aspas(&file.url) {
@@ -492,7 +541,8 @@ fn ingest_aspa_file(
             // A listed file that cannot be read is not evidence that the
             // artifact was never published: only the archive's own listing can
             // say that, and anything unverified fails the run.
-            let era_start = verified_era_start(*observed_any, artifact_published(&file.url));
+            let era_start =
+                verified_era_start(*observed_any, walk_from_era, artifact_published(&file.url));
             if era_start {
                 println!(
                     "  {} era-start (ASPA artifact not published yet)",
@@ -565,6 +615,9 @@ fn ingest_aspa_tal_range(
     let mut files = try_crawl_tal_artifact(tal_url, Some(from), Some(until), ASPA_ARTIFACT)?;
     files.sort_by_key(|file| file.file_date);
     let mut observed_any = last_observed_day(client, tal, ASPA_ARTIFACT)?.is_some();
+    // Only a walk that starts where the archive's ASPA era starts can meet an
+    // era boundary; a later start is mid-history, where an absent day is a gap.
+    let walk_from_era = from == aspa_era_start();
 
     let mut files_by_day = BTreeMap::new();
     for file in files {
@@ -575,12 +628,16 @@ fn ingest_aspa_tal_range(
     let mut day = from;
     while day <= until {
         match files_by_day.remove(&day) {
-            Some(file) => ingest_aspa_file(client, tal, &file, &mut observed_any, counts)?,
+            Some(file) => {
+                ingest_aspa_file(client, tal, &file, &mut observed_any, walk_from_era, counts)?
+            }
             None => record_aspa_gap(
                 client,
                 tal,
                 day,
-                !observed_any,
+                // The day is not in the archive listing at all, so no artifact
+                // was published for it either.
+                verified_era_start(observed_any, walk_from_era, Some(false)),
                 missing == MissingDays::FailRun,
                 counts,
             )?,
@@ -721,14 +778,17 @@ mod tests {
 
     #[test]
     fn era_start_requires_verified_publication_evidence() {
-        // Nothing observed yet and the archive says the artifact is not there.
-        assert!(verified_era_start(false, Some(false)));
+        // Nothing observed yet, the walk began at the era, and the archive says
+        // the artifact is not there.
+        assert!(verified_era_start(false, true, Some(false)));
         // A TAL with ASPA history never starts an era again.
-        assert!(!verified_era_start(true, Some(false)));
+        assert!(!verified_era_start(true, true, Some(false)));
         // The artifact is published: the failure to read it is transient.
-        assert!(!verified_era_start(false, Some(true)));
+        assert!(!verified_era_start(false, true, Some(true)));
         // The probe itself failed, so there is no evidence either way.
-        assert!(!verified_era_start(false, None));
+        assert!(!verified_era_start(false, true, None));
+        // Started mid-history: an absent day is a gap, not an era boundary.
+        assert!(!verified_era_start(false, false, Some(false)));
     }
 }
 
@@ -900,6 +960,68 @@ mod pg_tests {
             vec![(days[0], Some(days[0])), (days[2], None)]
         );
         assert_eq!(object_marker(&mut client), None);
+    }
+
+    #[test]
+    fn repairing_a_provider_change_keeps_the_later_span() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let days: Vec<NaiveDate> = ["2026-09-10", "2026-09-11", "2026-09-12", "2026-09-13"]
+            .iter()
+            .map(|value| day(value))
+            .collect();
+        for present_day in &days {
+            apply(&mut client, *present_day, &[aspa(&[64_513])]);
+        }
+        assert_eq!(spans(&mut client), vec![(days[0], None)]);
+
+        // The provider set changed on day 2 after all: day 2 carries the new
+        // set, days 3-4 keep the set they were observed with.
+        apply(&mut client, days[1], &[aspa(&[64_514])]);
+
+        assert_eq!(
+            spans(&mut client),
+            vec![
+                (days[0], Some(days[0])),
+                (days[1], Some(days[1])),
+                (days[2], None)
+            ]
+        );
+        let sets: Vec<Vec<i64>> = client
+            .query(
+                "SELECT providers FROM wayback.aspa_version ORDER BY first_seen",
+                &[],
+            )
+            .expect("query providers")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(sets, vec![vec![64_513], vec![64_514], vec![64_513]]);
+        assert_eq!(object_marker(&mut client), None);
+    }
+
+    #[test]
+    fn reapplying_a_day_with_a_new_provider_set_replaces_its_own_row() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        // The span starts on the second day: the correction has to replace that
+        // row rather than collide with its primary key and be dropped.
+        apply(&mut client, first, &[]);
+        apply(&mut client, second, &[aspa(&[64_513])]);
+        assert_eq!(spans(&mut client), vec![(second, None)]);
+
+        apply(&mut client, second, &[aspa(&[64_514])]);
+
+        assert_eq!(spans(&mut client), vec![(second, None)]);
+        let providers: Vec<i64> = client
+            .query_one("SELECT providers FROM wayback.aspa_version", &[])
+            .expect("query providers")
+            .get(0);
+        assert_eq!(providers, vec![64_514]);
     }
 
     #[test]

@@ -168,15 +168,18 @@ and the `wayback-rpki` CLI behave exactly as before.
   `--types roa,aspa` (default: both families, each resuming from its own
   source-file cursor). An unknown `--tal` name is a CLI error, not a panic.
 - **Repair semantics**: applying a day out of order continues an adjacent span, splits the
-  span that covers the day when the file says the object was absent (days observed after it
-  keep their own span, gated on `source_file`), and derives `roa_object.last_seen` /
-  `aspa_object.last_seen` from the version spans, so replaying an older day neither reopens
-  nor closes an object that later history still covers.
+  span that covers the day (absence closes it, changed attributes or a changed provider set
+  keep the days after it under the previous values, gated on days the TAL observed in
+  `source_file`), replaces that day's own row instead of colliding with its primary key, and
+  derives `roa_object.last_seen` / `aspa_object.last_seen` from the version spans, so
+  replaying an older day neither reopens nor closes an object that later history covers. The
+  ROA ingest loads only the TAL being applied.
 - **Gaps**: every calendar day of a range gets a `source_file` row. A day the archive does
   not list is recorded as `missing` (an incremental run fails on it, a backfill does not);
   a listed file that cannot be fetched or parsed is always a failure. ASPA records
-  `era_start` only with the archive's own listing as evidence (`oneio::exists`), never from a
-  fetch or parse error.
+  `era_start` only when the walk began at the archive's ASPA era and the artifact is
+  verifiably unpublished (`oneio::exists`); a range that starts mid-history, or a failure to
+  read a published file, is a gap rather than an era start.
 - **Storage**: `pg/001_schema.sql` (ROA object/version SCD-2, the per-file
   `source_file` ledger, `ingest_run` accounting) and `pg/002_aspa.sql`
   (ASN-keyed `aspa_object` / `aspa_version`, plus `aspa_providers_of()` and

@@ -91,10 +91,16 @@ WITH covered AS (
   FROM wayback.roa_object o
   JOIN wayback.roa_version v USING (roa_obj_id)
 ),
+days AS (
+  -- Several objects (TALs, certificate URIs) can authorize the same tuple on the
+  -- same day: number the distinct day set, or the duplicates give one day
+  -- several island keys and split a contiguous span into fragments.
+  SELECT DISTINCT prefix, origin_asn, max_len, d FROM covered
+),
 islands AS (
   SELECT prefix, origin_asn, max_len, d,
          d - (row_number() OVER (PARTITION BY prefix, origin_asn, max_len ORDER BY d))::int AS island
-  FROM covered
+  FROM days
 )
 SELECT prefix, origin_asn, max_len, min(d) AS first_seen,
        CASE WHEN max(d) = CURRENT_DATE THEN NULL ELSE max(d) END AS last_seen
