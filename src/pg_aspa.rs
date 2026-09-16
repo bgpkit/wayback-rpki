@@ -358,7 +358,10 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
                 "COPY stage_aspa (customer, providers, provider_count, has_as0, as0_only) FROM STDIN",
             )?;
             let mut buffer = String::new();
-            for entry in file.entries {
+            // `today` already collapsed duplicate customer entries (one
+            // statement may not touch the same conflict row twice); stage that
+            // set, so a structurally valid snapshot with duplicates still loads.
+            for entry in today.values() {
                 let providers = entry
                     .providers
                     .iter()
@@ -1149,6 +1152,28 @@ mod pg_tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn duplicate_customer_entries_load_instead_of_aborting() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let only_day = day("2026-09-10");
+        // A structurally valid snapshot that lists one customer twice: the day
+        // must load (the last entry of the day wins) instead of tripping the
+        // conflict target twice in one statement.
+        apply(&mut client, only_day, &[aspa(&[64_513]), aspa(&[64_514])]);
+
+        assert_eq!(
+            count(&mut client, "SELECT count(*) FROM wayback.aspa_version"),
+            1
+        );
+        let providers: Vec<i64> = client
+            .query_one("SELECT providers FROM wayback.aspa_version", &[])
+            .expect("query providers")
+            .get(0);
+        assert_eq!(providers, vec![64_514]);
     }
 
     #[test]

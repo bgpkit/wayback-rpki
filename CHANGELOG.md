@@ -29,6 +29,9 @@ All notable changes to this project will be documented in this file.
 * A listing that comes back readable but without a single entry is treated as a broken response rather than an empty archive, so the strict crawl cannot turn an error page into a run that records every day as a gap and succeeds.
 * When one certificate authorizes the same prefix and origin at more than one max length in a snapshot, the longest authorization is stored: it is the one that validates traffic, and the previous smallest-wins rule understated it.
 
+* `roa_tuple_view` merges the version spans per tuple with `range_agg` instead of expanding each span into one calendar-day row: on 200k spans of 30 days the old form materialized 6.0M intermediate rows and spilled ~200 MB to disk per scan, the new one works on 200k spans, and both return identical rows.
+* A snapshot that lists the same ASPA customer twice now loads: the day is staged from the deduplicated set, so one statement never touches the same conflict row twice.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.

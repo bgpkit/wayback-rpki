@@ -189,7 +189,9 @@ and the `wayback-rpki` CLI behave exactly as before.
   verifiably unpublished (`oneio::exists`); a range that starts mid-history, or a failure to
   read a published file, is a gap rather than an era start.
 - **Storage**: `pg/001_schema.sql` (ROA object/version SCD-2, the per-file
-  `source_file` ledger, `ingest_run` accounting) and `pg/002_aspa.sql`
+  `source_file` ledger, `ingest_run` accounting, and `roa_tuple_view`, which
+  merges the spans per tuple with `range_agg` instead of expanding every span
+  into one row per calendar day) and `pg/002_aspa.sql`
   (ASN-keyed `aspa_object` / `aspa_version`, plus `aspa_providers_of()` and
   `aspa_customers_of()`, which apply cross-TAL union and the U-SPAS AS0 rule).
 - **Coverage**: ROA from `2015-03-10`, ASPA from `2023-10-11` (the first day the

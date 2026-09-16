@@ -84,28 +84,33 @@ CREATE OR REPLACE VIEW wayback.roa_version_current_view AS
 -- (prefix, origin_asn, max_len) contiguous islands — trie semantics. Disjoint
 -- islands stay separate rows: a tuple that disappeared and came back is two
 -- spans, not one span with the days in between filled in.
+--
+-- The islands are merged from the spans themselves (`range_agg`), never by
+-- expanding every span into one row per calendar day: the day expansion of a
+-- multi-year store is billions of intermediate rows, which makes scans and
+-- exports of this view impractical.
 CREATE OR REPLACE VIEW wayback.roa_tuple_view AS
-WITH covered AS (
+WITH spans AS (
   SELECT o.prefix, o.origin_asn, v.max_len,
-         generate_series(v.first_seen, COALESCE(v.last_seen, CURRENT_DATE), interval '1 day')::date AS d
+         daterange(v.first_seen, COALESCE(v.last_seen, CURRENT_DATE), '[]') AS span
   FROM wayback.roa_object o
   JOIN wayback.roa_version v USING (roa_obj_id)
 ),
-days AS (
-  -- Several objects (TALs, certificate URIs) can authorize the same tuple on the
-  -- same day: number the distinct day set, or the duplicates give one day
-  -- several island keys and split a contiguous span into fragments.
-  SELECT DISTINCT prefix, origin_asn, max_len, d FROM covered
-),
-islands AS (
-  SELECT prefix, origin_asn, max_len, d,
-         d - (row_number() OVER (PARTITION BY prefix, origin_asn, max_len ORDER BY d))::int AS island
-  FROM days
+merged AS (
+  -- `range_agg` merges overlapping and adjacent spans per tuple, which is
+  -- exactly the island rule; duplicate authorization of one tuple by several
+  -- objects collapses here as well.
+  SELECT prefix, origin_asn, max_len, range_agg(span) AS spans
+  FROM spans
+  GROUP BY prefix, origin_asn, max_len
 )
-SELECT prefix, origin_asn, max_len, min(d) AS first_seen,
-       CASE WHEN max(d) = CURRENT_DATE THEN NULL ELSE max(d) END AS last_seen
-FROM islands
-GROUP BY prefix, origin_asn, max_len, island;
+SELECT prefix, origin_asn, max_len,
+       lower(part) AS first_seen,
+       -- The spans are half-open internally; a span that reaches today is the
+       -- current one and stays NULL.
+       CASE WHEN upper(part) = CURRENT_DATE + 1 THEN NULL ELSE upper(part) - 1 END AS last_seen
+FROM merged
+CROSS JOIN LATERAL unnest(merged.spans) AS part;
 
 -- Change events: attribute changes and lifecycle boundaries.
 -- Noise policy (storage stays raw; only this view filters):
