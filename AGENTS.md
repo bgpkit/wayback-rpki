@@ -178,8 +178,8 @@ and the `wayback-rpki` CLI behave exactly as before.
   `source_file`), replaces that day's own row instead of colliding with its primary key (a
   span that starts on the repaired day is dropped, so a correction that restores the previous
   attributes or set cannot leave two rows claiming the day, and an object left without spans
-  is removed), and derives `roa_object.last_seen` / `aspa_object.last_seen` from the version
-  spans, so
+  is removed), and derives the `roa_object` / `aspa_object` `first_seen` and `last_seen` from
+  the version spans, so
   replaying an older day neither reopens nor closes an object that later history covers. The
   ROA ingest loads only the TAL being applied.
 - **Gaps**: every calendar day of a range gets a `source_file` row. A day the archive does
@@ -193,7 +193,8 @@ and the `wayback-rpki` CLI behave exactly as before.
   that starts mid-history, or a failure to read a published file, is a gap rather than an era
   start.
 - **Storage**: `pg/001_schema.sql` (ROA object/version SCD-2, the per-file
-  `source_file` ledger, `ingest_run` accounting, and `roa_tuple_view`, which
+  `source_file` ledger, `ingest_run` accounting with an `error` column for runs that fail
+  outside file accounting, and `roa_tuple_view`, which
   merges the spans per tuple with `range_agg` instead of expanding every span
   into one row per calendar day) and `pg/002_aspa.sql`
   (ASN-keyed `aspa_object` / `aspa_version`, plus `aspa_providers_of()` and

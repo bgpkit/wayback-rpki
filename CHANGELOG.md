@@ -43,6 +43,9 @@ All notable changes to this project will be documented in this file.
 * Repairing the day before an existing span merges the identical span that starts the next day into one span instead of leaving two adjacent rows, which a later replay of that day would have extended over, violating the span exclusion constraint and aborting the day.
 * The predecessor extension refuses to run when a span with the same attributes already covers the day, which makes such a replay a no-op instead of an overlapping update.
 
+* The per-day reconciliation recomputes an object's `first_seen` along with its current-state marker, so a repair that removes the earliest version but keeps a later one no longer leaves the object pointing at a day no version covers.
+* `ingest_run` has an `error` column: a run that fails before or outside file accounting (an unreadable listing, a database error) is no longer indistinguishable from a successful no-op run.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.

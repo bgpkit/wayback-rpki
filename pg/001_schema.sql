@@ -71,8 +71,11 @@ CREATE TABLE IF NOT EXISTS wayback.ingest_run (
   files_ok     integer,
   files_failed integer,
   rows_inserted bigint,
-  rows_updated  bigint
+  rows_updated  bigint,
+  error         text          -- NULL when the run finished its work
 );
+-- Existing stores predate the column.
+ALTER TABLE wayback.ingest_run ADD COLUMN IF NOT EXISTS error text;
 
 -- Current-state views (_view suffix per convention).
 CREATE OR REPLACE VIEW wayback.roa_object_current_view AS

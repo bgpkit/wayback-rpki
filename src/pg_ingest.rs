@@ -681,12 +681,23 @@ pub fn ingest_day(
             FROM wayback.roa_version v
             JOIN touched t USING (roa_obj_id)
             ORDER BY v.roa_obj_id, v.first_seen DESC
+          ), earliest AS (
+            -- The object's first day has to follow its versions: a repair that
+            -- removes the earliest one must not leave the object pointing at a
+            -- day no version covers.
+            SELECT v.roa_obj_id, min(v.first_seen) AS first_seen
+            FROM wayback.roa_version v
+            JOIN touched t USING (roa_obj_id)
+            GROUP BY v.roa_obj_id
           )
           UPDATE wayback.roa_object o
-             SET last_seen = latest.last_seen
+             SET last_seen = latest.last_seen,
+                 first_seen = earliest.first_seen
             FROM latest
+            JOIN earliest USING (roa_obj_id)
            WHERE o.roa_obj_id = latest.roa_obj_id
-             AND o.last_seen IS DISTINCT FROM latest.last_seen",
+             AND (o.last_seen IS DISTINCT FROM latest.last_seen
+                  OR o.first_seen IS DISTINCT FROM earliest.first_seen)",
         &[&tal, &current_ids],
     )? as i64;
 
@@ -759,17 +770,23 @@ pub(crate) fn start_run(client: &mut Client, mode: &str) -> Result<i64> {
         .context("start ingest run")
 }
 
-pub(crate) fn finish_run(client: &mut Client, run_id: i64, counts: &RunCounts) -> Result<()> {
+pub(crate) fn finish_run(
+    client: &mut Client,
+    run_id: i64,
+    counts: &RunCounts,
+    error: Option<&str>,
+) -> Result<()> {
     client.execute(
         "UPDATE wayback.ingest_run
          SET finished_at = now(), files_ok = $1, files_failed = $2,
-             rows_inserted = $3, rows_updated = $4
-         WHERE run_id = $5",
+             rows_inserted = $3, rows_updated = $4, error = $5
+         WHERE run_id = $6",
         &[
             &(counts.files_ok as i32),
             &(counts.files_failed as i32),
             &counts.rows_inserted,
             &counts.rows_updated,
+            &error,
             &run_id,
         ],
     )?;
@@ -911,24 +928,31 @@ where
     let run_id = start_run(client, mode)?;
     let mut counts = RunCounts::default();
     let work_result = work(client, &mut counts);
-    let finish_result = finish_run(client, run_id, &counts);
+    // Every way this run can fail has to reach the ledger, or a failed run looks
+    // like a successful no-op: an unreadable listing or a database error never
+    // touches `files_failed`.
+    let failure = match &work_result {
+        Ok(()) if counts.files_failed > 0 => {
+            Some(format!("{} failed file(s)", counts.files_failed))
+        }
+        Ok(()) => None,
+        Err(error) => Some(format!("{error:#}")),
+    };
+    let finish_result = finish_run(client, run_id, &counts, failure.as_deref());
 
     match (work_result, finish_result) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) if counts.files_failed > 0 => {
-            bail!(
-                "{mode} completed with {} failed file(s)",
-                counts.files_failed
-            )
-        }
-        (Ok(()), Ok(())) => {
-            println!(
-                "{mode} done: ok={} failed={}",
-                counts.files_ok, counts.files_failed
-            );
-            Ok(())
-        }
+        (Ok(()), Ok(())) => match failure {
+            Some(failure) => bail!("{mode} failed: {failure}"),
+            None => {
+                println!(
+                    "{mode} done: ok={} failed={}",
+                    counts.files_ok, counts.files_failed
+                );
+                Ok(())
+            }
+        },
     }
 }
 
@@ -1114,6 +1138,13 @@ mod pg_tests {
             .collect()
     }
 
+    fn object_first_seen(client: &mut Client) -> NaiveDate {
+        client
+            .query_one("SELECT first_seen FROM wayback.roa_object", &[])
+            .expect("query object first_seen")
+            .get(0)
+    }
+
     fn object_marker(client: &mut Client) -> Option<NaiveDate> {
         client
             .query_one("SELECT last_seen FROM wayback.roa_object", &[])
@@ -1138,6 +1169,36 @@ mod pg_tests {
     fn present(client: &mut Client, day: NaiveDate) {
         ingest_day(client, "test", day, &[roa(24)], true, Some(200), None)
             .expect("ingest present day");
+    }
+
+    #[test]
+    fn a_failed_run_is_recorded_with_its_error() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+
+        // A failure that never touches a file counter (an unreadable listing, a
+        // database error) still has to be visible in the run ledger.
+        let result = run_ingest(&mut client, "test-run", |_client, _counts| {
+            anyhow::bail!("boom: unreadable listing")
+        });
+
+        assert!(result.is_err());
+        let row = client
+            .query_one(
+                "SELECT error, files_failed, finished_at IS NOT NULL FROM wayback.ingest_run",
+                &[],
+            )
+            .expect("run ledger row");
+        let error: Option<String> = row.get(0);
+        let failed: i32 = row.get(1);
+        let finished: bool = row.get(2);
+        assert!(finished);
+        assert_eq!(failed, 0);
+        assert!(
+            error.as_deref().unwrap_or_default().contains("boom"),
+            "the run row must carry the failure: {error:?}"
+        );
     }
 
     #[test]
@@ -1300,9 +1361,11 @@ mod pg_tests {
             .expect("re-apply the first day as absent");
 
         // Only the first day is withdrawn; the object is still current because
-        // of the day that was observed after it.
+        // of the day that was observed after it, and its first day follows the
+        // version that remains.
         assert_eq!(spans(&mut client), vec![(second, None)]);
         assert_eq!(object_marker(&mut client), None);
+        assert_eq!(object_first_seen(&mut client), second);
         assert_eq!(
             table_count(&mut client, "SELECT count(*) FROM wayback.roa_object"),
             1

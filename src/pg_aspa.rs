@@ -522,12 +522,23 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
             FROM wayback.aspa_version v
             JOIN touched t USING (aspa_obj_id)
             ORDER BY v.aspa_obj_id, v.first_seen DESC
+          ), earliest AS (
+            -- The customer's first day has to follow its versions: a repair that
+            -- removes the earliest one must not leave the object pointing at a
+            -- day no version covers.
+            SELECT v.aspa_obj_id, min(v.first_seen) AS first_seen
+            FROM wayback.aspa_version v
+            JOIN touched t USING (aspa_obj_id)
+            GROUP BY v.aspa_obj_id
           )
           UPDATE wayback.aspa_object o
-             SET last_seen = latest.last_seen
+             SET last_seen = latest.last_seen,
+                 first_seen = earliest.first_seen
             FROM latest
+            JOIN earliest USING (aspa_obj_id)
            WHERE o.aspa_obj_id = latest.aspa_obj_id
-             AND o.last_seen IS DISTINCT FROM latest.last_seen",
+             AND (o.last_seen IS DISTINCT FROM latest.last_seen
+                  OR o.first_seen IS DISTINCT FROM earliest.first_seen)",
         &[&file.tal, &current_ids],
     )? as i64;
 
@@ -1004,6 +1015,13 @@ mod pg_tests {
             .collect()
     }
 
+    fn object_first_seen(client: &mut Client) -> NaiveDate {
+        client
+            .query_one("SELECT first_seen FROM wayback.aspa_object", &[])
+            .expect("query object first_seen")
+            .get(0)
+    }
+
     fn object_marker(client: &mut Client) -> Option<NaiveDate> {
         client
             .query_one("SELECT last_seen FROM wayback.aspa_object", &[])
@@ -1134,6 +1152,7 @@ mod pg_tests {
 
         assert_eq!(spans(&mut client), vec![(second, None)]);
         assert_eq!(object_marker(&mut client), None);
+        assert_eq!(object_first_seen(&mut client), second);
         assert_eq!(
             count(&mut client, "SELECT count(*) FROM wayback.aspa_object"),
             1
