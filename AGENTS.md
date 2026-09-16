@@ -175,8 +175,9 @@ and the `wayback-rpki` CLI behave exactly as before.
   span that covers the day (absence closes it, changed attributes or a changed provider set
   keep the days after it under the previous values, gated on days the TAL observed in
   `source_file`), replaces that day's own row instead of colliding with its primary key (a
-  span that starts on the repaired day is dropped and an object left without spans is
-  removed), and derives `roa_object.last_seen` / `aspa_object.last_seen` from the version
+  span that starts on the repaired day is dropped, so a correction that restores the previous
+  attributes or set cannot leave two rows claiming the day, and an object left without spans
+  is removed), and derives `roa_object.last_seen` / `aspa_object.last_seen` from the version
   spans, so
   replaying an older day neither reopens nor closes an object that later history covers. The
   ROA ingest loads only the TAL being applied.

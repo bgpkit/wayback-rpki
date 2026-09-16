@@ -284,25 +284,36 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
     for (customer_asn, current_row) in &current {
         match today.get(customer_asn) {
             Some(entry) if entry.providers != current_row.providers => {
-                // The set changed on this day: close the span observed on
-                // `day`, keep the days after it under the previous set, then let
-                // the insert below write the new set for `day` alone. Without
-                // the tail a repair would push the new set over days that were
-                // already observed with the old one.
+                // The set changed on this day: keep the days after it under the
+                // previous set, then let the insert below write the new set for
+                // `day` alone. Without the tail a repair would push the new set
+                // over days that were already observed with the old one.
                 stage_aspa_span_tail(
                     &mut tx,
                     current_row.aspa_obj_id,
                     current_row.version_first_seen,
                     day,
                 )?;
-                updated += tx.execute(
-                    "UPDATE wayback.aspa_version
-                        SET last_seen = GREATEST(LEAST(COALESCE(last_seen, 'infinity'::date), $1), first_seen)
-                      WHERE aspa_obj_id = $2
-                        AND COALESCE(last_seen, 'infinity'::date) >= $1::date + 1
-                        AND first_seen <= $1::date + 1",
-                    &[&prev_day, &current_row.aspa_obj_id],
-                )? as i64;
+                if current_row.version_first_seen >= day {
+                    // The row observed on `day` is this day's own: it has to make
+                    // way for the corrected set (a repair that restores the set
+                    // the previous span already carries would otherwise leave two
+                    // rows claiming `day`).
+                    updated += tx.execute(
+                        "DELETE FROM wayback.aspa_version
+                          WHERE aspa_obj_id = $1 AND first_seen = $2",
+                        &[&current_row.aspa_obj_id, &current_row.version_first_seen],
+                    )? as i64;
+                } else {
+                    updated += tx.execute(
+                        "UPDATE wayback.aspa_version
+                            SET last_seen = GREATEST(LEAST(COALESCE(last_seen, 'infinity'::date), $1), first_seen)
+                          WHERE aspa_obj_id = $2
+                            AND COALESCE(last_seen, 'infinity'::date) >= $1::date + 1
+                            AND first_seen <= $1::date + 1",
+                        &[&prev_day, &current_row.aspa_obj_id],
+                    )? as i64;
+                }
                 updated += insert_staged_aspa_tail(&mut tx)?;
             }
             Some(_) => {}
@@ -388,7 +399,10 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
             "INSERT INTO wayback.aspa_object (ta, customer_asn, first_seen)
              SELECT $1::text, s.customer, $2::date FROM stage_aspa s
              ON CONFLICT (ta, customer_asn) DO UPDATE
-               SET first_seen = LEAST(wayback.aspa_object.first_seen, EXCLUDED.first_seen)",
+               SET first_seen = LEAST(wayback.aspa_object.first_seen, EXCLUDED.first_seen)
+             -- an unchanged day writes nothing: the update runs only when the
+             -- first observation moves earlier
+             WHERE wayback.aspa_object.first_seen > EXCLUDED.first_seen",
             &[&file.tal, &day],
         )?;
         // A repaired day next to an existing span continues that span: extend
@@ -1214,6 +1228,56 @@ mod pg_tests {
             "era_start"
         );
         assert_eq!(counts.files_failed, 0);
+    }
+
+    #[test]
+    fn correcting_a_provider_set_back_does_not_violate_the_span_constraint() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        apply(&mut client, first, &[aspa(&[64_513])]);
+        apply(&mut client, second, &[aspa(&[64_514])]);
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(first)), (second, None)]
+        );
+
+        // Day 2 was observed with the previous set after all: the correction
+        // restores it, and the day's own row must give way instead of leaving
+        // two rows that both claim the day.
+        apply(&mut client, second, &[aspa(&[64_513])]);
+
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+        let providers: Vec<i64> = client
+            .query_one("SELECT providers FROM wayback.aspa_version", &[])
+            .expect("query providers")
+            .get(0);
+        assert_eq!(providers, vec![64_513]);
+    }
+
+    #[test]
+    fn an_unchanged_aspa_day_rewrites_nothing() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let entry = aspa(&[64_513]);
+        apply(&mut client, first, std::slice::from_ref(&entry));
+        let before: String = client
+            .query_one("SELECT xmin::text FROM wayback.aspa_object", &[])
+            .expect("object row")
+            .get(0);
+
+        apply(&mut client, first, std::slice::from_ref(&entry));
+
+        // The row version must not change: an unchanged day writes nothing.
+        let after: String = client
+            .query_one("SELECT xmin::text FROM wayback.aspa_object", &[])
+            .expect("object row")
+            .get(0);
+        assert_eq!(before, after);
     }
 
     #[test]

@@ -391,14 +391,26 @@ pub fn ingest_day(
                     // re-applies an older day: later days were ingested with the
                     // previous attributes and must not inherit the new ones.
                     stage_span_tail(&mut tx, cur.roa_obj_id, cur.version_first_seen, day)?;
-                    counts.versions_closed += tx.execute(
-                        "UPDATE wayback.roa_version
-                            SET last_seen = GREATEST(LEAST(COALESCE(last_seen, 'infinity'::date), $1), first_seen)
-                          WHERE roa_obj_id = $2
-                            AND COALESCE(last_seen, 'infinity'::date) >= $1::date + 1
-                            AND first_seen <= $1::date + 1",
-                        &[&prev_day, &cur.roa_obj_id],
-                    )? as i64;
+                    if cur.version_first_seen >= day {
+                        // The row observed on `day` is this day's own: it has to
+                        // make way for the corrected attributes (a repair that
+                        // restores the attributes the previous span already
+                        // carries would otherwise leave two rows claiming `day`).
+                        counts.versions_closed += tx.execute(
+                            "DELETE FROM wayback.roa_version
+                              WHERE roa_obj_id = $1 AND first_seen = $2",
+                            &[&cur.roa_obj_id, &cur.version_first_seen],
+                        )? as i64;
+                    } else {
+                        counts.versions_closed += tx.execute(
+                            "UPDATE wayback.roa_version
+                                SET last_seen = GREATEST(LEAST(COALESCE(last_seen, 'infinity'::date), $1), first_seen)
+                              WHERE roa_obj_id = $2
+                                AND COALESCE(last_seen, 'infinity'::date) >= $1::date + 1
+                                AND first_seen <= $1::date + 1",
+                            &[&prev_day, &cur.roa_obj_id],
+                        )? as i64;
+                    }
                     counts.versions_inserted += insert_staged_tail(&mut tx)?;
                     counts.versions_inserted += tx.execute(
                         "INSERT INTO wayback.roa_version
@@ -1409,6 +1421,59 @@ mod pg_tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn correcting_attributes_back_does_not_violate_the_span_constraint() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        present(&mut client, first);
+        ingest_day(
+            &mut client,
+            "test",
+            second,
+            &[roa(25)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("changed attribute");
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(first)), (second, None)]
+        );
+
+        // Day 2 carried the previous attribute after all: the correction
+        // replaces the day's own row, and the two spans stay adjacent without
+        // either claiming the other's days.
+        ingest_day(
+            &mut client,
+            "test",
+            second,
+            &[roa(24)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("correct the attribute back");
+
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(first)), (second, None)]
+        );
+        let max_lens: Vec<i16> = client
+            .query(
+                "SELECT max_len FROM wayback.roa_version ORDER BY first_seen",
+                &[],
+            )
+            .expect("query max_len")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(max_lens, vec![24, 24]);
     }
 
     #[test]

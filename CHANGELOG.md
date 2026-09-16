@@ -14,7 +14,7 @@ All notable changes to this project will be documented in this file.
 * `roa_tuple_view` returns one row per contiguous span, so a tuple that disappeared and returned is two rows rather than one range with the gap filled in.
 
 * A repaired day whose attributes changed (ROA) or whose provider set changed (ASPA) now keeps the days after it under the previous values and replaces that day's own row, instead of writing the new values over later observations or dropping the change on a primary-key clash.
-* `roa_tuple_view` numbers the distinct day set, so several objects authorizing the same tuple no longer fragment one contiguous span.
+* `roa_tuple_view` folds the spans of a tuple into contiguous rows, so several objects authorizing the same tuple no longer fragment or overlap one span.
 * The ROA ingest loads only the TAL being applied, so another TAL's objects can neither be closed nor marked by it.
 * ASPA `era_start` also requires the walk to have begun at the archive's ASPA era; a range that starts mid-history records absent days as gaps.
 * `next_update_day` points at `wayback-pg backfill`, and the ROA/ASPA storage comments state the invariants the tables actually hold.
@@ -33,6 +33,9 @@ All notable changes to this project will be documented in this file.
 * A snapshot that lists the same ASPA customer twice now loads: the day is staged from the deduplicated set, so one statement never touches the same conflict row twice.
 
 * A walk decides whether an unavailable ASPA day is an era start from the observations at or before its starting position, not from the latest observation in the database, so backfilling early history into a database that already holds later days records those days as `era_start` instead of failing them as gaps.
+
+* A correction that restores the attributes (ROA) or provider set (ASPA) a previous span already carries drops the day's own row instead of leaving two rows that both claim the day, which mid-statement violated the ASPA span exclusion constraint and aborted the whole day.
+* An unchanged ASPA day no longer rewrites its object rows: the first-seen upsert fires only when the observation actually moves earlier.
 
 ### Added
 
