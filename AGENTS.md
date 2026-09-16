@@ -183,9 +183,10 @@ and the `wayback-rpki` CLI behave exactly as before.
   ROA ingest loads only the TAL being applied.
 - **Gaps**: every calendar day of a range gets a `source_file` row. A day the archive does
   not list is recorded as `missing` (an incremental run fails on it, a backfill does not);
-  a listed file that cannot be fetched or parsed is always a failure. An incremental walk
-  stops at the first day it cannot observe, so its cursor stays before the gap and the next
-  run retries it. ASPA records
+  a listed file that cannot be fetched or parsed is always a failure. The ledger only ever
+  gains evidence: a failed replay of an observed day reports the failure but keeps the
+  `observed` row and its count. An incremental walk stops at the first day it cannot observe,
+  so its cursor stays before the gap and the next run retries it. ASPA records
   `era_start` only when the walk began at the archive's ASPA era, nothing was observed at or
   before that position, and the artifact is verifiably unpublished (`oneio::exists`); a range
   that starts mid-history, or a failure to read a published file, is a gap rather than an era

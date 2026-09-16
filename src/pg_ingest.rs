@@ -325,7 +325,11 @@ pub fn ingest_day(
            SET http_status = EXCLUDED.http_status,
                roa_count = EXCLUDED.roa_count,
                sha256 = EXCLUDED.sha256,
-               gap_class = EXCLUDED.gap_class",
+               gap_class = EXCLUDED.gap_class
+         -- Evidence is only ever added: a failed replay must not downgrade a row
+         -- that already records a successful observation, and the run reports the
+         -- failure by itself.
+         WHERE wayback.source_file.gap_class <> 'observed' OR EXCLUDED.gap_class = 'observed'",
         &[
             &tal,
             &day,
@@ -1391,6 +1395,36 @@ mod pg_tests {
             .map(|row| row.get(0))
             .collect();
         assert_eq!(max_lens, vec![24, 25]);
+    }
+
+    #[test]
+    fn a_failed_replay_keeps_the_observed_ledger_row() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let only_day = day("2026-09-01");
+        present(&mut client, only_day);
+        let loaded: i32 = client
+            .query_one(
+                "SELECT roa_count FROM wayback.source_file WHERE file_date = $1",
+                &[&only_day],
+            )
+            .expect("ledger row")
+            .get(0);
+        assert_eq!(loaded, 1);
+
+        // A transient failure while replaying must not erase observed evidence.
+        ingest_day(&mut client, "test", only_day, &[], false, None, None).expect("failed replay");
+
+        assert_eq!(gap_class(&mut client, only_day), "observed");
+        let after: Option<i32> = client
+            .query_one(
+                "SELECT roa_count FROM wayback.source_file WHERE file_date = $1",
+                &[&only_day],
+            )
+            .expect("ledger row")
+            .get(0);
+        assert_eq!(after, Some(1));
     }
 
     #[test]

@@ -243,7 +243,11 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
                aspa_count = EXCLUDED.aspa_count,
                router_key_count = EXCLUDED.router_key_count,
                sha256 = EXCLUDED.sha256,
-               gap_class = EXCLUDED.gap_class",
+               gap_class = EXCLUDED.gap_class
+         -- Evidence is only ever added: a failed replay must not downgrade a row
+         -- that already records a successful observation, and the run reports the
+         -- failure by itself.
+         WHERE wayback.source_file.gap_class <> 'observed' OR EXCLUDED.gap_class = 'observed'",
         &[
             &file.tal,
             &day,
@@ -525,8 +529,12 @@ fn observed_at_or_before(
 /// range that starts later is mid-history, where an absent day is a gap), and the
 /// artifact is verifiably not published (`None` means the probe itself failed,
 /// which proves nothing). Everything else counts as a run failure.
-fn verified_era_start(observed_any: bool, walk_from_era: bool, published: Option<bool>) -> bool {
-    !observed_any && walk_from_era && published == Some(false)
+fn verified_era_start(
+    publication_seen: bool,
+    walk_from_era: bool,
+    published: Option<bool>,
+) -> bool {
+    !publication_seen && walk_from_era && published == Some(false)
 }
 
 /// The version that was current ON `day`: the latest span covering it. Diffing
@@ -580,7 +588,7 @@ fn ingest_aspa_file(
     client: &mut Client,
     tal: &str,
     file: &ArchiveFile,
-    observed_any: &mut bool,
+    publication_seen: &mut bool,
     walk_from_era: bool,
     counts: &mut RunCounts,
 ) -> Result<bool> {
@@ -599,7 +607,7 @@ fn ingest_aspa_file(
                     era_start: false,
                 },
             )?;
-            *observed_any = true;
+            *publication_seen = true;
             counts.files_ok += 1;
             counts.rows_inserted += inserted;
             counts.rows_updated += updated;
@@ -617,8 +625,13 @@ fn ingest_aspa_file(
             // A listed file that cannot be read is not evidence that the
             // artifact was never published: only the archive's own listing can
             // say that, and anything unverified fails the run.
-            let era_start =
-                verified_era_start(*observed_any, walk_from_era, artifact_published(&file.url));
+            let published = artifact_published(&file.url);
+            if published == Some(true) {
+                // The artifact exists, so publication has begun even though this
+                // read failed: absent days after it are gaps, not era starts.
+                *publication_seen = true;
+            }
+            let era_start = verified_era_start(*publication_seen, walk_from_era, published);
             if era_start {
                 println!(
                     "  {} era-start (ASPA artifact not published yet)",
@@ -692,7 +705,7 @@ fn ingest_aspa_day_files(
     missing: MissingDays,
     counts: &mut RunCounts,
 ) -> Result<()> {
-    let mut observed_any = observed_at_or_before(client, tal, ASPA_ARTIFACT, from)?;
+    let mut publication_seen = observed_at_or_before(client, tal, ASPA_ARTIFACT, from)?;
     // Only a walk that starts where the archive's ASPA era starts can meet an
     // era boundary; a later start is mid-history, where an absent day is a gap.
     let walk_from_era = from == aspa_era_start();
@@ -707,8 +720,14 @@ fn ingest_aspa_day_files(
     while day <= until {
         match files_by_day.remove(&day) {
             Some(file) => {
-                let failed =
-                    ingest_aspa_file(client, tal, &file, &mut observed_any, walk_from_era, counts)?;
+                let failed = ingest_aspa_file(
+                    client,
+                    tal,
+                    &file,
+                    &mut publication_seen,
+                    walk_from_era,
+                    counts,
+                )?;
                 if failed && missing == MissingDays::FailRun {
                     // The cursor is the latest observed day, so walking past a
                     // failure would skip it for good.
@@ -716,7 +735,7 @@ fn ingest_aspa_day_files(
                 }
             }
             None => {
-                let era_start = verified_era_start(observed_any, walk_from_era, Some(false));
+                let era_start = verified_era_start(publication_seen, walk_from_era, Some(false));
                 record_aspa_gap(
                     client,
                     tal,
@@ -1164,6 +1183,93 @@ mod pg_tests {
             .map(|row| row.get(0))
             .collect();
         assert_eq!(sets, vec![vec![64_513], vec![64_514]]);
+    }
+
+    #[test]
+    fn a_failed_replay_keeps_the_observed_ledger_row() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let only_day = day("2026-09-10");
+        apply(&mut client, only_day, &[aspa(&[64_513])]);
+        let loaded: i32 = client
+            .query_one(
+                "SELECT aspa_count FROM wayback.source_file WHERE file_date = $1",
+                &[&only_day],
+            )
+            .expect("ledger row")
+            .get(0);
+        assert_eq!(loaded, 1);
+
+        ingest_aspa_day(
+            &mut client,
+            &AspaFile {
+                tal: "test",
+                day: only_day,
+                entries: &[],
+                quality: &AspaQuality::default(),
+                file_ok: false,
+                http_status: None,
+                sha256: None,
+                era_start: false,
+            },
+        )
+        .expect("failed replay");
+
+        let gap: String = client
+            .query_one(
+                "SELECT gap_class FROM wayback.source_file WHERE file_date = $1",
+                &[&only_day],
+            )
+            .expect("ledger row")
+            .get(0);
+        assert_eq!(gap, "observed");
+        let after: Option<i32> = client
+            .query_one(
+                "SELECT aspa_count FROM wayback.source_file WHERE file_date = $1",
+                &[&only_day],
+            )
+            .expect("ledger row")
+            .get(0);
+        assert_eq!(after, Some(1));
+    }
+
+    #[test]
+    fn a_parse_failure_after_publication_does_not_label_later_days_era_start() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let era = aspa_era_start();
+        let next_day = era + chrono::Duration::days(1);
+        // A listed artifact that exists but does not parse: publication has
+        // demonstrably begun, so a later absent day is a gap, not an era start.
+        let broken = json_fixture("broken", "{not json");
+        let files = vec![ArchiveFile {
+            url: broken,
+            file_date: era,
+        }];
+        let mut counts = RunCounts::default();
+
+        ingest_aspa_day_files(
+            &mut client,
+            "test",
+            files,
+            era,
+            next_day,
+            MissingDays::RecordOnly,
+            &mut counts,
+        )
+        .expect("walk the era boundary");
+
+        let gap: String = client
+            .query_one(
+                "SELECT gap_class FROM wayback.source_file WHERE file_date = $1",
+                &[&next_day],
+            )
+            .expect("ledger row")
+            .get(0);
+        assert_eq!(gap, "missing");
+        assert_eq!(counts.files_failed, 1);
     }
 
     #[test]

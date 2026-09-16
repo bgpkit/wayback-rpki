@@ -37,6 +37,9 @@ All notable changes to this project will be documented in this file.
 * A correction that restores the attributes (ROA) or provider set (ASPA) a previous span already carries drops the day's own row instead of leaving two rows that both claim the day, which mid-statement violated the ASPA span exclusion constraint and aborted the whole day.
 * An unchanged ASPA day no longer rewrites its object rows: the first-seen upsert fires only when the observation actually moves earlier.
 
+* The `source_file` ledger only ever gains evidence: a failed replay of a day that was already observed records the run failure but keeps the `observed` row and its counts instead of downgrading the day to `missing` and clearing its provenance.
+* An ASPA artifact that exists but does not parse marks publication as begun, so a backfill that continues past the failure records the days after it as gaps instead of era starts.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.
