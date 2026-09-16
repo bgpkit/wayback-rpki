@@ -185,9 +185,10 @@ and the `wayback-rpki` CLI behave exactly as before.
   a listed file that cannot be fetched or parsed is always a failure. An incremental walk
   stops at the first day it cannot observe, so its cursor stays before the gap and the next
   run retries it. ASPA records
-  `era_start` only when the walk began at the archive's ASPA era and the artifact is
-  verifiably unpublished (`oneio::exists`); a range that starts mid-history, or a failure to
-  read a published file, is a gap rather than an era start.
+  `era_start` only when the walk began at the archive's ASPA era, nothing was observed at or
+  before that position, and the artifact is verifiably unpublished (`oneio::exists`); a range
+  that starts mid-history, or a failure to read a published file, is a gap rather than an era
+  start.
 - **Storage**: `pg/001_schema.sql` (ROA object/version SCD-2, the per-file
   `source_file` ledger, `ingest_run` accounting, and `roa_tuple_view`, which
   merges the spans per tuple with `range_agg` instead of expanding every span

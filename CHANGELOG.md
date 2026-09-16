@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 * `roa_tuple_view` merges the version spans per tuple with `range_agg` instead of expanding each span into one calendar-day row: on 200k spans of 30 days the old form materialized 6.0M intermediate rows and spilled ~200 MB to disk per scan, the new one works on 200k spans, and both return identical rows.
 * A snapshot that lists the same ASPA customer twice now loads: the day is staged from the deduplicated set, so one statement never touches the same conflict row twice.
 
+* A walk decides whether an unavailable ASPA day is an era start from the observations at or before its starting position, not from the latest observation in the database, so backfilling early history into a database that already holds later days records those days as `era_start` instead of failing them as gaps.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.

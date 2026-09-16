@@ -485,6 +485,27 @@ fn artifact_published(url: &str) -> Option<bool> {
     oneio::exists(url).ok()
 }
 
+/// Whether this TAL already has an observed artifact at or before `day`. A walk
+/// starts from this: early history can be backfilled into a database that already
+/// holds later days, and a later observation says nothing about whether the
+/// artifact was published at the walk position.
+fn observed_at_or_before(
+    client: &mut Client,
+    tal: &str,
+    artifact: &str,
+    day: NaiveDate,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM wayback.source_file
+                             WHERE tal = $1 AND artifact = $2
+                               AND gap_class = 'observed' AND file_date <= $3)",
+            &[&tal, &artifact, &day],
+        )
+        .context("look up earlier observations")?
+        .get(0))
+}
+
 /// An era start needs positive evidence, not just "nothing read yet": the TAL
 /// has no ASPA observation so far, the walk began at the archive's ASPA era (a
 /// range that starts later is mid-history, where an absent day is a gap), and the
@@ -657,7 +678,7 @@ fn ingest_aspa_day_files(
     missing: MissingDays,
     counts: &mut RunCounts,
 ) -> Result<()> {
-    let mut observed_any = last_observed_day(client, tal, ASPA_ARTIFACT)?.is_some();
+    let mut observed_any = observed_at_or_before(client, tal, ASPA_ARTIFACT, from)?;
     // Only a walk that starts where the archive's ASPA era starts can meet an
     // era boundary; a later start is mid-history, where an absent day is a gap.
     let walk_from_era = from == aspa_era_start();
@@ -1152,6 +1173,47 @@ mod pg_tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn backfilling_earlier_history_recognizes_the_era_start() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let era = aspa_era_start();
+        // The TAL is already ingested for a much later day ...
+        apply(&mut client, day("2026-09-12"), &[aspa(&[64_513])]);
+        // ... and the operator now backfills from the era start.
+        let files = vec![ArchiveFile {
+            url: "/nonexistent/wayback-aspa-era-start.json".to_string(),
+            file_date: era,
+        }];
+        let mut counts = RunCounts::default();
+
+        ingest_aspa_day_files(
+            &mut client,
+            "test",
+            files,
+            era,
+            era,
+            MissingDays::FailRun,
+            &mut counts,
+        )
+        .expect("walk the era boundary");
+
+        // The later observation must not turn the pre-publication day into a
+        // gap, and the run must not fail on it.
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT gap_class FROM wayback.source_file WHERE file_date = $1",
+                    &[&era],
+                )
+                .expect("ledger row")
+                .get::<_, String>(0),
+            "era_start"
+        );
+        assert_eq!(counts.files_failed, 0);
     }
 
     #[test]
