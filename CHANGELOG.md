@@ -26,6 +26,9 @@ All notable changes to this project will be documented in this file.
 * A span written for a repaired (out-of-order) day covers that day only, and the ROA attribute-change repair follows the same rule: a later span, or days the archive observed as absent, are no longer filled in with presence or attributes no file ever showed. The span stays open only when the repaired day is the latest day the TAL observed.
 * The legacy `crawl_tal_after` / `crawl_tal_artifact` keep their best-effort traversal: a listing below the TAL root that cannot be fetched omits only that subtree, while the ingest uses the strict forms that fail the run.
 
+* A listing that comes back readable but without a single entry is treated as a broken response rather than an empty archive, so the strict crawl cannot turn an error page into a run that records every day as a gap and succeeds.
+* When one certificate authorizes the same prefix and origin at more than one max length in a snapshot, the longest authorization is stored: it is the one that validates traffic, and the previous smallest-wins rule understated it.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.

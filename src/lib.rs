@@ -101,7 +101,16 @@ fn check_date(
 /// just that subtree with a warning, which is what the legacy crawl has always
 /// done; the ingest uses the strict form.
 fn listing_or_empty(url: &str, width: usize, strict: bool) -> Result<Vec<u32>> {
-    match crawl_links(url, width) {
+    let listing = crawl_links(url, width).and_then(|entries| {
+        // A readable listing with no numeric entry is a broken response (error
+        // page, renamed markup), not an archive that published nothing: reading
+        // it as empty would let a run record every day as a gap and succeed.
+        if entries.is_empty() {
+            return Err(anyhow!("{url} returned no entries"));
+        }
+        Ok(entries)
+    });
+    match listing {
         Ok(entries) => Ok(entries),
         Err(error) if strict => Err(error),
         Err(error) => {
@@ -405,6 +414,21 @@ mod tests {
             roa_files[0].file_date,
             NaiveDate::from_ymd_opt(2011, 1, 21).unwrap()
         );
+    }
+
+    #[test]
+    fn a_listing_without_entries_is_not_an_empty_archive() {
+        let path =
+            std::env::temp_dir().join(format!("wayback-rpki-listing-{}.html", std::process::id()));
+        std::fs::write(&path, "<html><body>404 Not Found</body></html>").expect("write fixture");
+        let url = path.to_string_lossy().into_owned();
+
+        assert!(listing_or_empty(&url, 4, true).is_err());
+        assert_eq!(
+            listing_or_empty(&url, 4, false).expect("best effort"),
+            Vec::<u32>::new()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

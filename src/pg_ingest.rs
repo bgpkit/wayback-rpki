@@ -340,8 +340,10 @@ pub fn ingest_day(
     let mut today: HashMap<(String, String, String, i64), &RoaFullEntry> = HashMap::new();
     for e in entries {
         // One (uri, prefix, origin) can carry several max_len rows in a single
-        // day (publisher-side quirk); keep the smallest deterministically so
-        // day-to-day comparisons are stable.
+        // day (one certificate authorizing the same prefix at more than one
+        // length). Keep the largest: origin validation follows the longest
+        // authorization the publisher issued that day, and the choice is
+        // deterministic for day-to-day comparison.
         let key = (
             tal.to_string(),
             e.uri.clone(),
@@ -349,7 +351,7 @@ pub fn ingest_day(
             e.origin_asn as i64,
         );
         match today.get(&key) {
-            Some(prev) if prev.max_len <= e.max_len => {}
+            Some(prev) if prev.max_len >= e.max_len => {}
             _ => {
                 today.insert(key, e);
             }
@@ -1407,6 +1409,32 @@ mod pg_tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn the_largest_max_length_of_the_day_is_kept() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let only_day = day("2026-09-01");
+        // One certificate authorizes the same prefix at two lengths in the same
+        // snapshot: the longer authorization is the one that validates traffic.
+        ingest_day(
+            &mut client,
+            "test",
+            only_day,
+            &[roa(24), roa(25)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("ingest both rows");
+
+        let max_len: i16 = client
+            .query_one("SELECT max_len FROM wayback.roa_version", &[])
+            .expect("query max_len")
+            .get(0);
+        assert_eq!(max_len, 25);
     }
 
     #[test]

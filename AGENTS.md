@@ -47,7 +47,8 @@ wayback-rpki/
 - **`try_crawl_tal_after` / `try_crawl_tal_artifact`** — the same listing walk with the crawl
   failure kept as an `Err`, so an unreadable listing cannot pass as "nothing was published".
   The `crawl_tal_*` forms stay the v1 contract: a listing below the TAL root that cannot be
-  fetched omits only that subtree (warning), and only a root failure yields nothing.
+  fetched, or one that comes back without a single entry (an error page is not an empty
+  archive), omits only that subtree (warning), and only a root failure yields nothing.
 - **`tal_url(name)` / `tal_names()`** — resolve or validate a TAL name without the panic in
   `get_tal_urls`, which keeps its v1 behaviour.
 - **`parse_roas_csv(url)`** — Downloads and parses a `roas.csv.xz` file into `Vec<RoaEntry>`.
