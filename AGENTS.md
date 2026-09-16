@@ -22,7 +22,13 @@ wayback-rpki/
 │   ├── roas_trie.rs    # v2 core: rkyv archive, JointPrefixMap storage, JSONL transport
 │   ├── legacy.rs       # v1 backend: bincode + ipnet-trie, kept for transition
 │   ├── api.rs          # Axum HTTP API: /search, /validate, /health; TrieBackend enum
-│   └── bin/main.rs     # CLI: rebuild, update, fix, search, convert, serve
+│   ├── pg_ingest.rs    # ROA → PostgreSQL ingest and run accounting (wayback-pg)
+│   ├── pg_aspa.rs      # ASPA JSON parsing and SCD-2 ingestion (wayback-pg)
+│   ├── bin/main.rs     # CLI: rebuild, update, fix, search, convert, serve
+│   └── bin/pg.rs       # wayback-pg CLI: update, backfill
+├── pg/
+│   ├── 001_schema.sql  # PostgreSQL store: ROA SCD-2, source ledger, run ledger
+│   └── 002_aspa.sql    # PostgreSQL store: ASPA SCD-2, views, direction functions
 ├── Dockerfile          # cargo-chef multi-stage build (rust:1.90 → debian:trixie-slim)
 ├── Cargo.toml          # Crate metadata; bin name = wayback-rpki
 ├── DEVELOPMENT.md      # Reproducible data-integrity and transport-generation operations
@@ -38,6 +44,13 @@ wayback-rpki/
 
 - **`crawl_tal_after(tal_url, from, until)`** — Scrapes RIPE's year/month/day directory
   listing for a given TAL, returns `Vec<RoaFile>` metadata. Uses `rayon` for parallel crawling.
+- **`try_crawl_tal_after` / `try_crawl_tal_artifact`** — the same listing walk with the crawl
+  failure kept as an `Err`, so an unreadable listing cannot pass as "nothing was published".
+  The `crawl_tal_*` forms stay the v1 contract: a listing below the TAL root that cannot be
+  fetched, or one that comes back without a single entry (an error page is not an empty
+  archive), omits only that subtree (warning), and only a root failure yields nothing.
+- **`tal_url(name)` / `tal_names()`** — resolve or validate a TAL name without the panic in
+  `get_tal_urls`, which keeps its v1 behaviour.
 - **`parse_roas_csv(url)`** — Downloads and parses a `roas.csv.xz` file into `Vec<RoaEntry>`.
   Each entry has `tal`, `prefix` (`IpNet`), `max_len`, `asn`, `date` (`NaiveDate`).
 - **`get_tal_urls(tal)`** — Returns RIPE RPKI TAL URLs for the 5 RIRs (afrinic, apnic, arin,
@@ -146,6 +159,58 @@ A `.bin`/`.bin.gz` `path` keeps working directly in legacy mode without conversi
   Cloudflare Worker at `alpha.api.bgpkit.com` with failover. Container entrypoint:
   `wayback-rpki serve --bootstrap --host 0.0.0.0 --port 40065`.
 
+### `wayback-pg` — PostgreSQL ingest (additive)
+
+A second binary that writes RIPE RPKI observations into PostgreSQL instead of a
+trie. It shares the crawler and touches no v1 code path: the trie, the HTTP API,
+and the `wayback-rpki` CLI behave exactly as before.
+
+- **Commands**: `wayback-pg update --pg-config ...` and `wayback-pg backfill
+  --pg-config ... --from --until`, both accepting `--tal afrinic,apnic` and
+  `--types roa,aspa` (default: both families, each resuming from its own
+  source-file cursor). An unknown `--tal` name is a CLI error, not a panic.
+- **Certificate windows**: a version that gets written records the claims its file made, hour
+  drift included. The staging alignment and every comparison (change detection, coverage,
+  adjacent-span extension, next-day merge, close) treat a window within 36 h of the stored one
+  as the same certificate, so ARIN's republishing drift writes no version while a repaired or
+  backfilled day keeps the claims of its own file.
+- **Repair semantics**: a span written for a repaired day covers that day only (it stays open
+  only when the repaired day is the latest the TAL observed), because nothing observed the
+  days up to a later span. Applying a day out of order continues an adjacent span (merging the
+  identical span that starts the next day), splits the
+  span that covers the day (absence closes it, changed attributes or a changed provider set
+  keep the days after it under the previous values, gated on days the TAL observed in
+  `source_file`), replaces that day's own row instead of colliding with its primary key (a
+  span that starts on the repaired day is dropped, so a correction that restores the previous
+  attributes or set cannot leave two rows claiming the day, and an object left without spans
+  is removed), and derives the `roa_object` / `aspa_object` `first_seen` and `last_seen` from
+  the version spans, so
+  replaying an older day neither reopens nor closes an object that later history covers. The
+  ROA ingest loads only the TAL being applied.
+- **Gaps**: every calendar day of a range gets a `source_file` row. A day the archive does
+  not list is recorded as `missing` (an incremental run fails on it, a backfill does not);
+  a listed file that cannot be fetched or parsed is always a failure. The ledger only ever
+  gains evidence: a failed replay of an observed day reports the failure but keeps the
+  `observed` row and its count. An incremental walk stops at the first day it cannot observe,
+  so its cursor stays before the gap and the next run retries it. ASPA records
+  `era_start` only when the walk began at the archive's ASPA era, nothing was observed at or
+  before that position, and the artifact is verifiably unpublished (`oneio::exists`); a range
+  that starts mid-history, or a failure to read a published file, is a gap rather than an era
+  start.
+- **Storage**: `pg/001_schema.sql` (ROA object/version SCD-2, the per-file
+  `source_file` ledger, `ingest_run` accounting with an `error` column for runs that fail
+  outside file accounting, and `roa_tuple_view`, which
+  merges the spans per tuple with `range_agg` instead of expanding every span
+  into one row per calendar day) and `pg/002_aspa.sql`
+  (ASN-keyed `aspa_object` / `aspa_version`, plus `aspa_providers_of()` and
+  `aspa_customers_of()`, which apply cross-TAL union and the U-SPAS AS0 rule).
+- **Coverage**: ROA from `2015-03-10`, ASPA from `2023-10-11` (the first day the
+  `output.json.xz` artifact exists); ASPA input is clamped to that era start.
+- **Modules**: `src/pg_ingest.rs`, `src/pg_aspa.rs`, `src/bin/pg.rs`,
+  `tests/pg_cli_contract.rs`.
+- Serving is out of scope here: the API is rebuilt on the PostgreSQL store
+  elsewhere, not in this repository.
+
 ## Build & Test
 
 ```bash
@@ -153,6 +218,10 @@ cargo build                              # Build
 cargo clippy --all-features -- -D warnings  # Lint (CI-enforced)
 cargo test --lib roas_trie::tests         # Offline unit tests (plus src/bin/main.rs tests)
 cargo test                                # All tests (lib.rs crawler tests need network to ftp.ripe.net)
+
+# PostgreSQL ingest tests: skipped unless a disposable database is named.
+WAYBACK_PG_TEST_CONFIG="host=127.0.0.1 user=postgres password=postgres dbname=postgres" \
+  cargo test --all-features --lib pg_tests
 ```
 
 ## CI/CD
@@ -161,6 +230,8 @@ CI mirrors the monocle repo's workflow layout.
 
 - **`rust.yml`** — On push/PR to main (`**.md` ignored): `cargo fmt --check`,
   `cargo clippy --all-features -- -D warnings`, `cargo test --all-features --verbose`.
+  A throwaway `postgres:17` service is provided through `WAYBACK_PG_TEST_CONFIG`, which is
+  what makes the PostgreSQL ingest tests run.
 - **`release.yml`** — On `v*` tag: `build-test` gate (fmt, clippy, build, test) →
   GitHub release (from `CHANGELOG.md`) → binary uploads for `aarch64-linux`,
   `x86_64-linux`, `universal-apple-darwin` (`macos-14` runner) → `cargo publish`

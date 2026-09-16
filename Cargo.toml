@@ -15,9 +15,14 @@ rust-version = "1.81"
 name = "wayback-rpki"
 path = "src/bin/main.rs"
 
+[[bin]]
+name = "wayback-pg"
+path = "src/bin/pg.rs"
+
 [dependencies]
 
 anyhow = "1"
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 tikv-jemallocator = "0.6"
 oneio = { version = "0.24", default-features = false, features = ["https", "xz", "gz", "s3"] }
 chrono = "0.4.38"

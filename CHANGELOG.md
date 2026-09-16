@@ -2,6 +2,60 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed (wayback-pg ingest correctness, from review of #19)
+
+* Applying a day out of order no longer drops the observation: a span that ends the day before is extended, and an absent day in the middle of a span is split so days observed after it keep their own span.
+* `roa_object.last_seen` and `aspa_object.last_seen` are derived from the version spans instead of being written by the day being applied, so replaying an older day neither reopens nor closes an object that later history still covers.
+* ASPA `era_start` requires the archive's own listing as evidence; a fetch or parse failure now fails the run instead of fabricating an era start.
+* Backfills record every calendar day they did not ingest as a `source_file` gap instead of skipping it, and a listing that cannot be read fails the run instead of reporting success with no work.
+* `roa_counts_view` no longer reports a missing file as an observed zero count, and an unknown `--tal` name is a CLI error instead of a panic.
+* `roa_tuple_view` returns one row per contiguous span, so a tuple that disappeared and returned is two rows rather than one range with the gap filled in.
+
+* A repaired day whose attributes changed (ROA) or whose provider set changed (ASPA) now keeps the days after it under the previous values and replaces that day's own row, instead of writing the new values over later observations or dropping the change on a primary-key clash.
+* `roa_tuple_view` folds the spans of a tuple into contiguous rows, so several objects authorizing the same tuple no longer fragment or overlap one span.
+* The ROA ingest loads only the TAL being applied, so another TAL's objects can neither be closed nor marked by it.
+* ASPA `era_start` also requires the walk to have begun at the archive's ASPA era; a range that starts mid-history records absent days as gaps.
+* `next_update_day` points at `wayback-pg backfill`, and the ROA/ASPA storage comments state the invariants the tables actually hold.
+
+* An incremental run stops at the first day it cannot observe, so the cursor stays before that day and the next run retries it instead of jumping past it to the latest success.
+* A repair that finds the object absent on the very day its span started drops that row (keeping a verified later tail), and an object left with no observations is removed rather than left current with an empty history.
+* The ASPA parser requires `aspas` and each object's `providers`: a renamed field or an error document fails the day instead of parsing as an empty snapshot that withdraws every customer.
+
+* A span written for a repaired (out-of-order) day covers that day only, and the ROA attribute-change repair follows the same rule: a later span, or days the archive observed as absent, are no longer filled in with presence or attributes no file ever showed. The span stays open only when the repaired day is the latest day the TAL observed.
+* The legacy `crawl_tal_after` / `crawl_tal_artifact` keep their best-effort traversal: a listing below the TAL root that cannot be fetched omits only that subtree, while the ingest uses the strict forms that fail the run.
+
+* A listing that comes back readable but without a single entry is treated as a broken response rather than an empty archive, so the strict crawl cannot turn an error page into a run that records every day as a gap and succeeds.
+* When one certificate authorizes the same prefix and origin at more than one max length in a snapshot, the longest authorization is stored: it is the one that validates traffic, and the previous smallest-wins rule understated it.
+
+* `roa_tuple_view` merges the version spans per tuple with `range_agg` instead of expanding each span into one calendar-day row: on 200k spans of 30 days the old form materialized 6.0M intermediate rows and spilled ~200 MB to disk per scan, the new one works on 200k spans, and both return identical rows.
+* A snapshot that lists the same ASPA customer twice now loads: the day is staged from the deduplicated set, so one statement never touches the same conflict row twice.
+
+* A walk decides whether an unavailable ASPA day is an era start from the observations at or before its starting position, not from the latest observation in the database, so backfilling early history into a database that already holds later days records those days as `era_start` instead of failing them as gaps.
+
+* A correction that restores the attributes (ROA) or provider set (ASPA) a previous span already carries drops the day's own row instead of leaving two rows that both claim the day, which mid-statement violated the ASPA span exclusion constraint and aborted the whole day.
+* An unchanged ASPA day no longer rewrites its object rows: the first-seen upsert fires only when the observation actually moves earlier.
+
+* The `source_file` ledger only ever gains evidence: a failed replay of a day that was already observed records the run failure but keeps the `observed` row and its counts instead of downgrading the day to `missing` and clearing its provenance.
+* An ASPA artifact that exists but does not parse marks publication as begun, so a backfill that continues past the failure records the days after it as gaps instead of era starts.
+
+* Repairing the day before an existing span merges the identical span that starts the next day into one span instead of leaving two adjacent rows, which a later replay of that day would have extended over, violating the span exclusion constraint and aborting the day.
+* The predecessor extension refuses to run when a span with the same attributes already covers the day, which makes such a replay a no-op instead of an overlapping update.
+
+* The per-day reconciliation recomputes an object's `first_seen` along with its current-state marker, so a repair that removes the earliest version but keeps a later one no longer leaves the object pointing at a day no version covers.
+* `ingest_run` has an `error` column: a run that fails before or outside file accounting (an unreadable listing, a database error) is no longer indistinguishable from a successful no-op run.
+
+* A ROA version that gets written records the certificate window its file published: staged rows are aligned to the stored window for the ingest's comparisons (drift within 36 h is not a change and writes no version), but the row written for a repaired or backfilled day keeps that day's own claims instead of the stored ones.
+* An object merge after an adjacent span extension updates the row that actually covers the day, not only a row starting on it.
+
+### Added
+
+* `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.
+* ASPA support in that binary: `pg/002_aspa.sql` adds ASN-keyed `aspa_object` / `aspa_version` tables that write a row only when a customer's provider set changes, plus `aspa_providers_of(customer_asn, day)` and `aspa_customers_of(provider_asn, day)` for either query direction as of a date. Cross-TAL unioning and the U-SPAS AS0 rule live in the views and functions. Coverage starts `2023-10-11`, the first day RIPE's `output.json.xz` artifact exists.
+* `pg/001_schema.sql` carries the ROA SCD-2 store, the per-file `source_file` ledger, and the `ingest_run` accounting that the binary writes.
+* `src/lib.rs` gains `crawl_tal_artifact()` for archive artifacts other than `roas.csv.xz`; no v1 function changed.
+
 ## v1.1.0 - 2026-07-25
 
 ### Highlights
