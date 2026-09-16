@@ -423,8 +423,21 @@ pub fn ingest_day(
             None if file_ok => {
                 // Same TAL current row is absent from today's file. A row
                 // observed only yesterday is a valid one-day span and must be
-                // closed, while a span that begins today cannot be rewound.
-                if let Some(last_seen) = last_seen_before_absence(cur.version_first_seen, day) {
+                // closed; a span that begins today has nothing left to close.
+                if cur.version_first_seen >= day {
+                    // The observation is this day itself and the file says the
+                    // object is not there: the row has to go, keeping only a
+                    // verified later tail.
+                    stage_span_tail(&mut tx, cur.roa_obj_id, cur.version_first_seen, day)?;
+                    counts.versions_closed += tx.execute(
+                        "DELETE FROM wayback.roa_version
+                          WHERE roa_obj_id = $1 AND first_seen = $2",
+                        &[&cur.roa_obj_id, &cur.version_first_seen],
+                    )? as i64;
+                    counts.versions_inserted += insert_staged_tail(&mut tx)?;
+                } else if let Some(last_seen) =
+                    last_seen_before_absence(cur.version_first_seen, day)
+                {
                     close_span_with_split(
                         &mut tx,
                         cur.roa_obj_id,
@@ -597,6 +610,16 @@ pub fn ingest_day(
     //    hold an open span after an earlier day was re-applied, so derive the
     //    marker from the latest span of every touched object.
     let current_ids: Vec<i64> = current.values().map(|row| row.roa_obj_id).collect();
+    // An object whose observations are all gone (a repair that removes its first
+    // day) is no longer an object: drop the identity too, or the current view
+    // keeps an object that holds no span.
+    tx.execute(
+        "DELETE FROM wayback.roa_object o
+          WHERE o.roa_obj_id = ANY($1::bigint[])
+            AND NOT EXISTS (SELECT 1 FROM wayback.roa_version v
+                             WHERE v.roa_obj_id = o.roa_obj_id)",
+        &[&current_ids],
+    )?;
     counts.object_markers_updated += tx.execute(
         "WITH touched AS (
             SELECT o.roa_obj_id
@@ -634,6 +657,9 @@ pub(crate) struct RunCounts {
     pub(crate) rows_updated: i64,
 }
 
+/// Continue one day past the latest observed snapshot. An incremental walk stops
+/// at the first day it cannot observe, so this cursor stays before a gap and the
+/// next run retries it.
 fn next_update_day(last_observed: Option<NaiveDate>) -> Result<NaiveDate> {
     last_observed
         .map(|day| day + chrono::Duration::days(1))
@@ -730,23 +756,25 @@ fn ingest_missing_day(
     Ok(())
 }
 
+/// Apply one archive file. Returns whether the day counts as a run failure.
 fn ingest_file(
     client: &mut Client,
     tal: &str,
     file: &crate::RoaFile,
     counts: &mut RunCounts,
-) -> Result<()> {
+) -> Result<bool> {
     let entries = match parse_roas_csv_full(&file.url) {
         Ok(entries) => entries,
         Err(error) => {
-            return ingest_missing_day(
+            ingest_missing_day(
                 client,
                 tal,
                 file.file_date,
                 &format!("fetch or parse {}: {error:#}", file.url),
                 true,
                 counts,
-            );
+            )?;
+            return Ok(true);
         }
     };
 
@@ -762,6 +790,54 @@ fn ingest_file(
         inserted,
         updated
     );
+    Ok(false)
+}
+
+/// Apply a known file list to one TAL's range. Split out of the crawl so the
+/// calendar walk and its stop-at-first-gap policy are testable without the
+/// network.
+fn ingest_day_files(
+    client: &mut Client,
+    tal: &str,
+    files: Vec<crate::RoaFile>,
+    from: NaiveDate,
+    until: NaiveDate,
+    missing: MissingDays,
+    counts: &mut RunCounts,
+) -> Result<()> {
+    let mut files_by_day = BTreeMap::new();
+    for file in files {
+        files_by_day.insert(file.file_date, file);
+    }
+    // Every calendar day of the range gets a ledger row, so "nothing to do"
+    // stays distinguishable from "nothing was read".
+    let mut day = from;
+    while day <= until {
+        match files_by_day.remove(&day) {
+            Some(file) => {
+                let failed = ingest_file(client, tal, &file, counts)?;
+                if failed && missing == MissingDays::FailRun {
+                    // The cursor is the latest observed day, so walking past a
+                    // failure would skip it for good.
+                    break;
+                }
+            }
+            None => {
+                ingest_missing_day(
+                    client,
+                    tal,
+                    day,
+                    "not listed by RIPE FTP",
+                    missing == MissingDays::FailRun,
+                    counts,
+                )?;
+                if missing == MissingDays::FailRun {
+                    break;
+                }
+            }
+        }
+        day += chrono::Duration::days(1);
+    }
     Ok(())
 }
 
@@ -777,29 +853,7 @@ fn ingest_tal_range(
     println!("== TAL {tal} ==");
     let mut files = try_crawl_tal_after(tal_url, Some(from), Some(until))?;
     files.sort_by_key(|file| file.file_date);
-
-    let mut files_by_day = BTreeMap::new();
-    for file in files {
-        files_by_day.insert(file.file_date, file);
-    }
-    // Every calendar day of the range gets a ledger row, so "nothing to do"
-    // stays distinguishable from "nothing was read".
-    let mut day = from;
-    while day <= until {
-        match files_by_day.remove(&day) {
-            Some(file) => ingest_file(client, tal, &file, counts)?,
-            None => ingest_missing_day(
-                client,
-                tal,
-                day,
-                "not listed by RIPE FTP",
-                missing == MissingDays::FailRun,
-                counts,
-            )?,
-        }
-        day += chrono::Duration::days(1);
-    }
-    Ok(())
+    ingest_day_files(client, tal, files, from, until, missing, counts)
 }
 
 pub(crate) fn run_ingest<F>(client: &mut Client, mode: &str, work: F) -> Result<()>
@@ -1046,6 +1100,164 @@ mod pg_tests {
         assert_eq!(
             selected_tal_urls(&[]).expect("all TALs").len(),
             crate::tal_names().len()
+        );
+    }
+
+    /// A readable ROA CSV on disk, so the calendar walk can be driven without
+    /// the network.
+    fn csv_fixture(name: &str) -> String {
+        let path =
+            std::env::temp_dir().join(format!("wayback-roa-{}-{name}.csv", std::process::id()));
+        std::fs::write(
+            &path,
+            "URI,ASN,IP Prefix,Max Length,Not Before,Not After\n\
+             rsync://rpki.example/roa/test.cer,AS64496,192.0.2.0/24,24,2026-01-01 00:00:00,2027-01-01 00:00:00\n",
+        )
+        .expect("write CSV fixture");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn roa_file(url: String, file_date: NaiveDate) -> crate::RoaFile {
+        crate::RoaFile {
+            tal: "test".to_string(),
+            url,
+            file_date,
+            rows_count: 0,
+            processed: false,
+        }
+    }
+
+    #[test]
+    fn an_incremental_walk_stops_at_the_first_failed_day() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        let third = day("2026-09-03");
+        let missing_url = std::env::temp_dir()
+            .join(format!("wayback-roa-{}-absent.csv", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let files = vec![
+            roa_file(csv_fixture("first"), first),
+            roa_file(missing_url, second),
+            roa_file(csv_fixture("third"), third),
+        ];
+        let mut counts = RunCounts::default();
+
+        ingest_day_files(
+            &mut client,
+            "test",
+            files,
+            first,
+            third,
+            MissingDays::FailRun,
+            &mut counts,
+        )
+        .expect("walk the range");
+
+        // The unreadable day is recorded, the walk stops there, and the cursor
+        // still points at it so the next run retries it.
+        assert_eq!(gap_class(&mut client, first), "observed");
+        assert_eq!(gap_class(&mut client, second), "missing");
+        assert_eq!(
+            table_count(
+                &mut client,
+                "SELECT count(*) FROM wayback.source_file WHERE file_date = '2026-09-03'"
+            ),
+            0
+        );
+        assert_eq!(counts.files_failed, 1);
+        let cursor =
+            next_update_day(last_observed_day(&mut client, "test", ROA_ARTIFACT).expect("cursor"))
+                .expect("cursor");
+        assert_eq!(cursor, second);
+    }
+
+    #[test]
+    fn a_backfill_walk_records_the_gap_and_continues() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        let third = day("2026-09-03");
+        let missing_url = std::env::temp_dir()
+            .join(format!("wayback-roa-{}-absent2.csv", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let files = vec![
+            roa_file(csv_fixture("first"), first),
+            roa_file(missing_url, second),
+            roa_file(csv_fixture("third"), third),
+        ];
+        let mut counts = RunCounts::default();
+
+        ingest_day_files(
+            &mut client,
+            "test",
+            files,
+            first,
+            third,
+            MissingDays::RecordOnly,
+            &mut counts,
+        )
+        .expect("walk the range");
+
+        assert_eq!(gap_class(&mut client, second), "missing");
+        assert_eq!(gap_class(&mut client, third), "observed");
+        assert_eq!(counts.files_failed, 1);
+    }
+
+    #[test]
+    fn reapplying_the_first_day_as_absent_removes_the_observation() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let only_day = day("2026-09-01");
+        present(&mut client, only_day);
+        assert_eq!(
+            table_count(&mut client, "SELECT count(*) FROM wayback.roa_version"),
+            1
+        );
+
+        // The file for that very day is known not to carry the object.
+        ingest_day(&mut client, "test", only_day, &[], true, Some(200), None)
+            .expect("re-apply the first day as absent");
+
+        assert_eq!(
+            table_count(&mut client, "SELECT count(*) FROM wayback.roa_version"),
+            0
+        );
+        assert_eq!(
+            table_count(&mut client, "SELECT count(*) FROM wayback.roa_object"),
+            0
+        );
+        assert_eq!(spans(&mut client), Vec::new());
+    }
+
+    #[test]
+    fn reapplying_the_first_day_as_absent_keeps_the_later_tail() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        present(&mut client, first);
+        present(&mut client, second);
+        assert_eq!(spans(&mut client), vec![(first, None)]);
+
+        ingest_day(&mut client, "test", first, &[], true, Some(200), None)
+            .expect("re-apply the first day as absent");
+
+        // Only the first day is withdrawn; the object is still current because
+        // of the day that was observed after it.
+        assert_eq!(spans(&mut client), vec![(second, None)]);
+        assert_eq!(object_marker(&mut client), None);
+        assert_eq!(
+            table_count(&mut client, "SELECT count(*) FROM wayback.roa_object"),
+            1
         );
     }
 

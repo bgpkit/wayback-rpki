@@ -170,13 +170,17 @@ and the `wayback-rpki` CLI behave exactly as before.
 - **Repair semantics**: applying a day out of order continues an adjacent span, splits the
   span that covers the day (absence closes it, changed attributes or a changed provider set
   keep the days after it under the previous values, gated on days the TAL observed in
-  `source_file`), replaces that day's own row instead of colliding with its primary key, and
-  derives `roa_object.last_seen` / `aspa_object.last_seen` from the version spans, so
+  `source_file`), replaces that day's own row instead of colliding with its primary key (a
+  span that starts on the repaired day is dropped and an object left without spans is
+  removed), and derives `roa_object.last_seen` / `aspa_object.last_seen` from the version
+  spans, so
   replaying an older day neither reopens nor closes an object that later history covers. The
   ROA ingest loads only the TAL being applied.
 - **Gaps**: every calendar day of a range gets a `source_file` row. A day the archive does
   not list is recorded as `missing` (an incremental run fails on it, a backfill does not);
-  a listed file that cannot be fetched or parsed is always a failure. ASPA records
+  a listed file that cannot be fetched or parsed is always a failure. An incremental walk
+  stops at the first day it cannot observe, so its cursor stays before the gap and the next
+  run retries it. ASPA records
   `era_start` only when the walk began at the archive's ASPA era and the artifact is
   verifiably unpublished (`oneio::exists`); a range that starts mid-history, or a failure to
   read a published file, is a gap rather than an era start.

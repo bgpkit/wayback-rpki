@@ -19,6 +19,10 @@ All notable changes to this project will be documented in this file.
 * ASPA `era_start` also requires the walk to have begun at the archive's ASPA era; a range that starts mid-history records absent days as gaps.
 * `next_update_day` points at `wayback-pg backfill`, and the ROA/ASPA storage comments state the invariants the tables actually hold.
 
+* An incremental run stops at the first day it cannot observe, so the cursor stays before that day and the next run retries it instead of jumping past it to the latest success.
+* A repair that finds the object absent on the very day its span started drops that row (keeping a verified later tail), and an object left with no observations is removed rather than left current with an empty history.
+* The ASPA parser requires `aspas` and each object's `providers`: a renamed field or an error document fails the day instead of parsing as an empty snapshot that withdraws every customer.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.
