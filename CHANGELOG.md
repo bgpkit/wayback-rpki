@@ -23,6 +23,9 @@ All notable changes to this project will be documented in this file.
 * A repair that finds the object absent on the very day its span started drops that row (keeping a verified later tail), and an object left with no observations is removed rather than left current with an empty history.
 * The ASPA parser requires `aspas` and each object's `providers`: a renamed field or an error document fails the day instead of parsing as an empty snapshot that withdraws every customer.
 
+* A span written for a repaired (out-of-order) day covers that day only, and the ROA attribute-change repair follows the same rule: a later span, or days the archive observed as absent, are no longer filled in with presence or attributes no file ever showed. The span stays open only when the repaired day is the latest day the TAL observed.
+* The legacy `crawl_tal_after` / `crawl_tal_artifact` keep their best-effort traversal: a listing below the TAL root that cannot be fetched omits only that subtree, while the ingest uses the strict forms that fail the run.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.

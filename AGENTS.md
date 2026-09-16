@@ -46,7 +46,8 @@ wayback-rpki/
   listing for a given TAL, returns `Vec<RoaFile>` metadata. Uses `rayon` for parallel crawling.
 - **`try_crawl_tal_after` / `try_crawl_tal_artifact`** — the same listing walk with the crawl
   failure kept as an `Err`, so an unreadable listing cannot pass as "nothing was published".
-  The `crawl_tal_*` forms stay the v1 contract (warning + empty vector).
+  The `crawl_tal_*` forms stay the v1 contract: a listing below the TAL root that cannot be
+  fetched omits only that subtree (warning), and only a root failure yields nothing.
 - **`tal_url(name)` / `tal_names()`** — resolve or validate a TAL name without the panic in
   `get_tal_urls`, which keeps its v1 behaviour.
 - **`parse_roas_csv(url)`** — Downloads and parses a `roas.csv.xz` file into `Vec<RoaEntry>`.
@@ -167,7 +168,9 @@ and the `wayback-rpki` CLI behave exactly as before.
   --pg-config ... --from --until`, both accepting `--tal afrinic,apnic` and
   `--types roa,aspa` (default: both families, each resuming from its own
   source-file cursor). An unknown `--tal` name is a CLI error, not a panic.
-- **Repair semantics**: applying a day out of order continues an adjacent span, splits the
+- **Repair semantics**: a span written for a repaired day covers that day only (it stays open
+  only when the repaired day is the latest the TAL observed), because nothing observed the
+  days up to a later span. Applying a day out of order continues an adjacent span, splits the
   span that covers the day (absence closes it, changed attributes or a changed provider set
   keep the days after it under the previous values, gated on days the TAL observed in
   `source_file`), replaces that day's own row instead of colliding with its primary key (a

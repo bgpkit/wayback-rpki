@@ -402,8 +402,10 @@ pub fn ingest_day(
                         "INSERT INTO wayback.roa_version
                            (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
                          VALUES ($1, $2, $3::timestamp AT TIME ZONE 'UTC', $4::timestamp AT TIME ZONE 'UTC', $5,
-                                 (SELECT min(w.first_seen) - 1 FROM wayback.roa_version w
-                                   WHERE w.roa_obj_id = $1 AND w.first_seen > $5))
+                                 CASE WHEN (SELECT max(f.file_date) FROM wayback.source_file f
+                                             WHERE f.tal = $6 AND f.artifact = 'roas.csv.xz'
+                                               AND f.gap_class = 'observed') = $5
+                                      THEN NULL ELSE $5 END)
                          ON CONFLICT (roa_obj_id, first_seen) DO UPDATE
                            SET max_len = EXCLUDED.max_len,
                                not_before = EXCLUDED.not_before,
@@ -415,6 +417,7 @@ pub fn ingest_day(
                             &nb,
                             &na,
                             &day,
+                            &tal,
                         ],
                     )? as i64;
                 }
@@ -518,11 +521,15 @@ pub fn ingest_day(
         )?;
         // A repaired day next to an existing span continues that span: extend
         // the span that ends the day before `day` instead of opening a second
-        // row for the same attributes.
+        // row for the same attributes. The extension reaches exactly one day:
+        // nothing observed the days up to the next span, so claiming them would
+        // assert presence the archive never showed.
         counts.spans_extended += tx.execute(
             "UPDATE wayback.roa_version v
-                SET last_seen = (SELECT min(w.first_seen) - 1 FROM wayback.roa_version w
-                                  WHERE w.roa_obj_id = v.roa_obj_id AND w.first_seen > $2::date)
+                SET last_seen = CASE WHEN (SELECT max(f.file_date) FROM wayback.source_file f
+                                           WHERE f.tal = $1 AND f.artifact = 'roas.csv.xz'
+                                             AND f.gap_class = 'observed') = $2::date
+                                     THEN NULL ELSE $2::date END
                FROM stage_day s
                JOIN wayback.roa_object o
                  ON o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix AND o.origin_asn = s.origin
@@ -533,14 +540,17 @@ pub fn ingest_day(
             &[&tal, &day],
         )? as i64;
         // Versions: one per staged tuple unless a matching span actually covers
-        // the day (idempotent replay). When backfilling an earlier day
-        // (out-of-order repair), bound the new span by the object's next
-        // existing span instead of leaving it open-ended.
+        // the day (idempotent replay). A span written for a historical day
+        // covers that day only and stays open only when the day is the latest
+        // one the TAL observed: a later span, or observed days after it, would
+        // otherwise be filled in with presence no file ever showed.
         let n_ver = tx.execute(
             "INSERT INTO wayback.roa_version (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
              SELECT o.roa_obj_id, d.max_len, d.not_before, d.not_after, $2::date,
-                    (SELECT min(w.first_seen) - 1 FROM wayback.roa_version w
-                      WHERE w.roa_obj_id = o.roa_obj_id AND w.first_seen > $2::date)
+                    CASE WHEN (SELECT max(f.file_date) FROM wayback.source_file f
+                                WHERE f.tal = $1 AND f.artifact = 'roas.csv.xz'
+                                  AND f.gap_class = 'observed') = $2::date
+                         THEN NULL ELSE $2::date END
              FROM (
                SELECT DISTINCT ON (uri, prefix, origin) uri, prefix, origin, max_len, not_before, not_after
                FROM stage_day ORDER BY uri, prefix, origin, max_len
@@ -1259,6 +1269,114 @@ mod pg_tests {
             table_count(&mut client, "SELECT count(*) FROM wayback.roa_object"),
             1
         );
+    }
+
+    #[test]
+    fn a_repair_does_not_fill_days_observed_as_absent() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        let third = day("2026-09-03");
+        let fourth = day("2026-09-04");
+        let fifth = day("2026-09-05");
+        present(&mut client, first);
+        for absent_day in [second, third, fourth] {
+            ingest_day(&mut client, "test", absent_day, &[], true, Some(200), None)
+                .expect("absent day");
+        }
+        present(&mut client, fifth);
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(first)), (fifth, None)]
+        );
+
+        // Day 2 was present after all, but days 3-4 were observed absent: the
+        // repaired span must stop at day 2, not stretch to the next version.
+        ingest_day(
+            &mut client,
+            "test",
+            second,
+            &[roa(24)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("repair day 2");
+
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(second)), (fifth, None)]
+        );
+    }
+
+    #[test]
+    fn a_repair_before_a_later_span_covers_only_its_day() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let second = day("2026-09-02");
+        let fifth = day("2026-09-05");
+        present(&mut client, fifth);
+        assert_eq!(spans(&mut client), vec![(fifth, None)]);
+
+        ingest_day(
+            &mut client,
+            "test",
+            second,
+            &[roa(24)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("repair an earlier day");
+
+        assert_eq!(
+            spans(&mut client),
+            vec![(second, Some(second)), (fifth, None)]
+        );
+    }
+
+    #[test]
+    fn an_attribute_change_repair_covers_only_its_day() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        let third = day("2026-09-03");
+        present(&mut client, first);
+        present(&mut client, second);
+        ingest_day(&mut client, "test", third, &[], true, Some(200), None).expect("absent day");
+
+        // Day 2 carried a different max_len after all, and day 3 was observed
+        // absent: the new attribute belongs to day 2 only.
+        ingest_day(
+            &mut client,
+            "test",
+            second,
+            &[roa(25)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("repair day 2");
+
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(first)), (second, Some(second))]
+        );
+        let max_lens: Vec<i16> = client
+            .query(
+                "SELECT max_len FROM wayback.roa_version ORDER BY first_seen",
+                &[],
+            )
+            .expect("query max_len")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(max_lens, vec![24, 25]);
     }
 
     #[test]

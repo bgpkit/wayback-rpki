@@ -97,6 +97,20 @@ fn check_date(
     from_match && until_match
 }
 
+/// A listing that cannot be fetched either fails the crawl (`strict`) or drops
+/// just that subtree with a warning, which is what the legacy crawl has always
+/// done; the ingest uses the strict form.
+fn listing_or_empty(url: &str, width: usize, strict: bool) -> Result<Vec<u32>> {
+    match crawl_links(url, width) {
+        Ok(entries) => Ok(entries),
+        Err(error) if strict => Err(error),
+        Err(error) => {
+            warn!("omitting {url} from the crawl: {error:#}");
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// Day files of one artifact in the RIPE archive:
 /// `{tal_url}/{year}/{month}/{day}/{artifact}`.
 fn crawl_artifact_days(
@@ -104,8 +118,9 @@ fn crawl_artifact_days(
     from: Option<NaiveDate>,
     until: Option<NaiveDate>,
     artifact: &str,
+    strict: bool,
 ) -> Result<Vec<ArchiveFile>> {
-    let years: Vec<u32> = crawl_links(tal_url, 4)?
+    let years: Vec<u32> = listing_or_empty(tal_url, 4, strict)?
         .into_iter()
         .filter(|year| {
             NaiveDate::from_ymd_opt(*year as i32, 1, 1)
@@ -119,7 +134,7 @@ fn crawl_artifact_days(
             let year = *year as i32;
             info!("scanning {artifact} files for {tal_url}/{year} ...");
             let year_url = format!("{tal_url}/{year}");
-            let months: Vec<u32> = crawl_links(&year_url, 2)?
+            let months: Vec<u32> = listing_or_empty(&year_url, 2, strict)?
                 .into_iter()
                 .filter(|month| {
                     NaiveDate::from_ymd_opt(year, *month, 1)
@@ -133,7 +148,7 @@ fn crawl_artifact_days(
                     debug!("scraping data for {year_url}/{month:02} ...");
                     let month_url = format!("{year_url}/{month:02}");
                     let mut files = Vec::new();
-                    for day in crawl_links(&month_url, 2)? {
+                    for day in listing_or_empty(&month_url, 2, strict)? {
                         let Some(file_date) = NaiveDate::from_ymd_opt(year, *month, day) else {
                             continue;
                         };
@@ -164,13 +179,30 @@ pub fn crawl_tal_after(
     from: Option<NaiveDate>,
     until: Option<NaiveDate>,
 ) -> Vec<RoaFile> {
-    match try_crawl_tal_after(tal_url, from, until) {
+    match crawl_tal_files(tal_url, from, until) {
         Ok(files) => files,
         Err(error) => {
             warn!("failed to crawl {tal_url}: {error:#}");
             Vec::new()
         }
     }
+}
+
+/// Best-effort form of `try_crawl_tal_after`: a listing below the root that
+/// cannot be fetched omits that subtree instead of dropping the whole TAL. This
+/// is the behaviour the v1 rebuild path has always had.
+fn crawl_tal_files(
+    tal_url: &str,
+    from: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+) -> Result<Vec<RoaFile>> {
+    let tal = tal_name_from_url(tal_url);
+    Ok(
+        crawl_artifact_days(tal_url, from, until, ROA_ARTIFACT, false)?
+            .into_iter()
+            .map(|file| roa_file(file, &tal))
+            .collect(),
+    )
 }
 
 /// `crawl_tal_after` with the crawl failure kept as an error: an ingest run
@@ -181,16 +213,22 @@ pub fn try_crawl_tal_after(
     until: Option<NaiveDate>,
 ) -> Result<Vec<RoaFile>> {
     let tal = tal_name_from_url(tal_url);
-    Ok(crawl_artifact_days(tal_url, from, until, ROA_ARTIFACT)?
-        .into_iter()
-        .map(|file| RoaFile {
-            tal: tal.clone(),
-            url: file.url,
-            file_date: file.file_date,
-            rows_count: 0,
-            processed: false,
-        })
-        .collect())
+    Ok(
+        crawl_artifact_days(tal_url, from, until, ROA_ARTIFACT, true)?
+            .into_iter()
+            .map(|file| roa_file(file, &tal))
+            .collect(),
+    )
+}
+
+fn roa_file(file: ArchiveFile, tal: &str) -> RoaFile {
+    RoaFile {
+        tal: tal.to_owned(),
+        url: file.url,
+        file_date: file.file_date,
+        rows_count: 0,
+        processed: false,
+    }
 }
 
 /// TAL name as it appears in its archive URL: `.../afrinic.tal` -> `afrinic`.
@@ -314,7 +352,7 @@ pub fn crawl_tal_artifact(
     until: Option<NaiveDate>,
     artifact: &str,
 ) -> Vec<ArchiveFile> {
-    match try_crawl_tal_artifact(tal_url, from, until, artifact) {
+    match crawl_artifact_days(tal_url, from, until, artifact, false) {
         Ok(files) => files,
         Err(error) => {
             warn!("failed to crawl {tal_url} for {artifact}: {error:#}");
@@ -331,7 +369,7 @@ pub fn try_crawl_tal_artifact(
     until: Option<NaiveDate>,
     artifact: &str,
 ) -> Result<Vec<ArchiveFile>> {
-    crawl_artifact_days(tal_url, from, until, artifact)
+    crawl_artifact_days(tal_url, from, until, artifact, true)
 }
 
 #[cfg(test)]
@@ -367,6 +405,27 @@ mod tests {
             roa_files[0].file_date,
             NaiveDate::from_ymd_opt(2011, 1, 21).unwrap()
         );
+    }
+
+    #[test]
+    fn a_broken_listing_drops_its_subtree_only_when_not_strict() {
+        let missing = "/nonexistent/wayback-rpki-listing";
+        assert!(listing_or_empty(missing, 4, true).is_err());
+        assert_eq!(
+            listing_or_empty(missing, 4, false).expect("best-effort listing"),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn legacy_crawl_stays_best_effort_while_the_strict_form_fails() {
+        let missing = "/nonexistent/wayback-rpki-crawl-test";
+        // The ingest must see the failure ...
+        assert!(try_crawl_tal_after(missing, None, None).is_err());
+        assert!(try_crawl_tal_artifact(missing, None, None, ROA_ARTIFACT).is_err());
+        // ... while the v1 wrappers keep their old contract: warn and continue.
+        assert!(crawl_tal_after(missing, None, None).is_empty());
+        assert!(crawl_tal_artifact(missing, None, None, ROA_ARTIFACT).is_empty());
     }
 
     #[test]

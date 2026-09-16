@@ -390,11 +390,15 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
         )?;
         // A repaired day next to an existing span continues that span: extend
         // the span that ends the day before `day` instead of opening a second
-        // row for the same provider set.
+        // row for the same provider set. The extension reaches exactly one day:
+        // nothing observed the days up to the next span, so claiming them would
+        // assert a provider set the archive never showed.
         updated += tx.execute(
             "UPDATE wayback.aspa_version v
-                SET last_seen = (SELECT min(w.first_seen) - 1 FROM wayback.aspa_version w
-                                  WHERE w.aspa_obj_id = v.aspa_obj_id AND w.first_seen > $2::date)
+                SET last_seen = CASE WHEN (SELECT max(f.file_date) FROM wayback.source_file f
+                                           WHERE f.tal = $1 AND f.artifact = 'output.json.xz'
+                                             AND f.gap_class = 'observed') = $2::date
+                                     THEN NULL ELSE $2::date END
                FROM stage_aspa s
                JOIN wayback.aspa_object o ON o.ta = $1 AND o.customer_asn = s.customer
               WHERE v.aspa_obj_id = o.aspa_obj_id
@@ -406,8 +410,10 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
             "INSERT INTO wayback.aspa_version
                (aspa_obj_id, providers, provider_count, has_as0, as0_only, first_seen, last_seen)
              SELECT o.aspa_obj_id, s.providers, s.provider_count, s.has_as0, s.as0_only, $2::date,
-                    (SELECT min(w.first_seen) - 1 FROM wayback.aspa_version w
-                      WHERE w.aspa_obj_id = o.aspa_obj_id AND w.first_seen > $2::date)
+                    CASE WHEN (SELECT max(f.file_date) FROM wayback.source_file f
+                                WHERE f.tal = $1 AND f.artifact = 'output.json.xz'
+                                  AND f.gap_class = 'observed') = $2::date
+                         THEN NULL ELSE $2::date END
              FROM stage_aspa s
              JOIN wayback.aspa_object o ON o.ta = $1 AND o.customer_asn = s.customer
              WHERE NOT EXISTS (
@@ -1037,6 +1043,89 @@ mod pg_tests {
             count(&mut client, "SELECT count(*) FROM wayback.aspa_object"),
             1
         );
+    }
+
+    #[test]
+    fn a_repair_does_not_fill_days_observed_as_absent() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        let third = day("2026-09-12");
+        let fourth = day("2026-09-13");
+        let fifth = day("2026-09-14");
+        let entry = aspa(&[64_513]);
+        apply(&mut client, first, std::slice::from_ref(&entry));
+        for absent_day in [second, third, fourth] {
+            apply(&mut client, absent_day, &[]);
+        }
+        apply(&mut client, fifth, std::slice::from_ref(&entry));
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(first)), (fifth, None)]
+        );
+
+        // The customer was present on day 2 after all: the repaired span stops
+        // at that day, it does not inherit the days observed absent.
+        apply(&mut client, second, std::slice::from_ref(&entry));
+
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(second)), (fifth, None)]
+        );
+    }
+
+    #[test]
+    fn a_repair_before_a_later_span_covers_only_its_day() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let second = day("2026-09-11");
+        let fifth = day("2026-09-14");
+        let entry = aspa(&[64_513]);
+        apply(&mut client, fifth, std::slice::from_ref(&entry));
+        assert_eq!(spans(&mut client), vec![(fifth, None)]);
+
+        apply(&mut client, second, std::slice::from_ref(&entry));
+
+        assert_eq!(
+            spans(&mut client),
+            vec![(second, Some(second)), (fifth, None)]
+        );
+    }
+
+    #[test]
+    fn a_provider_set_change_repair_covers_only_its_day() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-10");
+        let second = day("2026-09-11");
+        let third = day("2026-09-12");
+        let old_set = aspa(&[64_513]);
+        apply(&mut client, first, std::slice::from_ref(&old_set));
+        apply(&mut client, second, std::slice::from_ref(&old_set));
+        apply(&mut client, third, &[]);
+
+        // Day 2 carried a different provider set, and day 3 was observed absent:
+        // the new set belongs to day 2 only.
+        apply(&mut client, second, &[aspa(&[64_514])]);
+
+        assert_eq!(
+            spans(&mut client),
+            vec![(first, Some(first)), (second, Some(second))]
+        );
+        let sets: Vec<Vec<i64>> = client
+            .query(
+                "SELECT providers FROM wayback.aspa_version ORDER BY first_seen",
+                &[],
+            )
+            .expect("query providers")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(sets, vec![vec![64_513], vec![64_514]]);
     }
 
     #[test]
