@@ -485,7 +485,11 @@ pub fn ingest_aspa_day(client: &mut Client, file: &AspaFile<'_>) -> Result<(i64,
             "UPDATE wayback.aspa_version v
                 SET last_seen = g.last_seen
                FROM stage_aspa_split g
-              WHERE v.aspa_obj_id = g.aspa_obj_id AND v.first_seen = $1::date",
+              WHERE v.aspa_obj_id = g.aspa_obj_id
+                -- the row that covers the day: the day's row itself, or the
+                -- predecessor the extension just grew onto it
+                AND v.first_seen <= $1::date
+                AND (v.last_seen IS NULL OR v.last_seen >= $1::date)",
             &[&day],
         )?;
         tx.execute("TRUNCATE stage_aspa_split", &[])?;

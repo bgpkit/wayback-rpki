@@ -479,13 +479,15 @@ pub fn ingest_day(
         tx.execute(
             "CREATE TEMP TABLE IF NOT EXISTS stage_day (
                uri text, prefix text, origin bigint, max_len smallint,
-               not_before timestamptz, not_after timestamptz) ON COMMIT DROP",
+               not_before timestamptz, not_after timestamptz,
+               file_not_before timestamptz, file_not_after timestamptz) ON COMMIT DROP",
             &[],
         )?;
         tx.execute("TRUNCATE stage_day", &[])?;
         {
             let mut w = tx.copy_in(
-                "COPY stage_day (uri, prefix, origin, max_len, not_before, not_after) FROM STDIN",
+                "COPY stage_day (uri, prefix, origin, max_len, not_before, not_after,
+                                 file_not_before, file_not_after) FROM STDIN",
             )?;
             use std::io::Write;
             let mut buf = String::new();
@@ -493,12 +495,18 @@ pub fn ingest_day(
                 if current.contains_key(key) {
                     continue;
                 }
+                // The window columns start as the file's own and are aligned
+                // below to the certificate already stored for this object; the
+                // `file_*` pair keeps the file's claim for a version that gets
+                // written.
                 let line = format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     escape_tsv(&e.uri),
                     escape_tsv(&e.prefix),
                     e.origin_asn,
                     e.max_len,
+                    e.not_before.format("%Y-%m-%d %H:%M:%S+00"),
+                    e.not_after.format("%Y-%m-%d %H:%M:%S+00"),
                     e.not_before.format("%Y-%m-%d %H:%M:%S+00"),
                     e.not_after.format("%Y-%m-%d %H:%M:%S+00"),
                 );
@@ -524,8 +532,9 @@ pub fn ingest_day(
         // few hours between snapshots (tz drift in publication). A staged row
         // whose window is within 36h of an existing span for the same object
         // and identical max_len is treated as the same certificate: adopt the
-        // stored window so the coverage guard matches instead of inserting a
-        // duplicate span.
+        // stored window so the comparisons below match instead of inserting a
+        // duplicate span. The file's own window stays in `file_not_before` /
+        // `file_not_after` for a version that does get written.
         tx.execute(
             "UPDATE stage_day s
                 SET not_before = v.not_before, not_after = v.not_after
@@ -548,25 +557,26 @@ pub fn ingest_day(
                                            WHERE f.tal = $1 AND f.artifact = 'roas.csv.xz'
                                              AND f.gap_class = 'observed') = $2::date
                                      THEN NULL ELSE $2::date END
-               FROM stage_day s
-               JOIN wayback.roa_object o
-                 ON o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix AND o.origin_asn = s.origin
-              WHERE v.roa_obj_id = o.roa_obj_id
-                AND v.max_len = s.max_len
-                AND v.not_before = s.not_before AND v.not_after = s.not_after
-                AND v.last_seen = $2::date - 1
-                -- only when the day is not covered by the same attributes
-                -- already: extending then would overlap that span. The staging
-                -- filter above already excludes covered objects, so this guard is
-                -- what keeps a future change to that filter from overlapping rows.
-                AND NOT EXISTS (
-                  SELECT 1 FROM wayback.roa_version c
-                  WHERE c.roa_obj_id = v.roa_obj_id
-                    AND c.max_len = s.max_len
-                    AND c.not_before = s.not_before AND c.not_after = s.not_after
-                    AND c.first_seen <= $2::date
-                    AND (c.last_seen IS NULL OR c.last_seen >= $2::date)
-                )",
+               FROM (
+                 -- One candidate per staged row, so the coverage check runs once
+                 -- per row instead of once per join pair.
+                 SELECT DISTINCT o.roa_obj_id, s.max_len, s.not_before, s.not_after
+                   FROM stage_day s
+                   JOIN wayback.roa_object o
+                     ON o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix
+                    AND o.origin_asn = s.origin
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM wayback.roa_version c
+                     WHERE c.roa_obj_id = o.roa_obj_id
+                       AND c.max_len = s.max_len
+                       AND c.not_before = s.not_before AND c.not_after = s.not_after
+                       AND c.first_seen <= $2::date
+                       AND (c.last_seen IS NULL OR c.last_seen >= $2::date))
+               ) cand
+              WHERE v.roa_obj_id = cand.roa_obj_id
+                AND v.max_len = cand.max_len
+                AND v.not_before = cand.not_before AND v.not_after = cand.not_after
+                AND v.last_seen = $2::date - 1",
             &[&tal, &day],
         )? as i64;
         // Versions: one per staged tuple unless a matching span actually covers
@@ -576,13 +586,15 @@ pub fn ingest_day(
         // otherwise be filled in with presence no file ever showed.
         let n_ver = tx.execute(
             "INSERT INTO wayback.roa_version (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
-             SELECT o.roa_obj_id, d.max_len, d.not_before, d.not_after, $2::date,
+             SELECT o.roa_obj_id, d.max_len, d.file_not_before, d.file_not_after, $2::date,
                     CASE WHEN (SELECT max(f.file_date) FROM wayback.source_file f
                                 WHERE f.tal = $1 AND f.artifact = 'roas.csv.xz'
                                   AND f.gap_class = 'observed') = $2::date
                          THEN NULL ELSE $2::date END
              FROM (
-               SELECT DISTINCT ON (uri, prefix, origin) uri, prefix, origin, max_len, not_before, not_after
+               SELECT DISTINCT ON (uri, prefix, origin)
+                      uri, prefix, origin, max_len, not_before, not_after,
+                      file_not_before, file_not_after
                FROM stage_day ORDER BY uri, prefix, origin, max_len
              ) d
              JOIN wayback.roa_object o
@@ -591,7 +603,8 @@ pub fn ingest_day(
                SELECT 1 FROM wayback.roa_version v
                WHERE v.roa_obj_id = o.roa_obj_id
                  AND v.max_len = d.max_len
-                 AND v.not_before = d.not_before AND v.not_after = d.not_after
+AND abs(extract(epoch from (v.not_before - d.not_before))) < 129600
+AND abs(extract(epoch from (v.not_after - d.not_after))) < 129600
                  AND v.first_seen <= $2::date
                  AND (v.last_seen IS NULL OR v.last_seen >= $2::date)
              )",
@@ -610,8 +623,9 @@ pub fn ingest_day(
                   AND o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix
                   AND o.origin_asn = s.origin
                   AND v.max_len = s.max_len
-                  AND v.not_before = s.not_before AND v.not_after = s.not_after
-                  AND v.first_seen = $2::date + 1
+AND abs(extract(epoch from (v.not_before - s.not_before))) < 129600
+AND abs(extract(epoch from (v.not_after - s.not_after))) < 129600
+AND v.first_seen = $2::date + 1
                RETURNING v.roa_obj_id, v.max_len, v.not_before, v.not_after, v.last_seen
              )
              INSERT INTO stage_split (roa_obj_id, max_len, not_before, not_after, first_seen, last_seen)
@@ -622,7 +636,11 @@ pub fn ingest_day(
             "UPDATE wayback.roa_version v
                 SET last_seen = g.last_seen
                FROM stage_split g
-              WHERE v.roa_obj_id = g.roa_obj_id AND v.first_seen = $1::date",
+              WHERE v.roa_obj_id = g.roa_obj_id
+                -- the row that covers the day: the day's row itself, or the
+                -- predecessor the extension just grew onto it
+                AND v.first_seen <= $1::date
+                AND (v.last_seen IS NULL OR v.last_seen >= $1::date)",
             &[&day],
         )?;
         tx.execute("TRUNCATE stage_split", &[])?;
@@ -638,14 +656,18 @@ pub fn ingest_day(
                   JOIN wayback.roa_object o
                     ON o.ta = $1 AND o.uri = s.uri AND o.prefix::text = s.prefix AND o.origin_asn = s.origin
                   WHERE o.roa_obj_id = v.roa_obj_id
-                    AND (v.max_len <> s.max_len OR v.not_before <> s.not_before OR v.not_after <> s.not_after)
+                    AND (v.max_len <> s.max_len
+OR abs(extract(epoch from (v.not_before - s.not_before))) >= 129600
+OR abs(extract(epoch from (v.not_after - s.not_after))) >= 129600)
                 )
                 AND NOT EXISTS (
                   SELECT 1 FROM stage_day s2
                   JOIN wayback.roa_object o2
                     ON o2.ta = $1 AND o2.uri = s2.uri AND o2.prefix::text = s2.prefix AND o2.origin_asn = s2.origin
                   WHERE o2.roa_obj_id = v.roa_obj_id
-                    AND v.max_len = s2.max_len AND v.not_before = s2.not_before AND v.not_after = s2.not_after
+                    AND v.max_len = s2.max_len
+AND abs(extract(epoch from (v.not_before - s2.not_before))) < 129600
+AND abs(extract(epoch from (v.not_after - s2.not_after))) < 129600
                 )",
             &[&tal, &day],
         )?;
@@ -1723,6 +1745,102 @@ mod pg_tests {
             .expect("query max_len")
             .get(0);
         assert_eq!(max_len, 25);
+    }
+
+    #[test]
+    fn a_repaired_day_keeps_its_own_certificate_window() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let third = day("2026-09-03");
+        let base = ts("2026-01-01 00:00:00");
+        let shifted = base + chrono::Duration::hours(10);
+        let entry = |not_before: chrono::NaiveDateTime| RoaFullEntry {
+            not_before,
+            not_after: not_before + chrono::Duration::days(365),
+            ..roa(24)
+        };
+
+        // The store first learns the certificate window of the third day ...
+        ingest_day(
+            &mut client,
+            "test",
+            third,
+            &[entry(base)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("day 3");
+        // ... and the repaired first day carries a window ten hours away: the
+        // row written for that day keeps the claim its file made.
+        ingest_day(
+            &mut client,
+            "test",
+            first,
+            &[entry(shifted)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("repair day 1");
+
+        let windows: Vec<chrono::NaiveDateTime> = client
+            .query(
+                "SELECT not_before AT TIME ZONE 'UTC' FROM wayback.roa_version ORDER BY first_seen",
+                &[],
+            )
+            .expect("query windows")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(windows, vec![shifted, base]);
+    }
+
+    #[test]
+    fn an_hour_level_drift_writes_no_version() {
+        let Some(mut client) = test_db::connect() else {
+            return;
+        };
+        let first = day("2026-09-01");
+        let second = day("2026-09-02");
+        let base = ts("2026-01-01 00:00:00");
+        let entry = |not_before: chrono::NaiveDateTime| RoaFullEntry {
+            not_before,
+            not_after: not_before + chrono::Duration::days(365),
+            ..roa(24)
+        };
+
+        ingest_day(
+            &mut client,
+            "test",
+            first,
+            &[entry(base)],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("day 1");
+        // ARIN republishes with a window shifted by hours: the same certificate,
+        // so nothing is written and no second version appears.
+        let applied = ingest_day(
+            &mut client,
+            "test",
+            second,
+            &[entry(base + chrono::Duration::hours(10))],
+            true,
+            Some(200),
+            None,
+        )
+        .expect("drift only day");
+
+        assert_eq!(applied, (0, 0));
+        assert_eq!(
+            table_count(&mut client, "SELECT count(*) FROM wayback.roa_version"),
+            1
+        );
+        assert_eq!(spans(&mut client), vec![(first, None)]);
     }
 
     #[test]

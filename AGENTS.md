@@ -169,6 +169,11 @@ and the `wayback-rpki` CLI behave exactly as before.
   --pg-config ... --from --until`, both accepting `--tal afrinic,apnic` and
   `--types roa,aspa` (default: both families, each resuming from its own
   source-file cursor). An unknown `--tal` name is a CLI error, not a panic.
+- **Certificate windows**: a version that gets written records the claims its file made, hour
+  drift included. The staging alignment and every comparison (change detection, coverage,
+  adjacent-span extension, next-day merge, close) treat a window within 36 h of the stored one
+  as the same certificate, so ARIN's republishing drift writes no version while a repaired or
+  backfilled day keeps the claims of its own file.
 - **Repair semantics**: a span written for a repaired day covers that day only (it stays open
   only when the repaired day is the latest the TAL observed), because nothing observed the
   days up to a later span. Applying a day out of order continues an adjacent span (merging the

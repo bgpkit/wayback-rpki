@@ -46,6 +46,9 @@ All notable changes to this project will be documented in this file.
 * The per-day reconciliation recomputes an object's `first_seen` along with its current-state marker, so a repair that removes the earliest version but keeps a later one no longer leaves the object pointing at a day no version covers.
 * `ingest_run` has an `error` column: a run that fails before or outside file accounting (an unreadable listing, a database error) is no longer indistinguishable from a successful no-op run.
 
+* A ROA version that gets written records the certificate window its file published: staged rows are aligned to the stored window for the ingest's comparisons (drift within 36 h is not a change and writes no version), but the row written for a repaired or backfilled day keeps that day's own claims instead of the stored ones.
+* An object merge after an adjacent span extension updates the row that actually covers the day, not only a row starting on it.
+
 ### Added
 
 * `wayback-pg`: a second binary that ingests RIPE RPKI observations into PostgreSQL and leaves the v1 trie, HTTP API, and `wayback-rpki` CLI untouched. `update` and `backfill --pg-config` accept `--tal` and `--types roa,aspa` (default: both), each family resuming from its own source-file cursor.
