@@ -44,7 +44,29 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS roa_version_maxlen_idx ON wayback.roa_version (max_len);
 CREATE INDEX IF NOT EXISTS roa_version_span_idx ON wayback.roa_version (first_seen, last_seen);
-CREATE INDEX IF NOT EXISTS roa_version_obj_first_idx ON wayback.roa_version (roa_obj_id, first_seen);
+-- An index on (roa_obj_id, first_seen) used to be created here. It duplicates the
+-- primary key exactly, so on the largest table it was two identical 1+ GB indexes
+-- for one query path; dropped, and dropped here so existing stores converge.
+DROP INDEX IF EXISTS wayback.roa_version_obj_first_idx;
+-- Not part of this schema: created ad hoc on an existing store and superseded by
+-- roa_object_origin_idx, which has the same leading column.
+DROP INDEX IF EXISTS wayback.roa_obj_asn_fs_ls_idx;
+
+-- Churn tuning. The daily ingest rewrites the open span of every object it
+-- touches (24M updates measured across one backfill), and each update writes new
+-- index entries because the rows sit too dense for HOT. At the default
+-- scale_factor of 0.2 autovacuum waits for tens of percent dead tuples, which is
+-- where the measured bloat (leaf density 52-65% against ~90% fresh) came from.
+ALTER TABLE wayback.roa_version SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_threshold = 1000,
+  autovacuum_vacuum_cost_limit = 1000
+);
+ALTER TABLE wayback.roa_object SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_threshold = 1000,
+  autovacuum_vacuum_cost_limit = 1000
+);
 
 -- Completeness ledger: one row per (tal, date, artifact) actually attempted.
 CREATE TABLE IF NOT EXISTS wayback.source_file (
