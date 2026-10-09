@@ -164,16 +164,17 @@ wayback-pg update --pg-config "$PG_CONFIG"
   this PostgreSQL line only — the trie backend ingests the ROA artifact alone.
 - `update` resumes after each TAL's latest observed day recorded in the `source_file`
   ledger. On an empty database the ROA pass stops with an error asking for a
-  `backfill` first, while the ASPA pass starts from the archive's ASPA era
-  (2023-10-11); run `backfill` up front so both families start from an explicit
-  range.
+  `backfill` first — and with the default `--types roa,aspa` the ROA pass runs first,
+  so `update` exits there without reaching the ASPA pass. Start with a `backfill`, or
+  `--types aspa` to walk from the archive's ASPA era (2023-10-11).
 - Runs take a PostgreSQL advisory lock: a second concurrent run exits instead of
   racing, and re-running an already-ingested day is idempotent.
 - Unlisted days: a `backfill` records them in the ledger as `missing` (`gap_class`)
   and continues; an `update` records the day, stops that family's walk for the TAL
   (the resume cursor stays before the gap, so the next run retries it), and the run
-  reports a failing status — during incremental ingest a missing publication is a
-  failure to chase, not a silent gap.
+  reports a failing status. One exception: an ASPA walk that starts at the ASPA era
+  with no observation yet records the pre-observation days as `era_start`, which
+  neither stops the walk nor fails the run.
 - The schema ships read-side views for common queries: `roa_tuple_view` (merged
   observation spans per prefix/origin/max-length), `roa_change_event_view`
   (appeared / maxlen_changed / publication_flap / cert_window_changed),
