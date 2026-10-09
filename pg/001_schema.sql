@@ -25,6 +25,13 @@ CREATE INDEX IF NOT EXISTS roa_object_origin_idx ON wayback.roa_object (origin_a
 -- through the FILTER form it plans a full heap scan of the object layer. These
 -- partial indexes keep it to the live set (index-only count measured at ~0.2 s
 -- against ~1 s on a 13M-row store).
+--
+-- A plain build holds a SHARE lock that conflicts with ingest writes for the
+-- duration of the build. This file assumes it is applied to a quiet store; on a
+-- live one, build these three read-side indexes (roa_version_prev_idx below
+-- included) with CREATE INDEX CONCURRENTLY by hand instead. CONCURRENTLY cannot
+-- run inside a transactional apply and can leave an invalid index behind that
+-- IF NOT EXISTS would then skip, so it does not belong in this file.
 CREATE INDEX IF NOT EXISTS roa_object_open_v4_idx ON wayback.roa_object (last_seen) WHERE last_seen IS NULL AND family(prefix) = 4;
 CREATE INDEX IF NOT EXISTS roa_object_open_v6_idx ON wayback.roa_object (last_seen) WHERE last_seen IS NULL AND family(prefix) = 6;
 
@@ -55,7 +62,8 @@ CREATE INDEX IF NOT EXISTS roa_version_span_idx ON wayback.roa_version (first_se
 -- last_seen) index the planner hash-joins the whole version table for a
 -- week-sized window (~16 s on a 26M-row store); with it the join becomes index
 -- probes (~1.4 s), and the change-event view built on the same shape benefits
--- the same way (~10 s -> ~1 s).
+-- the same way (~10 s -> ~1 s). Build concurrently by hand on a live store
+-- (see the note above roa_object_open_v4_idx).
 CREATE INDEX IF NOT EXISTS roa_version_prev_idx ON wayback.roa_version (roa_obj_id, last_seen);
 -- An index on (roa_obj_id, first_seen) used to be created here. It duplicates the
 -- primary key exactly, so on the largest table it was two identical 1+ GB indexes
