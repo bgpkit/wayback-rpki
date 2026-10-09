@@ -140,6 +140,38 @@ wayback-rpki serve --bootstrap --host 0.0.0.0 --port 40065
 Options: `--host` (default `0.0.0.0`), `--port` (default `40065`), `--backup-to` (additional
 backup destination path or S3 URL).
 
+## PostgreSQL Ingest (`wayback-pg`)
+
+`wayback-pg` maintains the same ROA and ASPA history in PostgreSQL instead of a trie
+file: object-grain rows with SCD-2 spans, so the full archive can be queried in SQL.
+It is an additive binary; the trie commands above are unaffected.
+
+```bash
+# 1. Create the schema. The file is idempotent; re-apply it to pick up schema
+#    updates.
+psql "$PG_CONFIG" -f pg/001_schema.sql
+
+# 2. Load history once (explicit range, both ends inclusive).
+wayback-pg backfill --pg-config "$PG_CONFIG" --from 2015-03-10 --until 2026-09-30
+
+# 3. Then keep it current (through yesterday UTC by default).
+wayback-pg update --pg-config "$PG_CONFIG"
+```
+
+- `backfill` and `update` ingest `roas.csv.xz` (from 2015-03-10) and `output.json.xz`
+  (ASPA, from 2023-10-11); restrict with `--types` and `--tal`.
+- `update` resumes after each TAL's latest observed day recorded in the
+  `source_file` ledger, and stops with an error on an empty database, asking for a
+  `backfill` first.
+- Runs take a PostgreSQL advisory lock: a second concurrent run exits instead of
+  racing, and re-running an already-ingested day is idempotent.
+- Days RIPE does not publish are recorded in the ledger as `missing` (`gap_class`),
+  not as run failures.
+- The schema ships read-side views for common queries: `roa_tuple_view` (merged
+  observation spans per prefix/origin/max-length), `roa_change_event_view`
+  (appeared / maxlen_changed / publication_flap / cert_window_changed),
+  `roa_counts_view` and `aspa_counts_view` (per-TAL/day source counts).
+
 ## API Reference
 
 ### `GET /search`
