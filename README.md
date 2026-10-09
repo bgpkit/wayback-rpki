@@ -140,6 +140,46 @@ wayback-rpki serve --bootstrap --host 0.0.0.0 --port 40065
 Options: `--host` (default `0.0.0.0`), `--port` (default `40065`), `--backup-to` (additional
 backup destination path or S3 URL).
 
+## PostgreSQL Ingest (`wayback-pg`)
+
+`wayback-pg` maintains the full RPKI ROA and ASPA history from RIPE in PostgreSQL as
+object-grain rows with SCD-2 spans, so the archive can be queried in SQL. The trie
+backend above carries ROA history only; ASPA exists on the PostgreSQL side. This
+binary is additive; the trie commands are unaffected.
+
+```bash
+# 1. Create the schema. Both files are idempotent; re-apply them to pick up
+#    schema updates.
+psql "$PG_CONFIG" -f pg/001_schema.sql -f pg/002_aspa.sql
+
+# 2. Load the history once (explicit range, both ends inclusive).
+wayback-pg backfill --pg-config "$PG_CONFIG" --from 2015-03-10 --until 2026-09-30
+
+# 3. Then keep it current (through yesterday UTC by default).
+wayback-pg update --pg-config "$PG_CONFIG"
+```
+
+- `backfill` and `update` ingest `roas.csv.xz` (from 2015-03-10) and `output.json.xz`
+  (ASPA, from 2023-10-11); restrict with `--types` and `--tal`. ASPA is carried by
+  this PostgreSQL line only — the trie backend ingests the ROA artifact alone.
+- `update` resumes after each TAL's latest observed day recorded in the `source_file`
+  ledger. On an empty database the ROA pass stops with an error asking for a
+  `backfill` first — and with the default `--types roa,aspa` the ROA pass runs first,
+  so `update` exits there without reaching the ASPA pass. Start with a `backfill`, or
+  `--types aspa` to walk from the archive's ASPA era (2023-10-11).
+- Runs take a PostgreSQL advisory lock: a second concurrent run exits instead of
+  racing, and re-running an already-ingested day is idempotent.
+- Unlisted days: a `backfill` records them in the ledger as `missing` (`gap_class`)
+  and continues; an `update` records the day, stops that family's walk for the TAL
+  (the resume cursor stays before the gap, so the next run retries it), and the run
+  reports a failing status. One exception: an ASPA walk that starts at the ASPA era
+  with no observation yet records the pre-observation days as `era_start`, which
+  neither stops the walk nor fails the run.
+- The schema ships read-side views for common queries: `roa_tuple_view` (merged
+  observation spans per prefix/origin/max-length), `roa_change_event_view`
+  (appeared / maxlen_changed / publication_flap / cert_window_changed),
+  `roa_counts_view` and `aspa_counts_view` (per-TAL/day source counts).
+
 ## API Reference
 
 ### `GET /search`
