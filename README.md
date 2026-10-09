@@ -142,16 +142,17 @@ backup destination path or S3 URL).
 
 ## PostgreSQL Ingest (`wayback-pg`)
 
-`wayback-pg` maintains the same ROA and ASPA history in PostgreSQL instead of a trie
-file: object-grain rows with SCD-2 spans, so the full archive can be queried in SQL.
-It is an additive binary; the trie commands above are unaffected.
+`wayback-pg` maintains the full RPKI ROA and ASPA history from RIPE in PostgreSQL as
+object-grain rows with SCD-2 spans, so the archive can be queried in SQL. The trie
+backend above carries ROA history only; ASPA exists on the PostgreSQL side. This
+binary is additive; the trie commands are unaffected.
 
 ```bash
 # 1. Create the schema. The file is idempotent; re-apply it to pick up schema
 #    updates.
 psql "$PG_CONFIG" -f pg/001_schema.sql
 
-# 2. Load history once (explicit range, both ends inclusive).
+# 2. Load the history once (explicit range, both ends inclusive).
 wayback-pg backfill --pg-config "$PG_CONFIG" --from 2015-03-10 --until 2026-09-30
 
 # 3. Then keep it current (through yesterday UTC by default).
@@ -159,7 +160,8 @@ wayback-pg update --pg-config "$PG_CONFIG"
 ```
 
 - `backfill` and `update` ingest `roas.csv.xz` (from 2015-03-10) and `output.json.xz`
-  (ASPA, from 2023-10-11); restrict with `--types` and `--tal`.
+  (ASPA, from 2023-10-11); restrict with `--types` and `--tal`. ASPA is carried by
+  this PostgreSQL line only — the trie backend ingests the ROA artifact alone.
 - `update` resumes after each TAL's latest observed day recorded in the
   `source_file` ledger, and stops with an error on an empty database, asking for a
   `backfill` first.
