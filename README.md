@@ -148,9 +148,9 @@ backend above carries ROA history only; ASPA exists on the PostgreSQL side. This
 binary is additive; the trie commands are unaffected.
 
 ```bash
-# 1. Create the schema. The file is idempotent; re-apply it to pick up schema
-#    updates.
-psql "$PG_CONFIG" -f pg/001_schema.sql
+# 1. Create the schema. Both files are idempotent; re-apply them to pick up
+#    schema updates.
+psql "$PG_CONFIG" -f pg/001_schema.sql -f pg/002_aspa.sql
 
 # 2. Load the history once (explicit range, both ends inclusive).
 wayback-pg backfill --pg-config "$PG_CONFIG" --from 2015-03-10 --until 2026-09-30
@@ -162,13 +162,18 @@ wayback-pg update --pg-config "$PG_CONFIG"
 - `backfill` and `update` ingest `roas.csv.xz` (from 2015-03-10) and `output.json.xz`
   (ASPA, from 2023-10-11); restrict with `--types` and `--tal`. ASPA is carried by
   this PostgreSQL line only — the trie backend ingests the ROA artifact alone.
-- `update` resumes after each TAL's latest observed day recorded in the
-  `source_file` ledger, and stops with an error on an empty database, asking for a
-  `backfill` first.
+- `update` resumes after each TAL's latest observed day recorded in the `source_file`
+  ledger. On an empty database the ROA pass stops with an error asking for a
+  `backfill` first, while the ASPA pass starts from the archive's ASPA era
+  (2023-10-11); run `backfill` up front so both families start from an explicit
+  range.
 - Runs take a PostgreSQL advisory lock: a second concurrent run exits instead of
   racing, and re-running an already-ingested day is idempotent.
-- Days RIPE does not publish are recorded in the ledger as `missing` (`gap_class`),
-  not as run failures.
+- Unlisted days: a `backfill` records them in the ledger as `missing` (`gap_class`)
+  and continues; an `update` records the day, stops that family's walk for the TAL
+  (the resume cursor stays before the gap, so the next run retries it), and the run
+  reports a failing status — during incremental ingest a missing publication is a
+  failure to chase, not a silent gap.
 - The schema ships read-side views for common queries: `roa_tuple_view` (merged
   observation spans per prefix/origin/max-length), `roa_change_event_view`
   (appeared / maxlen_changed / publication_flap / cert_window_changed),
