@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+* The container image installs `curl` and declares its own `HEALTHCHECK`
+  against `/health`. The previous probe invoked `curl` in an image that did not
+  contain it, so Docker reported the container unhealthy while the API was
+  serving.
+
 ### Fixed (wayback-pg ingest correctness, from review of #19)
 
 * Applying a day out of order no longer drops the observation: a span that ends the day before is extended, and an absent day in the middle of a span is split so days observed after it keep their own span.
