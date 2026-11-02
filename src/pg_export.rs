@@ -26,36 +26,59 @@ use std::sync::Arc;
 const BATCH_ROWS: usize = 50_000;
 
 const EXPORT_SQL: &str = r#"
-WITH effective AS (
-    SELECT o.prefix AS prefix,
-           o.origin_asn,
-           v.max_len,
-           GREATEST(
-               v.first_seen::timestamp,
-               COALESCE(v.not_before AT TIME ZONE 'UTC', timestamp '1970-01-01')
-           ) AS lo,
-           LEAST(
-               COALESCE(v.last_seen, CURRENT_DATE)::timestamp + interval '1 day',
-               COALESCE(v.not_after AT TIME ZONE 'UTC', timestamp '2100-01-01') + interval '1 microsecond'
-           ) AS hi
-      FROM wayback.roa_object o
-      JOIN wayback.roa_version v ON v.roa_obj_id = o.roa_obj_id
+WITH observed AS (
+    -- The days the archive actually saw a ROA file for a TAL. Version spans
+    -- bridge days that were never fetched, and an export that kept the bridge
+    -- would assert an authorization the archive never measured.
+    SELECT tal, range_agg(daterange(file_date, file_date + 1, '[)')) AS days
+      FROM wayback.source_file
+     WHERE artifact = 'roas.csv.xz' AND gap_class = 'observed'
+     GROUP BY tal
+), version_span AS (
+    SELECT ta, prefix, origin_asn, max_len, lo, hi
+      FROM (
+          SELECT o.ta,
+                 o.prefix,
+                 o.origin_asn,
+                 v.max_len,
+                 GREATEST(
+                     v.first_seen::timestamp,
+                     COALESCE(v.not_before AT TIME ZONE 'UTC', timestamp '1970-01-01')
+                 ) AS lo,
+                 LEAST(
+                     (COALESCE(v.last_seen, (now() AT TIME ZONE 'UTC')::date) + 1)::timestamp,
+                     COALESCE(v.not_after AT TIME ZONE 'UTC', timestamp '2100-01-01')
+                 ) AS hi
+            FROM wayback.roa_object o
+            JOIN wayback.roa_version v ON v.roa_obj_id = o.roa_obj_id
+      ) span
+     WHERE lo < hi
+), cut AS (
+    SELECT s.prefix,
+           s.origin_asn,
+           s.max_len,
+           tsrange(
+               GREATEST(s.lo, lower(d)::timestamp),
+               LEAST(s.hi, upper(d)::timestamp),
+               '[)'
+           ) AS piece
+      FROM version_span s
+      JOIN observed o ON o.tal = s.ta
+      CROSS JOIN LATERAL unnest(o.days) AS d
+     WHERE s.lo < upper(d)::timestamp AND s.hi > lower(d)::timestamp
 ), merged AS (
-    SELECT prefix,
-           origin_asn,
-           max_len,
-           range_agg(tsrange(lo, hi, '[)')) AS spans
-      FROM effective
-     WHERE lo <= hi
+    SELECT prefix, origin_asn, max_len, range_agg(piece) AS spans
+      FROM cut
      GROUP BY 1, 2, 3
 )
 SELECT prefix::text AS prefix,
        origin_asn::bigint AS origin_asn,
        max_len::int AS max_len,
        extract(epoch FROM lower(s))::bigint AS from_ts,
-       extract(epoch FROM upper(s))::bigint AS to_ts
+       -- Upper bounds are exclusive; the table carries the last inclusive second.
+       extract(epoch FROM upper(s))::bigint - 1 AS to_ts
   FROM merged, LATERAL unnest(merged.spans) AS s
- WHERE upper(s) >= (timestamp '1970-01-01' + ($1::bigint) * interval '1 second')
+ WHERE upper(s) > (timestamp '1970-01-01' + ($1::bigint) * interval '1 second')
 "#;
 
 fn schema() -> Arc<Schema> {
@@ -66,6 +89,53 @@ fn schema() -> Arc<Schema> {
         Field::new("from_ts", DataType::Int64, false),
         Field::new("to_ts", DataType::Int64, false),
     ]))
+}
+
+/// A staging file that removes itself on drop unless it is forgotten.
+struct StagedFile {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+
+impl StagedFile {
+    fn as_file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Create a staging file that cannot collide with, or be redirected by, an
+/// existing path.
+fn create_staging_file() -> Result<StagedFile> {
+    let dir = std::env::temp_dir();
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    for attempt in 0..8 {
+        let path = dir.join(format!(
+            "wayback-spans-{}-{nanos}-{attempt}.parquet",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok(StagedFile { path, file }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", path.display()));
+            }
+        }
+    }
+    anyhow::bail!("could not create a staging file in {}", dir.display())
 }
 
 /// Write the interval table to `out`, which may be a local path or an S3 URI.
@@ -83,18 +153,15 @@ pub fn export_spans(pg_config: &str, out: &str, since: Option<NaiveDate>) -> Res
         .context("run span export query")?;
 
     // Parquet writers want `Write + Send`, and oneio hands back `Box<dyn Write>`,
-    // so the artifact is staged locally and copied out afterwards.
-    let staged = std::env::temp_dir().join(format!(
-        "wayback-spans-{}-{}.parquet",
-        std::process::id(),
-        Utc::now().timestamp()
-    ));
-    let file =
-        std::fs::File::create(&staged).with_context(|| format!("create {}", staged.display()))?;
+    // so the artifact is staged locally and copied out afterwards. The staging file
+    // is created exclusively: a predictable name opened with `create` would follow
+    // a planted symlink and truncate whatever it points at.
+    let staged = create_staging_file()?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema(), Some(props)).context("open parquet")?;
+    let mut writer = ArrowWriter::try_new(staged.as_file().try_clone()?, schema(), Some(props))
+        .context("open parquet")?;
 
     let mut batch = Vec::with_capacity(BATCH_ROWS);
     let mut total: u64 = 0;
@@ -122,19 +189,40 @@ pub fn export_spans(pg_config: &str, out: &str, since: Option<NaiveDate>) -> Res
     drop(rows);
     drop(client);
 
-    if out != staged.to_string_lossy() {
-        let mut src = oneio::get_reader(&staged.to_string_lossy())
-            .context("reopen staged parquet for upload")?;
+    let staged_path = staged.path().to_string_lossy().to_string();
+    if staged_path == out {
+        // The caller asked for the staging path itself; nothing to copy.
+        std::mem::forget(staged);
+    } else if out.contains("://") {
+        let mut src = oneio::get_reader(&staged_path).context("reopen staged parquet")?;
         let mut dst = oneio::get_writer(out).with_context(|| format!("open {out}"))?;
         std::io::copy(&mut src, &mut dst).with_context(|| format!("copy to {out}"))?;
-        dst.flush().ok();
-        std::fs::remove_file(&staged).ok();
+        dst.flush().with_context(|| format!("flush {out}"))?;
+    } else {
+        // A local destination is replaced atomically. Opening it directly would
+        // truncate the last good export before the copy finished, so a failed run
+        // would leave a corrupt file where a complete one used to be.
+        let dest = std::path::Path::new(out);
+        let tmp = dest.with_extension(format!("tmp-{}", std::process::id()));
+        {
+            let mut src = oneio::get_reader(&staged_path).context("reopen staged parquet")?;
+            let mut dst =
+                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            std::io::copy(&mut src, &mut dst)
+                .with_context(|| format!("write {}", tmp.display()))?;
+            dst.sync_all()
+                .with_context(|| format!("flush {}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, dest)
+            .with_context(|| format!("rename {} to {}", tmp.display(), dest.display()))?;
     }
 
     tracing::info!(
         rows = total,
         batches = flushed,
-        bytes = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0),
+        bytes = std::fs::metadata(&staged_path)
+            .map(|m| m.len())
+            .unwrap_or(0),
         out,
         "exported ROA effective intervals"
     );
