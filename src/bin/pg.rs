@@ -39,6 +39,25 @@ enum Command {
         #[arg(long, value_delimiter = ',', default_value = "roa,aspa")]
         types: Vec<DataType>,
     },
+    /// Export the ROA effective-interval table as Parquet.
+    ///
+    /// One row per (prefix, origin, max_len, from_ts, to_ts): the intervals during
+    /// which the archive shows that authorization in effect. Consumers use it to
+    /// validate BGP data against the ROA state of a past day without querying
+    /// PostgreSQL per file.
+    ExportSpans {
+        /// PostgreSQL connection configuration.
+        #[arg(long)]
+        pg_config: String,
+
+        /// Destination path: a local file or an S3 URI.
+        #[arg(short, long)]
+        out: String,
+
+        /// Drop intervals that end before this date (YYYY-MM-DD). Defaults to all.
+        #[arg(long)]
+        since: Option<NaiveDate>,
+    },
     /// Backfill an explicit historical range from RIPE FTP into PostgreSQL.
     Backfill {
         /// PostgreSQL connection configuration.
@@ -103,6 +122,11 @@ fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::ExportSpans {
+            pg_config,
+            out,
+            since,
+        } => wayback_rpki::pg_export::export_spans(&pg_config, &out, since),
         Command::Backfill {
             pg_config,
             from,
