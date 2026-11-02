@@ -190,14 +190,19 @@ pub fn export_spans(pg_config: &str, out: &str, since: Option<NaiveDate>) -> Res
     drop(client);
 
     let staged_path = staged.path().to_string_lossy().to_string();
-    if staged_path == out {
-        // The caller asked for the staging path itself; nothing to copy.
-        std::mem::forget(staged);
-    } else if out.contains("://") {
-        let mut src = oneio::get_reader(&staged_path).context("reopen staged parquet")?;
-        let mut dst = oneio::get_writer(out).with_context(|| format!("open {out}"))?;
-        std::io::copy(&mut src, &mut dst).with_context(|| format!("copy to {out}"))?;
-        dst.flush().with_context(|| format!("flush {out}"))?;
+    if let Some((scheme, _)) = out.split_once("://") {
+        // Object stores need oneio's uploader: its `get_writer` only produces a
+        // local file handle, so writing a URI through it silently drops the bytes.
+        match scheme {
+            "s3" | "r2" => {
+                let (bucket, key) =
+                    oneio::s3_url_parse(out).map_err(|e| anyhow::anyhow!("parse {out}: {e}"))?;
+                oneio::s3_env_check().map_err(|e| anyhow::anyhow!("s3 environment: {e}"))?;
+                oneio::s3_upload(&bucket, &key, &staged_path)
+                    .map_err(|e| anyhow::anyhow!("upload to {out}: {e}"))?;
+            }
+            other => anyhow::bail!("unsupported destination scheme {other:?} in {out}"),
+        }
     } else {
         // A local destination is replaced atomically. Opening it directly would
         // truncate the last good export before the copy finished, so a failed run
