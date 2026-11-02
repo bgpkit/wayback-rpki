@@ -23,6 +23,8 @@ path = "src/bin/pg.rs"
 
 anyhow = "1"
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+arrow = "59"
+parquet = "59"
 tikv-jemallocator = "0.6"
 oneio = { version = "0.27", default-features = false, features = ["https", "xz", "gz", "s3"] }
 chrono = "0.4.38"

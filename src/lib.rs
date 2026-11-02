@@ -3,6 +3,7 @@
 pub mod api;
 pub mod legacy;
 pub mod pg_aspa;
+pub mod pg_export;
 pub mod pg_ingest;
 mod roas_trie;
 
