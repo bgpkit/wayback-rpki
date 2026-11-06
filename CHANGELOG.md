@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+* `/validate` now applies RFC 6811 coverage correctly. Only records whose prefix
+  covers the queried prefix and that were published on the requested date count,
+  so a ROA for a sibling or more-specific block no longer makes an unrelated
+  prefix Valid, and a query for a date before a ROA's first publication returns
+  Unknown instead of Invalid. Both the v2 and the legacy v1 backend shared the
+  bug: the trie lookup returns the whole subtree under the shortest covering
+  prefix, and only the Valid branch checked the record's date.
+
 ## v1.2.0 - 2026-11-06
 
 ### Added

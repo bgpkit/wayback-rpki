@@ -299,21 +299,26 @@ impl LegacyRoasTrie {
     }
 
     pub fn validate(&self, prefix: &IpNet, origin: u32, date_ts: i64) -> RpkiValidation {
-        let mut is_valid = RpkiValidation::Unknown;
-        'outer: for matched in self.trie.matches(prefix) {
-            for entry in matched.1.values() {
-                if entry.origin == origin
-                    && entry.max_len >= prefix.prefix_len()
-                    && entry.contains_date(date_ts)
-                {
-                    is_valid = RpkiValidation::Valid;
-                    break 'outer;
+        let mut covered = false;
+        for (record_prefix, entries) in self.trie.matches(prefix) {
+            if !crate::roas_trie::prefix_covers(&record_prefix, prefix) {
+                continue;
+            }
+            for entry in entries.values() {
+                if !entry.contains_date(date_ts) {
+                    continue;
+                }
+                covered = true;
+                if entry.origin == origin && entry.max_len >= prefix.prefix_len() {
+                    return RpkiValidation::Valid;
                 }
             }
-            is_valid = RpkiValidation::Invalid;
         }
-
-        is_valid
+        if covered {
+            RpkiValidation::Invalid
+        } else {
+            RpkiValidation::Unknown
+        }
     }
 
     pub fn lookup_prefix(&self, prefix: &IpNet) -> Vec<RoasLookupEntry> {
@@ -615,5 +620,79 @@ mod tests {
         // No prefix filter → return all entries regardless of exact flag
         let results = trie.search(None, None, None, None, None, true);
         assert_eq!(results.len(), 3);
+    }
+
+    fn build_trie_from(entries: Vec<RoaEntry>) -> LegacyRoasTrie {
+        let mut trie = LegacyRoasTrie::new();
+        trie.process_entries(&entries, true);
+        trie.compress_dates();
+        trie
+    }
+
+    #[test]
+    fn test_validate() {
+        let trie = build_test_trie();
+        let ts = NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let prefix: IpNet = "1.1.1.0/24".parse().unwrap();
+
+        assert_eq!(trie.validate(&prefix, 13335, ts), RpkiValidation::Valid);
+        assert_eq!(trie.validate(&prefix, 64512, ts), RpkiValidation::Invalid);
+        let unknown: IpNet = "9.9.9.0/24".parse().unwrap();
+        assert_eq!(trie.validate(&unknown, 13335, ts), RpkiValidation::Unknown);
+    }
+
+    /// A ROA for a more-specific block does not cover its siblings.
+    #[test]
+    fn validate_ignores_more_specific_roa_outside_query_prefix() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+        let ts = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let trie = build_trie_from(vec![
+            make_entry("163.177.0.0/16", 17816, 16, date),
+            make_entry("163.177.84.0/24", 135061, 24, date),
+        ]);
+        let prefix: IpNet = "163.177.91.0/24".parse().unwrap();
+
+        assert_eq!(trie.validate(&prefix, 135061, ts), RpkiValidation::Invalid);
+    }
+
+    /// Before a ROA's first publication date the route is Unknown, not Invalid.
+    #[test]
+    fn validate_before_first_roa_date_is_unknown() {
+        let roa_date = NaiveDate::from_ymd_opt(2026, 5, 9).unwrap();
+        let roa_ts = roa_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let before_ts = NaiveDate::from_ymd_opt(2026, 5, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let trie = build_trie_from(vec![make_entry("2.27.171.0/24", 402425, 24, roa_date)]);
+        let prefix: IpNet = "2.27.171.0/24".parse().unwrap();
+
+        assert_eq!(
+            trie.validate(&prefix, 402425, before_ts),
+            RpkiValidation::Unknown
+        );
+        assert_eq!(
+            trie.validate(&prefix, 402425, roa_ts),
+            RpkiValidation::Valid
+        );
+    }
+
+    /// Covered by a ROA whose maxLength is shorter than the queried prefix
+    /// length: RFC 6811 Invalid, even when the origin matches.
+    #[test]
+    fn validate_covered_with_short_max_len_is_invalid() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+        let ts = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let trie = build_trie_from(vec![make_entry("163.177.88.0/22", 135061, 22, date)]);
+        let prefix: IpNet = "163.177.91.0/24".parse().unwrap();
+
+        assert_eq!(trie.validate(&prefix, 135061, ts), RpkiValidation::Invalid);
     }
 }

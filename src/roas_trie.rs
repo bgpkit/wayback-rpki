@@ -618,21 +618,35 @@ impl RoasTrie {
     }
 
     /// RPKI validation for a prefix/origin at a given date.
+    ///
+    /// RFC 6811: Valid when a published ROA covers the prefix, its maxLength
+    /// admits the prefix length, and its origin matches; Invalid when the prefix
+    /// is covered by a published ROA but none matches; Unknown when no published
+    /// ROA covers it. `match_records` returns the whole subtree under the
+    /// shortest covering prefix, so records that do not cover the query prefix
+    /// (siblings and more-specifics) must be skipped, and only records published
+    /// on `date_ts` may count as coverage.
     pub fn validate(&self, prefix: &IpNet, origin: u32, date_ts: i64) -> RpkiValidation {
-        let mut result = RpkiValidation::Unknown;
-        let prefix_len = prefix.prefix_len();
-        for (_p, records) in self.match_records(prefix) {
+        let mut covered = false;
+        for (record_prefix, records) in self.match_records(prefix) {
+            if !prefix_covers(&record_prefix, prefix) {
+                continue;
+            }
             for r in records.iter() {
-                let r_origin = r.origin.to_native();
-                let r_max_len = r.max_len;
-                if r_origin == origin && r_max_len >= prefix_len && record_contains_date(r, date_ts)
-                {
+                if !record_contains_date(r, date_ts) {
+                    continue;
+                }
+                covered = true;
+                if r.origin.to_native() == origin && r.max_len >= prefix.prefix_len() {
                     return RpkiValidation::Valid;
                 }
             }
-            result = RpkiValidation::Invalid;
         }
-        result
+        if covered {
+            RpkiValidation::Invalid
+        } else {
+            RpkiValidation::Unknown
+        }
     }
 
     /// All ROA records matching a prefix, including supernets and subnets.
@@ -745,6 +759,19 @@ fn record_contains_date(r: &ArchivedRoaRecord, date_ts: i64) -> bool {
         let end = range.1.to_native();
         date_ts >= start && date_ts <= end
     })
+}
+
+/// True when `record` is a supernet of, or equal to, `query`. Coverage is
+/// directional: a /24 ROA for one block says nothing about a sibling block.
+pub(crate) fn prefix_covers(record: &IpNet, query: &IpNet) -> bool {
+    if record.prefix_len() > query.prefix_len() {
+        return false;
+    }
+    match (record, query) {
+        (IpNet::V4(record), IpNet::V4(query)) => record.contains(&query.network()),
+        (IpNet::V6(record), IpNet::V6(query)) => record.contains(&query.network()),
+        _ => false,
+    }
 }
 
 fn archived_lookup_entry(prefix: IpNet, r: &ArchivedRoaRecord) -> RoasLookupEntry {
@@ -1000,6 +1027,72 @@ mod tests {
 
         let unknown: IpNet = "9.9.9.0/24".parse().unwrap();
         assert_eq!(trie.validate(&unknown, 13335, ts), RpkiValidation::Unknown);
+    }
+
+    fn build_trie_from(entries: Vec<RoaEntry>, name: &str) -> RoasTrie {
+        let mut trie = RoasTrieMut::new();
+        trie.process_entries(&entries, true);
+        let tmp = std::env::temp_dir().join(format!(
+            "wayback-rpki-test-{}-{}.rkyv",
+            name,
+            std::process::id()
+        ));
+        trie.dump(tmp.to_str().unwrap()).unwrap();
+        let t = RoasTrie::open(tmp.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        t
+    }
+
+    /// A ROA for a more-specific block does not cover its siblings: 135061's
+    /// /24 ROA for 163.177.84.0/24 says nothing about 163.177.91.0/24.
+    #[test]
+    fn validate_ignores_more_specific_roa_outside_query_prefix() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+        let entries = vec![
+            make_entry("163.177.0.0/16", 17816, 16, date),
+            make_entry("163.177.84.0/24", 135061, 24, date),
+        ];
+        let trie = build_trie_from(entries, concat!("t", line!()));
+        let prefix: IpNet = "163.177.91.0/24".parse().unwrap();
+
+        assert_eq!(
+            trie.validate(&prefix, 135061, date_to_ts(date)),
+            RpkiValidation::Invalid
+        );
+    }
+
+    /// Before a ROA's first publication date the route is Unknown, not Invalid.
+    #[test]
+    fn validate_before_first_roa_date_is_unknown() {
+        let roa_date = NaiveDate::from_ymd_opt(2026, 5, 9).unwrap();
+        let entries = vec![make_entry("2.27.171.0/24", 402425, 24, roa_date)];
+        let trie = build_trie_from(entries, concat!("t", line!()));
+        let prefix: IpNet = "2.27.171.0/24".parse().unwrap();
+        let before = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+
+        assert_eq!(
+            trie.validate(&prefix, 402425, date_to_ts(before)),
+            RpkiValidation::Unknown
+        );
+        assert_eq!(
+            trie.validate(&prefix, 402425, date_to_ts(roa_date)),
+            RpkiValidation::Valid
+        );
+    }
+
+    /// Covered by a ROA whose maxLength is shorter than the queried prefix
+    /// length: RFC 6811 Invalid, even when the origin matches.
+    #[test]
+    fn validate_covered_with_short_max_len_is_invalid() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+        let entries = vec![make_entry("163.177.88.0/22", 135061, 22, date)];
+        let trie = build_trie_from(entries, concat!("t", line!()));
+        let prefix: IpNet = "163.177.91.0/24".parse().unwrap();
+
+        assert_eq!(
+            trie.validate(&prefix, 135061, date_to_ts(date)),
+            RpkiValidation::Invalid
+        );
     }
 
     #[test]
