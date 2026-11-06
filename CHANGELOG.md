@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## v1.2.0 - 2026-11-06
+
 ### Added
 
 * `wayback-pg export-spans` writes the ROA effective-interval table as Parquet: one row per (prefix, origin, max_len, from_ts, to_ts) interval during which the archive shows an authorization in effect, with the certificate window intersected with the observation span and versions merged in SQL. A consumer loads it once and validates BGP data against the ROA state of a past day without querying PostgreSQL per file.
