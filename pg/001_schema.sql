@@ -20,6 +20,11 @@ CREATE TABLE IF NOT EXISTS wayback.roa_object (
   UNIQUE (ta, uri, prefix, origin_asn)
 );
 CREATE INDEX IF NOT EXISTS roa_object_prefix_idx ON wayback.roa_object USING gist (prefix inet_ops);
+-- Equality on (prefix, origin_asn) is what /v4/rpki/roas/history and the object-profile ROA section
+-- ask. The GiST index above answers containment but not this shape cheaply: 1,406 buffers / 44 ms
+-- for one /24, against 8 buffers / 0.6 ms through a btree exact match. Applied to the live primary
+-- 2026-11-14 with CREATE INDEX CONCURRENTLY; recorded in infrastructure/scripts/trove-indexes.sql.
+CREATE INDEX IF NOT EXISTS roa_object_prefix_asn_idx ON wayback.roa_object (prefix, origin_asn);
 CREATE INDEX IF NOT EXISTS roa_object_origin_idx ON wayback.roa_object (origin_asn, last_seen);
 -- Counting currently-open objects per address family is a health-shape query.
 -- These partial indexes serve the pair form, one count per family:
