@@ -94,6 +94,28 @@ pub struct Manifest {
     pub source: Source,
     /// Every object the writer has published, oldest first.
     pub objects: Vec<Published>,
+    /// The pre-2.0 JSONL transport this writer last published, when it publishes one.
+    ///
+    /// Recorded so a later run can tell whether the key still holds what this pipeline
+    /// wrote: the file is also written by other tooling, and a silent replacement would
+    /// otherwise be indistinguishable from our own upload.
+    #[serde(default)]
+    pub legacy_jsonl: Option<LegacyJsonl>,
+}
+
+/// What the pre-2.0 transport contained when this pipeline wrote it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyJsonl {
+    /// Object key, without the bucket.
+    pub key: String,
+    /// sha256 of the gzipped file as uploaded.
+    pub sha256: String,
+    /// Rows written.
+    pub rows: u64,
+    /// Bytes as uploaded.
+    pub bytes: u64,
+    /// When the upload finished, unix seconds.
+    pub written_at: i64,
 }
 
 /// Provenance of the source table.
@@ -800,6 +822,7 @@ mod tests {
             generated_at: at(3),
             source: Source::default(),
             objects,
+            legacy_jsonl: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let (url, id) = newest_object_url(&json, "https://example.test/").unwrap();
@@ -813,9 +836,37 @@ mod tests {
             generated_at: 0,
             source: Source::default(),
             objects: Vec::new(),
+            legacy_jsonl: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(newest_object_url(&json, "https://example.test/").is_err());
+    }
+
+    #[test]
+    fn the_manifest_records_what_the_transport_contained() {
+        let legacy = LegacyJsonl {
+            key: "broker/roas_trie.jsonl.gz".to_string(),
+            sha256: "a".repeat(64),
+            rows: 11,
+            bytes: 22,
+            written_at: 33,
+        };
+        let manifest = Manifest {
+            generated_at: 0,
+            source: Source::default(),
+            objects: Vec::new(),
+            legacy_jsonl: Some(legacy.clone()),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let back: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.legacy_jsonl, Some(legacy));
+
+        // a manifest written before this field existed still parses
+        let old: Manifest = serde_json::from_str(
+            r#"{"generated_at":0,"source":{"parquet_sha256":"","parquet_bytes":0},"objects":[]}"#,
+        )
+        .unwrap();
+        assert!(old.legacy_jsonl.is_none());
     }
 
     #[test]

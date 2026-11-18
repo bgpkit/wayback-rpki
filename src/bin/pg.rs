@@ -245,7 +245,7 @@ fn snap_build(
     keep_daily: usize,
     legacy_jsonl: Option<&str>,
 ) -> anyhow::Result<()> {
-    use wayback_rpki::snap_export::{self, Decision, Manifest, Published, Target};
+    use wayback_rpki::snap_export::{self, Decision, LegacyJsonl, Manifest, Published, Target};
 
     // oneio reads local paths and s3:// URIs alike, so an object can be built straight from
     // the bucket that already holds the export
@@ -335,6 +335,8 @@ fn snap_build(
     snap_export::upload(&target, &key, &built.bytes)?;
     println!("uploaded s3://{}/{key}", target.bucket);
 
+    let mut legacy_record: Option<(LegacyJsonl, String)> = None;
+
     // the pre-2.0 transport, from the same rows: old binaries cannot read the object, and a
     // second, independent export would drift from it eventually
     if let Some(uri) = legacy_jsonl {
@@ -350,9 +352,31 @@ fn snap_build(
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         ));
+        // another job writes this key too, so establish what is there before replacing it:
+        // a sha that differs from the one recorded in the manifest means our file did not
+        // survive the interval since the last run
+        if let Some(previous) = manifest.legacy_jsonl.clone() {
+            let probe = temp.with_extension("probe.gz");
+            match oneio::download(uri, probe.to_str().unwrap()) {
+                Ok(()) => {
+                    let found = snap_export::file_sha256(&probe)?;
+                    if found != previous.sha256 {
+                        println!(
+                            "note: {uri} holds content this pipeline did not write (recorded {}, found {}); republishing",
+                            &previous.sha256[..12.min(previous.sha256.len())],
+                            &found[..12.min(found.len())]
+                        );
+                    }
+                }
+                Err(error) => println!("note: could not read {uri} to check it: {error}"),
+            }
+            let _ = std::fs::remove_file(&probe);
+        }
+
         let (by_prefix, _) = snap_export::group_parquet(&local)?;
         let lines = snap_export::write_jsonl(&by_prefix, temp.to_str().unwrap())?;
         let bytes = std::fs::metadata(&temp)?.len();
+        let sha = snap_export::file_sha256(&temp)?;
         oneio::s3_upload(&bucket, &key, temp.to_str().unwrap())
             .map_err(|e| anyhow::anyhow!("uploading {uri}: {e}"))?;
         let _ = std::fs::remove_file(&temp);
@@ -361,6 +385,16 @@ fn snap_build(
             anyhow::bail!("{uri} does not exist after the upload");
         }
         println!("uploaded {uri} ({lines} rows, {bytes} bytes)");
+        legacy_record = Some((
+            LegacyJsonl {
+                key: key.clone(),
+                sha256: sha,
+                rows: lines,
+                bytes,
+                written_at: chrono::Utc::now().timestamp(),
+            },
+            uri.to_string(),
+        ));
     }
 
     // content addressed: publishing the same bytes again is a no-op on the object, so it is
@@ -388,6 +422,28 @@ fn snap_build(
             index += 1;
             keep
         });
+    }
+
+    if let Some((record, uri)) = legacy_record {
+        // a different sha than the one we recorded last time means something else wrote
+        // this key between runs; say so instead of pretending our file is still there
+        if let Some(previous) = manifest.legacy_jsonl.as_ref() {
+            if previous.sha256 != record.sha256 {
+                let actual = oneio::exists(&uri).unwrap_or(false);
+                println!(
+                    "note: {uri} was replaced since the last publish (recorded sha {}, now {}); \
+                     republished ours{}",
+                    &previous.sha256[..12.min(previous.sha256.len())],
+                    &record.sha256[..12.min(record.sha256.len())],
+                    if actual {
+                        ""
+                    } else {
+                        ", and the key was missing"
+                    }
+                );
+            }
+        }
+        manifest.legacy_jsonl = Some(record);
     }
 
     manifest.source = snap_export::Source {
