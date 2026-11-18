@@ -26,7 +26,7 @@ postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 arrow = "59"
 parquet = "59"
 tikv-jemallocator = "0.6"
-oneio = { version = "0.27", default-features = false, features = ["https", "xz", "gz", "s3"] }
+oneio = { version = "0.27", default-features = false, features = ["https", "xz", "gz", "s3", "digest"] }
 chrono = "0.4.38"
 dotenvy = "0.15"
 indicatif = "0.18.0"
@@ -39,6 +39,8 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3.3"
 prefix-trie = { version = "0.10", features = ["ipnet", "rkyv"] }
+# the published ROA history is a snap object, derived from the daily spans export
+bgpkit-snap = { version = "0.2", features = ["derive"] }
 rkyv = "0.8"
 memmap2 = "0.9"
 

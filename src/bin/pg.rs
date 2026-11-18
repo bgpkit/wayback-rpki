@@ -58,6 +58,28 @@ enum Command {
         #[arg(long)]
         since: Option<NaiveDate>,
     },
+    /// Build a `bgpkit-snap` object from the spans Parquet and publish it.
+    ///
+    /// The object is a pure function of the table `export-spans` already writes, so this
+    /// never reads PostgreSQL. Publication order is: verify, upload the object, then
+    /// rewrite the manifest, which is the only mutable key.
+    SnapBuild {
+        /// The spans Parquet, local path or S3 URI.
+        #[arg(long)]
+        spans: String,
+
+        /// Where published objects live, e.g. s3://spaces/broker/snap/.
+        #[arg(short, long)]
+        publish: String,
+
+        /// Publish even when the guards fire (a deliberate rebuild).
+        #[arg(long)]
+        force: bool,
+
+        /// Build and verify, but do not upload anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Backfill an explicit historical range from RIPE FTP into PostgreSQL.
     Backfill {
         /// PostgreSQL connection configuration.
@@ -127,6 +149,12 @@ fn run() -> anyhow::Result<()> {
             out,
             since,
         } => wayback_rpki::pg_export::export_spans(&pg_config, &out, since),
+        Command::SnapBuild {
+            spans,
+            publish,
+            force,
+            dry_run,
+        } => snap_build(&spans, &publish, force, dry_run),
         Command::Backfill {
             pg_config,
             from,
@@ -168,4 +196,111 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Build the snap object from the spans table and publish it, in that order.
+fn snap_build(spans: &str, publish: &str, force: bool, dry_run: bool) -> anyhow::Result<()> {
+    use wayback_rpki::snap_export::{self, Decision, Manifest, Published, Target};
+
+    // oneio reads local paths and s3:// URIs alike, so an object can be built straight from
+    // the bucket that already holds the export
+    let local = if spans.starts_with("s3://") {
+        let temp = std::env::temp_dir().join(format!(
+            "wayback-spans-{}-{}.parquet",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        oneio::download(spans, temp.to_str().unwrap())
+            .map_err(|e| anyhow::anyhow!("downloading {spans}: {e}"))?;
+        temp
+    } else {
+        std::path::PathBuf::from(spans)
+    };
+
+    let source_sha = snap_export::file_sha256(&local)?;
+    let parquet_bytes = std::fs::metadata(&local)?.len();
+
+    let target = Target::parse(publish)?;
+    let manifest_url = target.manifest_url();
+    let mut manifest: Manifest = snap_export::read_manifest(&manifest_url)?;
+    let previous = manifest.latest().cloned();
+
+    let built = snap_export::build_from_parquet(&local)?;
+    // the guards decide whether this build replaces what the manifest names
+    match snap_export::decide(
+        previous.as_ref(),
+        &source_sha,
+        built.entries,
+        built.window,
+        force,
+    ) {
+        Decision::SkipUnchanged => {
+            println!("source unchanged (sha256 {source_sha}), nothing to publish");
+            if local != std::path::Path::new(spans) {
+                let _ = std::fs::remove_file(&local);
+            }
+            return Ok(());
+        }
+        Decision::Refuse(message) => {
+            anyhow::bail!("refusing to publish: {message}");
+        }
+        Decision::Publish => {}
+    }
+
+    let key = target.object_key(&built.content_id);
+    let published = Published {
+        key: key.clone(),
+        content_id: built.content_id.clone(),
+        type_id: "bgpkit.roa-set:v1".to_string(),
+        bytes: built.bytes.len() as u64,
+        entries: built.entries,
+        v4_entries: built.v4_entries,
+        v6_entries: built.v6_entries,
+        records: built.records,
+        window: built.window,
+        built_at: chrono::Utc::now().timestamp(),
+        source_sha256: source_sha.clone(),
+    };
+
+    println!(
+        "{} entries (v4 {}, v6 {}), {} records, window {}..{}, {} bytes, content id {}",
+        built.entries,
+        built.v4_entries,
+        built.v6_entries,
+        built.records,
+        built.window.0,
+        built.window.1,
+        built.bytes.len(),
+        built.content_id
+    );
+
+    if dry_run {
+        println!("dry run, not uploading s3://{}/{key}", target.bucket);
+        if local != std::path::Path::new(spans) {
+            let _ = std::fs::remove_file(&local);
+        }
+        return Ok(());
+    }
+
+    // verify, upload the object, then move the manifest: any failure leaves the previous
+    // object and manifest in place, and an orphan object is harmless because it is
+    // content addressed
+    snap_export::upload(&target, &key, &built.bytes)?;
+    println!("uploaded s3://{}/{key}", target.bucket);
+
+    manifest.objects.push(published);
+    manifest.source = snap_export::Source {
+        parquet_sha256: source_sha,
+        parquet_bytes,
+    };
+    manifest.generated_at = chrono::Utc::now().timestamp();
+    snap_export::write_manifest(&target, &manifest)?;
+    println!("manifest updated at {manifest_url}");
+
+    if local != std::path::Path::new(spans) {
+        let _ = std::fs::remove_file(&local);
+    }
+    Ok(())
 }

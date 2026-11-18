@@ -5,7 +5,8 @@ pub mod legacy;
 pub mod pg_aspa;
 pub mod pg_export;
 pub mod pg_ingest;
-mod roas_trie;
+pub mod roas_trie;
+pub mod snap_export;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, NaiveDate};
