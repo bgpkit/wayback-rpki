@@ -1,0 +1,25 @@
+# Publishes the ROA history as a bgpkit-snap object.
+#
+# The environment file holds WAYBACK_SPANS, WAYBACK_PUBLISH_URI, the optional
+# WAYBACK_LEGACY_JSONL and WAYBACK_SNAP_HEARTBEAT_URL, plus whatever the S3 client needs to
+# reach the bucket. Nothing site-specific belongs in this unit.
+[Unit]
+Description=Publish the ROA history as a snap object
+After=network-online.target
+Wants=network-online.target
+# Order this after the unit that writes the spans export, for example:
+# After=wayback-spans.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/lib/wayback
+EnvironmentFile=/etc/wayback/wayback.env
+# The build reads a table of roughly 20 MB and writes an object of a few hundred MB: keep it
+# out of the way of anything else on the host.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# A full build plus upload, with room for a slow bucket. A kill at this timeout costs the
+# whole pass; the previous object keeps serving.
+TimeoutStartSec=1800
+ExecStart=/usr/local/sbin/wayback-snap-publish.sh

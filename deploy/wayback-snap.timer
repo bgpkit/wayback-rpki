@@ -1,0 +1,14 @@
+# Runs the publish once a day, after the ingest and the spans export.
+[Unit]
+Description=Daily snap publish
+
+[Timer]
+# Pick a time after the export that feeds it. Persistent means a missed run happens at the
+# next boot instead of being skipped silently.
+OnCalendar=*-*-* 09:00:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+Unit=wayback-snap.service
+
+[Install]
+WantedBy=timers.target

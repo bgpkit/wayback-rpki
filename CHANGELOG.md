@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+* `deploy/` holds what a host needs to run the publish on a schedule: the script, a oneshot
+  unit, and a daily timer. They carry no host, bucket, or credential; the paths, the publish
+  URI, the optional legacy transport key, and the optional heartbeat URL all come from the
+  environment file the unit loads.
+* The manifest records the legacy JSONL transport it published (key, sha256, rows, bytes,
+  written at), and the next publish downloads the key first and says so when it no longer
+  holds what this pipeline wrote. The key is also written by other tooling, so a silent
+  replacement would otherwise be indistinguishable from our own upload.
+
 ## v2.0.0-rc.2 - 2026-11-18
 
 ### Added

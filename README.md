@@ -296,7 +296,9 @@ server on it. `current=true` is answered from the coverage window the object dec
 object built without a window is refused at open rather than answered with a guessed date.
 
 Retention keeps the newest `--keep-daily` objects (default 30) plus the last object of each
-UTC month, and deletes only keys the manifest no longer names. `wayback-snap.timer` runs the
+UTC month, and deletes only keys the manifest no longer names. `deploy/` holds the unit, the
+timer, and the publish script a host installs to run this on a schedule; every site-specific
+value in them comes from an environment file. `wayback-snap.timer` runs the
 publish daily at 09:00 UTC, after `wayback-update` (07:30) and `wayback-spans` (about 08:30).
 Rollback is stopping the timer: no serving path reads these objects.
 
