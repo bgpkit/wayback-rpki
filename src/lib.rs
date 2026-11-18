@@ -6,6 +6,7 @@ pub mod pg_aspa;
 pub mod pg_export;
 pub mod pg_ingest;
 pub mod roas_trie;
+pub mod snap_backend;
 pub mod snap_export;
 
 use anyhow::{anyhow, Context, Result};

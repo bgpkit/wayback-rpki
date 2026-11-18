@@ -146,6 +146,11 @@ fn is_rkyv_path(path: &str) -> bool {
     path.ends_with(".rkyv")
 }
 
+/// A published `bgpkit-snap` object. It is immutable, so serving one is read-only.
+fn is_snap_path(path: &str) -> bool {
+    path.ends_with(".snap")
+}
+
 /// Find a sibling legacy bin file for a given rkyv path.
 /// e.g. `roas_trie.rkyv` → check `roas_trie.bin.gz`, then `roas_trie.bin`
 fn find_sibling_bin(rkyv_path: &str) -> Option<String> {
@@ -426,10 +431,23 @@ fn main() {
                 info!("backup heartbeat will be sent to {}", backup_heartbeat_url);
             }
 
-            check_bootstrap_and_download(&path, opts.bootstrap);
-            ensure_data_available(&path);
+            let serving_snap = is_snap_path(&path);
+            if serving_snap {
+                // a snap object is immutable and addressed by content id: there is nothing to
+                // download over it and nothing to update in place
+                info!(
+                    "serving a published snap object (read-only, fixed coverage window): {}",
+                    path
+                );
+            } else {
+                check_bootstrap_and_download(&path, opts.bootstrap);
+                ensure_data_available(&path);
+            }
 
-            let backend = if is_rkyv_path(&path) {
+            let backend = if serving_snap {
+                info!("opening v3 snap object (mmap mode): {}", path);
+                TrieBackend::V3(wayback_rpki::snap_backend::SnapBackend::open(&path).unwrap())
+            } else if is_rkyv_path(&path) {
                 info!("opening v2 rkyv archive (mmap mode): {}", path);
                 TrieBackend::V2(RoasTrie::open(&path).unwrap())
             } else {
@@ -440,100 +458,106 @@ fn main() {
             let timer_lock = trie_lock.clone();
             let serve_path = path.clone();
 
-            thread::spawn(move || {
-                let rt = get_tokio_runtime();
-                rt.block_on(async {
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(update_interval));
-                    loop {
-                        interval.tick().await;
+            if serving_snap {
+                info!("a v3 object does not change; restart the server to serve the next object");
+            } else {
+                thread::spawn(move || {
+                    let rt = get_tokio_runtime();
+                    rt.block_on(async {
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_secs(update_interval));
+                        loop {
+                            interval.tick().await;
 
-                        info!("updating trie from latest data...");
-                        let rkyv_path = serve_path.clone();
-                        let is_rkyv = is_rkyv_path(&rkyv_path);
+                            info!("updating trie from latest data...");
+                            let rkyv_path = serve_path.clone();
+                            let is_rkyv = is_rkyv_path(&rkyv_path);
 
-                        let update_result = if is_rkyv {
-                            RoasTrieMut::load(&rkyv_path)
-                                .map_err(|e| e.to_string())
-                                .and_then(|mut t| {
-                                    t.update(None, None).map_err(|e| e.to_string())?;
-                                    t.fill_gaps();
-                                    t.dump(&rkyv_path).map_err(|e| e.to_string())?;
-                                    Ok(())
-                                })
-                        } else {
-                            wayback_rpki::legacy::LegacyRoasTrie::load(&rkyv_path)
-                                .map_err(|e| e.to_string())
-                                .and_then(|mut t| {
-                                    t.update(None, None).map_err(|e| e.to_string())?;
-                                    t.fill_gaps();
-                                    t.dump(&rkyv_path).map_err(|e| e.to_string())?;
-                                    Ok(())
-                                })
-                        };
+                            let update_result = if is_rkyv {
+                                RoasTrieMut::load(&rkyv_path)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|mut t| {
+                                        t.update(None, None).map_err(|e| e.to_string())?;
+                                        t.fill_gaps();
+                                        t.dump(&rkyv_path).map_err(|e| e.to_string())?;
+                                        Ok(())
+                                    })
+                            } else {
+                                wayback_rpki::legacy::LegacyRoasTrie::load(&rkyv_path)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|mut t| {
+                                        t.update(None, None).map_err(|e| e.to_string())?;
+                                        t.fill_gaps();
+                                        t.dump(&rkyv_path).map_err(|e| e.to_string())?;
+                                        Ok(())
+                                    })
+                            };
 
-                        if let Err(e) = update_result {
-                            error!("trie update failed: {}", e);
-                            continue;
-                        }
-                        info!("updated trie written to disk: {}", rkyv_path);
+                            if let Err(e) = update_result {
+                                error!("trie update failed: {}", e);
+                                continue;
+                            }
+                            info!("updated trie written to disk: {}", rkyv_path);
 
-                        let mut to_send_heartbeat = false;
-                        for backup_to in &backup_destinations {
-                            if let Some(backup_to) = backup_to.as_ref() {
-                                info!("writing additional backup trie to {}...", backup_to);
-                                match backup_archive(&rkyv_path, backup_to) {
-                                    Ok(()) => {
-                                        info!("backup trie written to {}", backup_to);
-                                        to_send_heartbeat = true;
+                            let mut to_send_heartbeat = false;
+                            for backup_to in &backup_destinations {
+                                if let Some(backup_to) = backup_to.as_ref() {
+                                    info!("writing additional backup trie to {}...", backup_to);
+                                    match backup_archive(&rkyv_path, backup_to) {
+                                        Ok(()) => {
+                                            info!("backup trie written to {}", backup_to);
+                                            to_send_heartbeat = true;
+                                        }
+                                        Err(e) => error!(
+                                            "failed to write backup trie to {}: {}",
+                                            backup_to, e
+                                        ),
                                     }
-                                    Err(e) => error!(
-                                        "failed to write backup trie to {}: {}",
-                                        backup_to, e
-                                    ),
                                 }
                             }
-                        }
 
-                        if to_send_heartbeat {
-                            if let Some(backup_heartbeat_url) = backup_heartbeat_url.as_ref() {
-                                info!("sending heartbeat to {}", backup_heartbeat_url);
-                                if let Err(e) = oneio::read_to_string_lossy(backup_heartbeat_url) {
-                                    error!("failed to send heartbeat: {}", e);
+                            if to_send_heartbeat {
+                                if let Some(backup_heartbeat_url) = backup_heartbeat_url.as_ref() {
+                                    info!("sending heartbeat to {}", backup_heartbeat_url);
+                                    if let Err(e) =
+                                        oneio::read_to_string_lossy(backup_heartbeat_url)
+                                    {
+                                        error!("failed to send heartbeat: {}", e);
+                                    }
                                 }
                             }
-                        }
 
-                        // Swap in the updated archive: re-open and replace.
-                        info!("swapping serving trie to updated archive...");
-                        let new_backend = if is_rkyv {
-                            match RoasTrie::open(&rkyv_path) {
-                                Ok(t) => Some(TrieBackend::V2(t)),
-                                Err(e) => {
-                                    error!("failed to re-open updated trie: {}", e);
-                                    None
+                            // Swap in the updated archive: re-open and replace.
+                            info!("swapping serving trie to updated archive...");
+                            let new_backend = if is_rkyv {
+                                match RoasTrie::open(&rkyv_path) {
+                                    Ok(t) => Some(TrieBackend::V2(t)),
+                                    Err(e) => {
+                                        error!("failed to re-open updated trie: {}", e);
+                                        None
+                                    }
                                 }
-                            }
-                        } else {
-                            match wayback_rpki::legacy::LegacyRoasTrie::load(&rkyv_path) {
-                                Ok(t) => Some(TrieBackend::V1(t)),
-                                Err(e) => {
-                                    error!("failed to re-load legacy trie: {}", e);
-                                    None
+                            } else {
+                                match wayback_rpki::legacy::LegacyRoasTrie::load(&rkyv_path) {
+                                    Ok(t) => Some(TrieBackend::V1(t)),
+                                    Err(e) => {
+                                        error!("failed to re-load legacy trie: {}", e);
+                                        None
+                                    }
                                 }
+                            };
+                            if let Some(b) = new_backend {
+                                let mut write_lock = timer_lock.write().await;
+                                *write_lock = b;
+                                drop(write_lock);
+                                info!("serving trie swapped");
                             }
-                        };
-                        if let Some(b) = new_backend {
-                            let mut write_lock = timer_lock.write().await;
-                            *write_lock = b;
-                            drop(write_lock);
-                            info!("serving trie swapped");
-                        }
 
-                        info!("wait for {} seconds before next update", update_interval);
-                    }
+                            info!("wait for {} seconds before next update", update_interval);
+                        }
+                    });
                 });
-            });
+            }
 
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(num_threads())

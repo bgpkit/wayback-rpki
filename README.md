@@ -223,6 +223,24 @@ a coverage window that moved backwards. Both of the latter are the shape of a br
 and the previous object should keep serving. `--force` publishes anyway, for a deliberate
 rebuild.
 
+### Serving from a published object
+
+`serve` accepts a published object in place of a trie archive:
+
+```bash
+wayback-rpki /var/lib/wayback/roas.snap serve --port 40065
+```
+
+The path decides the backend: `.snap` is a v3 object, `.rkyv` is the v2 trie, anything else
+is the v1 legacy archive. The query surface is the same on all three, and
+`tests/snap_backend_equivalence.rs` holds the answers equal for every query shape the API
+exposes, including the "subtree of the shortest covering prefix" rule and the expired filter.
+
+What is different about serving a v3 object: there is no updater. An object is immutable and
+addressed by content id, so a refresh means publishing the next object and restarting the
+server on it. `current=true` is answered from the coverage window the object declares, so an
+object built without a window is refused at open rather than answered with a guessed date.
+
 Retention keeps the newest `--keep-daily` objects (default 30) plus the last object of each
 UTC month, and deletes only keys the manifest no longer names. `wayback-snap.timer` runs the
 publish daily at 09:00 UTC, after `wayback-update` (07:30) and `wayback-spans` (about 08:30).

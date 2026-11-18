@@ -15,9 +15,12 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
-/// The trie backend — either v2 (rkyv mmap) or v1 (legacy in-memory bincode).
-/// Both implement the same query surface (search/validate/counts/latest_date).
+/// The trie backend — v3 (a published `bgpkit-snap` object), v2 (rkyv mmap) or v1 (legacy
+/// in-memory bincode). All three implement the same query surface
+/// (search/validate/counts/latest_date), and the answers must not depend on which one is
+/// loaded; `tests/snap_backend_equivalence.rs` holds that as a test.
 pub enum TrieBackend {
+    V3(crate::snap_backend::SnapBackend),
     V2(RoasTrie),
     V1(LegacyRoasTrie),
 }
@@ -33,6 +36,7 @@ impl TrieBackend {
         exact: bool,
     ) -> Vec<crate::RoasLookupEntry> {
         match self {
+            TrieBackend::V3(t) => t.search(prefix, origin, max_len, date, current, exact),
             TrieBackend::V2(t) => t.search(prefix, origin, max_len, date, current, exact),
             TrieBackend::V1(t) => t.search(prefix, origin, max_len, date, current, exact),
         }
@@ -40,6 +44,7 @@ impl TrieBackend {
 
     pub fn validate(&self, prefix: &IpNet, origin: u32, date_ts: i64) -> RpkiValidation {
         match self {
+            TrieBackend::V3(t) => t.validate(prefix, origin, date_ts),
             TrieBackend::V2(t) => t.validate(prefix, origin, date_ts),
             TrieBackend::V1(t) => t.validate(prefix, origin, date_ts),
         }
@@ -47,6 +52,7 @@ impl TrieBackend {
 
     pub fn counts(&self) -> (u64, u64) {
         match self {
+            TrieBackend::V3(t) => t.counts(),
             TrieBackend::V2(t) => t.counts(),
             TrieBackend::V1(t) => {
                 let mut v4 = 0u64;
@@ -65,6 +71,7 @@ impl TrieBackend {
 
     pub fn latest_date_ts(&self) -> i64 {
         match self {
+            TrieBackend::V3(t) => t.latest_date_ts(),
             TrieBackend::V2(t) => t.latest_date_ts(),
             TrieBackend::V1(t) => t.latest_date,
         }
@@ -72,6 +79,7 @@ impl TrieBackend {
 
     pub fn format_version(&self) -> u32 {
         match self {
+            TrieBackend::V3(_) => 3,
             TrieBackend::V2(_) => crate::FORMAT_VERSION,
             TrieBackend::V1(_) => 1,
         }
