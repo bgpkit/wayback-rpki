@@ -236,6 +236,15 @@ is the v1 legacy archive. The query surface is the same on all three, and
 `tests/snap_backend_equivalence.rs` holds the answers equal for every query shape the API
 exposes, including the "subtree of the shortest covering prefix" rule and the expired filter.
 
+In the container the entrypoint already names the subcommand, so override the entrypoint to
+serve an object:
+
+```bash
+docker run --entrypoint /usr/local/bin/wayback-rpki \
+  -v /srv/wayback:/data -p 40065:40065 \
+  wayback-rpki:latest /data/roas.snap serve --host 0.0.0.0 --port 40065
+```
+
 What is different about serving a v3 object: there is no updater. An object is immutable and
 addressed by content id, so a refresh means publishing the next object and restarting the
 server on it. `current=true` is answered from the coverage window the object declares, so an

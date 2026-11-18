@@ -23,8 +23,9 @@ use wayback_rpki::*;
 #[clap(author, version, about, long_about = None)]
 #[clap(name = "wayback-rpki")]
 struct Cli {
-    /// file path to the trie archive. Suffix determines the backend:
-    /// `.rkyv` → v2 mmap mode, `.bin`/`.bin.gz` → v1 legacy in-memory mode.
+    /// file path to the archive. Suffix determines the backend:
+    /// `.snap` → v3 published object (read-only), `.rkyv` → v2 mmap mode,
+    /// `.bin`/`.bin.gz` → v1 legacy in-memory mode.
     #[clap(default_value = "roas_trie.rkyv", global = true)]
     path: String,
 
@@ -439,6 +440,11 @@ fn main() {
                     "serving a published snap object (read-only, fixed coverage window): {}",
                     path
                 );
+                if opts.bootstrap {
+                    // the flag is global, so it reaches this path too; saying so beats
+                    // letting an operator believe a download happened
+                    warn!("--bootstrap has no effect on a snap object: it is already complete");
+                }
             } else {
                 check_bootstrap_and_download(&path, opts.bootstrap);
                 ensure_data_available(&path);
