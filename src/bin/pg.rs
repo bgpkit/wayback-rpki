@@ -338,6 +338,11 @@ fn snap_build(
     // the pre-2.0 transport, from the same rows: old binaries cannot read the object, and a
     // second, independent export would drift from it eventually
     if let Some(uri) = legacy_jsonl {
+        // oneio::get_writer only creates local files, so an s3:// URI handed to it would
+        // write a directory called "s3:" and report success. Parse the URI and use the
+        // upload function that actually talks to the bucket.
+        let (bucket, key) = oneio::s3_url_parse(uri)
+            .map_err(|e| anyhow::anyhow!("{uri} is not an s3://bucket/key URI: {e}"))?;
         let temp = std::env::temp_dir().join(format!(
             "roas_trie-{}-{}.jsonl.gz",
             std::process::id(),
@@ -348,12 +353,13 @@ fn snap_build(
         let (by_prefix, _) = snap_export::group_parquet(&local)?;
         let lines = snap_export::write_jsonl(&by_prefix, temp.to_str().unwrap())?;
         let bytes = std::fs::metadata(&temp)?.len();
-        let mut writer =
-            oneio::get_writer(uri).map_err(|e| anyhow::anyhow!("writing {uri}: {e}"))?;
-        std::io::copy(&mut std::fs::File::open(&temp)?, &mut writer)
+        oneio::s3_upload(&bucket, &key, temp.to_str().unwrap())
             .map_err(|e| anyhow::anyhow!("uploading {uri}: {e}"))?;
-        std::io::Write::flush(&mut writer).map_err(|e| anyhow::anyhow!("uploading {uri}: {e}"))?;
         let _ = std::fs::remove_file(&temp);
+        // "uploaded" has to mean the bucket has it, not that a function returned Ok
+        if !oneio::exists(uri).unwrap_or(false) {
+            anyhow::bail!("{uri} does not exist after the upload");
+        }
         println!("uploaded {uri} ({lines} rows, {bytes} bytes)");
     }
 
