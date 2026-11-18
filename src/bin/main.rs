@@ -3,6 +3,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
 
+use anyhow::Context;
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -150,6 +151,37 @@ fn is_rkyv_path(path: &str) -> bool {
 /// A published `bgpkit-snap` object. It is immutable, so serving one is read-only.
 fn is_snap_path(path: &str) -> bool {
     path.ends_with(".snap")
+}
+
+/// Where a new user's first object comes from.
+const REMOTE_SNAP_MANIFEST: &str = "https://spaces.bgpkit.org/broker/snap/manifest.json";
+const PUBLIC_OBJECT_BASE: &str = "https://spaces.bgpkit.org/";
+
+/// Fetch the newest published object to `path` and check it against the manifest.
+fn bootstrap_snap(path: &str) -> anyhow::Result<()> {
+    info!("fetching the published manifest {REMOTE_SNAP_MANIFEST}");
+    let manifest_json = oneio::read_to_string_lossy(REMOTE_SNAP_MANIFEST)
+        .with_context(|| format!("reading {REMOTE_SNAP_MANIFEST}"))?;
+    let (url, content_id) =
+        wayback_rpki::snap_export::newest_object_url(&manifest_json, PUBLIC_OBJECT_BASE)?;
+
+    info!("downloading {url}");
+    let partial = format!("{path}.partial");
+    oneio::download(&url, &partial).with_context(|| format!("downloading {url}"))?;
+
+    // the object is content addressed, so the check is exact and cheap: the id computed from
+    // the bytes must be the id the manifest published
+    let snap: bgpkit_snap::Snapshot<wayback_rpki::snap_export::RoaSet> =
+        bgpkit_snap::Snapshot::open(&partial).context("opening the downloaded object")?;
+    let got = snap.content_id();
+    drop(snap);
+    if got != content_id {
+        let _ = std::fs::remove_file(&partial);
+        anyhow::bail!("content id mismatch: manifest {content_id}, downloaded {got}");
+    }
+    std::fs::rename(&partial, path).with_context(|| format!("moving the object to {path}"))?;
+    info!("bootstrap complete: {path} ({content_id})");
+    Ok(())
 }
 
 /// Find a sibling legacy bin file for a given rkyv path.
@@ -440,10 +472,13 @@ fn main() {
                     "serving a published snap object (read-only, fixed coverage window): {}",
                     path
                 );
-                if opts.bootstrap {
-                    // the flag is global, so it reaches this path too; saying so beats
-                    // letting an operator believe a download happened
-                    warn!("--bootstrap has no effect on a snap object: it is already complete");
+                if opts.bootstrap && !std::path::Path::new(&path).exists() {
+                    if let Err(error) = bootstrap_snap(&path) {
+                        // a missing object is not something to serve half of: say what failed
+                        // and stop instead of starting an API with nothing behind it
+                        error!("bootstrap failed: {error}");
+                        exit(1);
+                    }
                 }
             } else {
                 check_bootstrap_and_download(&path, opts.bootstrap);

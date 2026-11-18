@@ -223,6 +223,22 @@ a coverage window that moved backwards. Both of the latter are the shape of a br
 and the previous object should keep serving. `--force` publishes anyway, for a deliberate
 rebuild.
 
+### A new user's first object
+
+```bash
+wayback-rpki /var/lib/wayback/roas.snap serve --bootstrap --port 40065
+```
+
+With `--bootstrap` and no file at the path, `serve` fetches
+`https://spaces.bgpkit.org/broker/snap/manifest.json`, downloads the newest object it names,
+and checks the bytes against the content id before moving the file into place. A mismatch
+deletes the partial download and stops, rather than serving something the manifest did not
+publish. There is no local build step: the object is already the finished artifact.
+
+The older bootstrap, `roas_trie.jsonl.gz`, still exists for binaries from before 2.0: it is
+13.6 MB and costs a local build that peaks at a few hundred megabytes of RAM. The object is
+223 MB and costs nothing beyond the download, so it is the path a new deployment should use.
+
 ### Serving from a published object
 
 `serve` accepts a published object in place of a trie archive:

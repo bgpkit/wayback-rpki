@@ -403,6 +403,17 @@ pub fn check_against_pg(pg_config: &str, object: &Path, sample: usize) -> Result
     Ok(report)
 }
 
+/// The object a new user should start from: the newest one the manifest names.
+///
+/// Returns the download URL and the content id to check the bytes against. The manifest is
+/// the only mutable key in the published set, so this function is the whole bootstrap
+/// contract: fetch the manifest, fetch the object it names last, check the id.
+pub fn newest_object_url(manifest_json: &str, base: &str) -> Result<(String, String)> {
+    let manifest: Manifest = serde_json::from_str(manifest_json).context("parsing the manifest")?;
+    let latest = manifest.latest().context("the manifest names no object")?;
+    Ok((format!("{base}{}", latest.key), latest.content_id.clone()))
+}
+
 /// Where a published set lives.
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -709,6 +720,31 @@ mod tests {
             dropped.iter().all(|i| *i < objects.len() - 10),
             "the newest ten always survive"
         );
+    }
+
+    #[test]
+    fn the_newest_object_is_the_one_to_bootstrap() {
+        let objects: Vec<Published> = (0..3).map(|i| entry(at(i), &format!("k{i}"))).collect();
+        let manifest = Manifest {
+            generated_at: at(3),
+            source: Source::default(),
+            objects,
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let (url, id) = newest_object_url(&json, "https://example.test/").unwrap();
+        assert_eq!(url, "https://example.test/k2");
+        assert_eq!(id, "0".repeat(64));
+    }
+
+    #[test]
+    fn a_manifest_with_no_object_is_an_error() {
+        let manifest = Manifest {
+            generated_at: 0,
+            source: Source::default(),
+            objects: Vec::new(),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(newest_object_url(&json, "https://example.test/").is_err());
     }
 
     #[test]
