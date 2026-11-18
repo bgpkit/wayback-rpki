@@ -161,6 +161,15 @@ pub fn decide(
 
 /// Build the object from a Parquet span table.
 pub fn build_from_parquet(spans: &Path) -> Result<Built> {
+    let (by_prefix, records) = group_parquet(spans)?;
+    build_from_rows(by_prefix, records)
+}
+
+/// Read the spans table and group it the way the value type wants it.
+///
+/// Shared by the object build and the legacy JSONL export so the two artifacts cannot
+/// describe different data: same rows, same merging, one pass each.
+pub fn group_parquet(spans: &Path) -> Result<(BTreeMap<IpNet, Vec<RoaRecord>>, u64)> {
     let file =
         std::fs::File::open(spans).with_context(|| format!("opening {}", spans.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -234,7 +243,34 @@ pub fn build_from_parquet(spans: &Path) -> Result<Built> {
         records += 1;
     }
 
-    build_from_rows(by_prefix, records)
+    Ok((by_prefix, records))
+}
+
+/// Write the grouped rows as the pre-2.0 JSONL transport.
+///
+/// This is the file older binaries bootstrap from (`roas_trie.jsonl.gz`), so it is derived
+/// from the same grouped rows as the object: a client on 1.x and a client on 2.x must see the
+/// same history, and two independent exports would eventually drift.
+pub fn write_jsonl(by_prefix: &BTreeMap<IpNet, Vec<RoaRecord>>, path: &str) -> Result<u64> {
+    use std::io::Write;
+
+    let mut writer = oneio::get_writer(path).with_context(|| format!("writing {path}"))?;
+    let mut lines = 0u64;
+    for (prefix, records) in by_prefix {
+        for record in records {
+            let row = crate::roas_trie::JsonlRecord {
+                p: prefix.to_string(),
+                m: record.max_len,
+                o: record.origin,
+                r: record.dates.clone(),
+            };
+            serde_json::to_writer(&mut writer, &row).context("serializing a JSONL row")?;
+            writer.write_all(b"\n").context("writing a newline")?;
+            lines += 1;
+        }
+    }
+    writer.flush().context("flushing the JSONL transport")?;
+    Ok(lines)
 }
 
 /// Build from already-grouped rows. Split out so tests do not need a Parquet file.
@@ -720,6 +756,41 @@ mod tests {
             dropped.iter().all(|i| *i < objects.len() - 10),
             "the newest ten always survive"
         );
+    }
+
+    #[test]
+    fn the_legacy_jsonl_round_trips_through_the_old_reader() {
+        let dir = std::env::temp_dir().join(format!("wayback-legacy-jsonl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roas_trie.jsonl.gz");
+
+        let mut by_prefix: BTreeMap<IpNet, Vec<RoaRecord>> = BTreeMap::new();
+        by_prefix.insert(
+            "10.0.0.0/8".parse().unwrap(),
+            vec![RoaRecord {
+                max_len: 24,
+                origin: 64500,
+                dates: vec![(1_704_067_200, 1_704_153_599)],
+            }],
+        );
+        by_prefix.insert(
+            "2001:db8::/32".parse().unwrap(),
+            vec![RoaRecord {
+                max_len: 48,
+                origin: 64501,
+                dates: vec![(1_704_067_200, 1_704_067_200)],
+            }],
+        );
+
+        let lines = write_jsonl(&by_prefix, path.to_str().unwrap()).unwrap();
+        assert_eq!(lines, 2, "one line per (prefix, max_len, origin)");
+
+        // the check that matters: the reader older binaries use accepts the file and sees
+        // the same table
+        let trie = crate::roas_trie::RoasTrieMut::from_jsonl(path.to_str().unwrap()).unwrap();
+        assert_eq!(trie.len(), 2, "two prefixes");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

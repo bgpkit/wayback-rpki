@@ -235,9 +235,21 @@ and checks the bytes against the content id before moving the file into place. A
 deletes the partial download and stops, rather than serving something the manifest did not
 publish. There is no local build step: the object is already the finished artifact.
 
-The older bootstrap, `roas_trie.jsonl.gz`, still exists for binaries from before 2.0: it is
-13.6 MB and costs a local build that peaks at a few hundred megabytes of RAM. The object is
-223 MB and costs nothing beyond the download, so it is the path a new deployment should use.
+The default path is now `roas_trie.snap`, so a bare `serve --bootstrap` gets the object.
+
+The older bootstrap, `roas_trie.jsonl.gz`, stays alive for binaries from before 2.0: they
+cannot read a snap object at all. The daily publish keeps it current from the same grouped
+rows the object is built from, so the two artifacts cannot describe different history:
+
+```
+wayback-pg snap-build --spans .. --publish s3://spaces/broker/snap/ \
+  --legacy-jsonl s3://spaces/broker/roas_trie.jsonl.gz
+```
+
+It is 13.6 MB against the object's 223 MB, but it costs a local build that peaks at a few
+hundred megabytes of RAM, so it is the compatibility path, not the recommended one. Naming a
+`.rkyv` path still selects it: `wayback-rpki roas_trie.rkyv serve --bootstrap` behaves exactly
+as it did in 1.x.
 
 ### Serving from a published object
 

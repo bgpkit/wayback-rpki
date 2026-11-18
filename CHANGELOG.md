@@ -19,6 +19,12 @@ All notable changes to this project will be documented in this file.
   prefix; it does not compare interval envelopes, because recomputing those
   means repeating the export's own SQL and the value carries neither the TA nor
   the version identity.
+* `serve --bootstrap` fetches a snap object when the path is `.snap` (now the default path):
+  it reads the manifest, downloads the object it names last, and checks the content id before
+  moving the file into place. A mismatch deletes the partial download and stops.
+* `snap-build --legacy-jsonl <uri>` also publishes the pre-2.0 JSONL transport from the same
+  grouped rows, so binaries that cannot read a snap object keep bootstrapping from current
+  data. A `.rkyv` path still selects the JSONL bootstrap, unchanged.
 * `serve` accepts a published object: `.snap` selects a v3 backend that answers
   the same search, validate, counts and latest-date queries as the rkyv trie,
   reading the archived bytes instead of decoding records. A v3 object is

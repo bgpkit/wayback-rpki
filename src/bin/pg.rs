@@ -83,6 +83,12 @@ enum Command {
         /// Daily objects to keep; older ones survive only as month ends.
         #[arg(long, default_value = "30")]
         keep_daily: usize,
+
+        /// Also write the pre-2.0 JSONL transport here, e.g.
+        /// `s3://spaces/broker/roas_trie.jsonl.gz`. Binaries from before 2.0 cannot read a
+        /// snap object and bootstrap from this file, so publishing keeps it current.
+        #[arg(long)]
+        legacy_jsonl: Option<String>,
     },
     /// Compare a published object with PostgreSQL, prefix by prefix.
     SnapCheck {
@@ -173,7 +179,15 @@ fn run() -> anyhow::Result<()> {
             force,
             dry_run,
             keep_daily,
-        } => snap_build(&spans, &publish, force, dry_run, keep_daily),
+            legacy_jsonl,
+        } => snap_build(
+            &spans,
+            &publish,
+            force,
+            dry_run,
+            keep_daily,
+            legacy_jsonl.as_deref(),
+        ),
         Command::SnapCheck {
             pg_config,
             object,
@@ -229,6 +243,7 @@ fn snap_build(
     force: bool,
     dry_run: bool,
     keep_daily: usize,
+    legacy_jsonl: Option<&str>,
 ) -> anyhow::Result<()> {
     use wayback_rpki::snap_export::{self, Decision, Manifest, Published, Target};
 
@@ -319,6 +334,28 @@ fn snap_build(
     // content addressed
     snap_export::upload(&target, &key, &built.bytes)?;
     println!("uploaded s3://{}/{key}", target.bucket);
+
+    // the pre-2.0 transport, from the same rows: old binaries cannot read the object, and a
+    // second, independent export would drift from it eventually
+    if let Some(uri) = legacy_jsonl {
+        let temp = std::env::temp_dir().join(format!(
+            "roas_trie-{}-{}.jsonl.gz",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let (by_prefix, _) = snap_export::group_parquet(&local)?;
+        let lines = snap_export::write_jsonl(&by_prefix, temp.to_str().unwrap())?;
+        let bytes = std::fs::metadata(&temp)?.len();
+        let mut writer =
+            oneio::get_writer(uri).map_err(|e| anyhow::anyhow!("writing {uri}: {e}"))?;
+        std::io::copy(&mut std::fs::File::open(&temp)?, &mut writer)
+            .map_err(|e| anyhow::anyhow!("uploading {uri}: {e}"))?;
+        std::io::Write::flush(&mut writer).map_err(|e| anyhow::anyhow!("uploading {uri}: {e}"))?;
+        let _ = std::fs::remove_file(&temp);
+        println!("uploaded {uri} ({lines} rows, {bytes} bytes)");
+    }
 
     manifest.objects.push(published);
 

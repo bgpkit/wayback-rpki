@@ -27,7 +27,7 @@ struct Cli {
     /// file path to the archive. Suffix determines the backend:
     /// `.snap` → v3 published object (read-only), `.rkyv` → v2 mmap mode,
     /// `.bin`/`.bin.gz` → v1 legacy in-memory mode.
-    #[clap(default_value = "roas_trie.rkyv", global = true)]
+    #[clap(default_value = "roas_trie.snap", global = true)]
     path: String,
 
     /// download bootstrap file to help get started quickly
