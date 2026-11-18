@@ -357,7 +357,12 @@ fn snap_build(
         println!("uploaded {uri} ({lines} rows, {bytes} bytes)");
     }
 
-    manifest.objects.push(published);
+    // content addressed: publishing the same bytes again is a no-op on the object, so it is
+    // a no-op on the manifest too, and repeated --force runs do not grow the list
+    match manifest.objects.last_mut() {
+        Some(last) if last.content_id == published.content_id => *last = published,
+        _ => manifest.objects.push(published),
+    }
 
     // retention: drop the dailies nobody needs, keeping month ends, and only after the new
     // object is in place so a failure here never shortens what the manifest names
