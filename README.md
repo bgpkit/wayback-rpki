@@ -180,6 +180,54 @@ wayback-pg update --pg-config "$PG_CONFIG"
   (appeared / maxlen_changed / publication_flap / cert_window_changed),
   `roa_counts_view` and `aspa_counts_view` (per-TAL/day source counts).
 
+## The ROA history as a snap object (`snap-build`)
+
+PostgreSQL is the system of record, and the v3 and v4 APIs read it. Alongside it, the same
+history is published as a `bgpkit-snap` object: one immutable file, addressed by its content
+id, with a small manifest as the only mutable key. The object is a pure function of the
+Parquet table that `export-spans` already writes, so this path never reads PostgreSQL and a
+failed build leaves the previous file serving.
+
+```bash
+# build from the daily export and publish it
+wayback-pg snap-build \
+  --spans /var/lib/wayback/spans/roa-spans.parquet \
+  --publish s3://spaces/broker/snap/
+
+# compare a published object with PostgreSQL, prefix by prefix
+wayback-pg snap-check \
+  --pg-config "$PG_CONFIG" \
+  --object s3://spaces/broker/snap/roas-<content id>.snap \
+  --sample 200
+```
+
+Layout and contract:
+
+```
+broker/snap/roas-<content id>.snap   immutable, one object for both address families
+broker/snap/manifest.json            the only key that changes
+```
+
+The manifest records, per object: the key, the content id, byte size and entry count (split
+by family), the interval record count, the coverage window, the build time, and the sha256 of
+the Parquet it was built from. A consumer reads the manifest, then fetches the object it
+names. There is no `latest` alias, because an alias is a promise the object cannot verify.
+
+The value type is `bgpkit.roa-set:v1`: for each prefix, one record per `(max_len, origin)`
+with the day intervals during which the archive shows that authorization in effect. Ask a
+question by opening the object and matching the prefix you care about.
+
+What an unattended run will not do: publish over an unchanged source (the Parquet hash is
+checked first), publish a table that lost more than one percent of its prefixes, or publish
+a coverage window that moved backwards. Both of the latter are the shape of a broken export,
+and the previous object should keep serving. `--force` publishes anyway, for a deliberate
+rebuild.
+
+Retention keeps the newest `--keep-daily` objects (default 30) plus the last object of each
+UTC month, and deletes only keys the manifest no longer names. `wayback-snap.timer` runs the
+publish daily at 09:00 UTC, after `wayback-update` (07:30) and `wayback-spans` (about 08:30).
+Rollback is stopping the timer: no serving path reads these objects.
+
 ## API Reference
 
 ### `GET /search`

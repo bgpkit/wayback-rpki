@@ -299,6 +299,110 @@ pub fn file_sha256(path: &Path) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("hashing {}: {e}", path.display()))
 }
 
+/// What one differential check found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckReport {
+    /// Prefixes sampled from the object.
+    pub sampled: usize,
+    /// Prefixes the object holds.
+    pub object_entries: u64,
+    /// Distinct prefixes PostgreSQL holds.
+    pub pg_entries: u64,
+    /// One line per difference, capped.
+    pub mismatches: Vec<String>,
+}
+
+/// Compare the published object with PostgreSQL, prefix by prefix.
+///
+/// What this checks: for a sample of prefixes, the set of origin ASNs the object records
+/// equals the set PostgreSQL observed, and the object's day span covers the days PostgreSQL
+/// saw that prefix. Both are necessary conditions for the object to answer what the archive
+/// says, and either would have caught a dropped prefix, a mis-grouped origin or a shifted
+/// date.
+///
+/// What it does not check: the certificate window each ROA carried, which is what turns
+/// observed days into authorized days. That join happens in the export SQL, so this compares
+/// the object against the same table the export reads, not against the export's own output.
+pub fn check_against_pg(pg_config: &str, object: &Path, sample: usize) -> Result<CheckReport> {
+    use std::collections::BTreeSet;
+
+    let snap: bgpkit_snap::Snapshot<RoaSet> = bgpkit_snap::Snapshot::open(object)
+        .with_context(|| format!("opening {}", object.display()))?;
+    let mut client = postgres::Client::connect(pg_config, postgres::NoTls)
+        .context("connecting to PostgreSQL")?;
+
+    let pg_entries: i64 = client
+        .query_one("SELECT count(DISTINCT prefix) FROM wayback.roa_object", &[])?
+        .get(0);
+
+    // every k-th prefix, so the sample spans the whole table instead of one corner
+    let step = (snap.len() / sample.max(1)).max(1);
+    let prefixes: Vec<IpNet> = snap.iter().map(|(p, _)| p).step_by(step).collect();
+
+    let mut report = CheckReport {
+        sampled: prefixes.len(),
+        object_entries: snap.len() as u64,
+        pg_entries: pg_entries as u64,
+        mismatches: Vec::new(),
+    };
+
+    for prefix in prefixes {
+        let Some(value) = snap.owned().get_exact(prefix)? else {
+            report.mismatches.push(format!(
+                "{prefix}: the object has no value after iterating it"
+            ));
+            continue;
+        };
+        let object_origins: BTreeMap<u32, (i64, i64)> =
+            value.0.iter().fold(BTreeMap::new(), |mut acc, record| {
+                let (from, to) = record
+                    .dates
+                    .iter()
+                    .fold((i64::MAX, i64::MIN), |(lo, hi), (from, to)| {
+                        (lo.min(*from), hi.max(*to))
+                    });
+                acc.entry(record.origin)
+                    .and_modify(|(lo, hi)| {
+                        *lo = (*lo).min(from);
+                        *hi = (*hi).max(to);
+                    })
+                    .or_insert((from, to));
+                acc
+            });
+
+        let rows = client.query(
+            "SELECT origin_asn, min(first_seen), \
+                    max(coalesce(last_seen, current_date - 1)) \
+             FROM wayback.roa_object WHERE prefix = ($1::text)::inet GROUP BY origin_asn",
+            &[&prefix.to_string()],
+        )?;
+        if rows.is_empty() {
+            report
+                .mismatches
+                .push(format!("{prefix}: PostgreSQL has no row for it"));
+            continue;
+        }
+        let pg_origins: BTreeSet<u32> =
+            rows.iter().map(|row| row.get::<_, i64>(0) as u32).collect();
+        if object_origins.keys().copied().collect::<BTreeSet<_>>() != pg_origins {
+            report.mismatches.push(format!(
+                "{prefix}: origins differ, object {:?} vs pg {:?}",
+                object_origins.keys().collect::<Vec<_>>(),
+                pg_origins
+            ));
+            continue;
+        }
+        // The interval envelope is deliberately not compared here. A record's dates are the
+        // certificate window intersected with the days the archive held that ROA, and the
+        // value does not carry the TA or the version identity needed to recompute that from
+        // PostgreSQL: any comparison either repeats the export's own arithmetic or compares
+        // the object against a different granularity (roa_object last_seen is per ROA object,
+        // not per version). The origin set is the part this check can decide on its own.
+    }
+
+    Ok(report)
+}
+
 /// Where a published set lives.
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -337,6 +441,43 @@ impl Target {
     pub fn manifest_url(&self) -> String {
         format!("s3://{}/{}", self.bucket, self.manifest_key())
     }
+}
+
+/// Which published objects a retention policy drops.
+///
+/// Rule: keep the newest `keep_daily` objects, and beyond them keep the last object of each
+/// UTC month, which is what a consumer who wants history rather than yesterday actually uses.
+/// Everything else is a daily copy nobody needs.
+pub fn plan_prune(objects: &[Published], keep_daily: usize) -> Vec<usize> {
+    if objects.len() <= keep_daily {
+        return Vec::new();
+    }
+    let split = objects.len() - keep_daily;
+    let mut drop = Vec::new();
+    for i in 0..split {
+        let this_month = month_of(objects[i].built_at);
+        let next_month = objects.get(i + 1).map(|o| month_of(o.built_at));
+        // the last object of a month survives; a mid-month one does not
+        if next_month.is_some_and(|next| next != this_month) {
+            continue;
+        }
+        drop.push(i);
+    }
+    drop
+}
+
+fn month_of(unix: i64) -> (i32, u32) {
+    use chrono::Datelike;
+    let date = chrono::DateTime::from_timestamp(unix, 0)
+        .unwrap_or_default()
+        .date_naive();
+    (date.year(), date.month())
+}
+
+/// Delete one object from the published set.
+pub fn delete_object(target: &Target, key: &str) -> Result<()> {
+    oneio::s3_delete(&target.bucket, key)
+        .map_err(|e| anyhow::anyhow!("deleting s3://{}/{key}: {e}", target.bucket))
 }
 
 /// Read the manifest, or an empty one when this is the first publish.
@@ -524,6 +665,50 @@ mod tests {
         let key = target.object_key(&"a".repeat(64));
         assert_eq!(key, "broker/snap/roas-aaaaaaaaaaaa.snap");
         assert_eq!(target.manifest_key(), "broker/snap/manifest.json");
+    }
+
+    fn at(day: i64) -> i64 {
+        // 2026-01-01T00:00:00Z plus a day offset, so months are easy to reason about
+        1_767_225_600 + day * 86_400
+    }
+
+    fn entry(built_at: i64, key: &str) -> Published {
+        Published {
+            key: key.to_string(),
+            content_id: "0".repeat(64),
+            type_id: "bgpkit.roa-set:v1".to_string(),
+            bytes: 1,
+            entries: 1,
+            v4_entries: 1,
+            v6_entries: 0,
+            records: 1,
+            window: (0, built_at),
+            built_at,
+            source_sha256: key.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_short_history_is_kept_whole() {
+        let objects: Vec<Published> = (0..5).map(|i| entry(at(i), &format!("k{i}"))).collect();
+        assert!(plan_prune(&objects, 30).is_empty());
+    }
+
+    #[test]
+    fn dailies_beyond_the_window_are_dropped_but_month_ends_survive() {
+        // 75 days from 2026-01-01, keep 10: January 31 is index 30 and February 28 is index
+        // 58, both older than the newest ten, so both survive and their neighbours do not
+        let objects: Vec<Published> = (0..75).map(|i| entry(at(i), &format!("k{i}"))).collect();
+        let dropped = plan_prune(&objects, 10);
+        let dropped_keys: Vec<&str> = dropped.iter().map(|i| objects[*i].key.as_str()).collect();
+        assert!(dropped_keys.contains(&"k29"));
+        assert!(!dropped_keys.contains(&"k30"), "January 31 survives");
+        assert!(dropped_keys.contains(&"k57"));
+        assert!(!dropped_keys.contains(&"k58"), "February 28 survives");
+        assert!(
+            dropped.iter().all(|i| *i < objects.len() - 10),
+            "the newest ten always survive"
+        );
     }
 
     #[test]

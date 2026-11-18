@@ -79,6 +79,24 @@ enum Command {
         /// Build and verify, but do not upload anything.
         #[arg(long)]
         dry_run: bool,
+
+        /// Daily objects to keep; older ones survive only as month ends.
+        #[arg(long, default_value = "30")]
+        keep_daily: usize,
+    },
+    /// Compare a published object with PostgreSQL, prefix by prefix.
+    SnapCheck {
+        /// PostgreSQL connection configuration.
+        #[arg(long)]
+        pg_config: String,
+
+        /// The object, local path or S3 URI.
+        #[arg(long)]
+        object: String,
+
+        /// Prefixes to sample across the table.
+        #[arg(long, default_value = "200")]
+        sample: usize,
     },
     /// Backfill an explicit historical range from RIPE FTP into PostgreSQL.
     Backfill {
@@ -154,7 +172,13 @@ fn run() -> anyhow::Result<()> {
             publish,
             force,
             dry_run,
-        } => snap_build(&spans, &publish, force, dry_run),
+            keep_daily,
+        } => snap_build(&spans, &publish, force, dry_run, keep_daily),
+        Command::SnapCheck {
+            pg_config,
+            object,
+            sample,
+        } => snap_check(&pg_config, &object, sample),
         Command::Backfill {
             pg_config,
             from,
@@ -199,7 +223,13 @@ fn main() -> ExitCode {
 }
 
 /// Build the snap object from the spans table and publish it, in that order.
-fn snap_build(spans: &str, publish: &str, force: bool, dry_run: bool) -> anyhow::Result<()> {
+fn snap_build(
+    spans: &str,
+    publish: &str,
+    force: bool,
+    dry_run: bool,
+    keep_daily: usize,
+) -> anyhow::Result<()> {
     use wayback_rpki::snap_export::{self, Decision, Manifest, Published, Target};
 
     // oneio reads local paths and s3:// URIs alike, so an object can be built straight from
@@ -291,6 +321,27 @@ fn snap_build(spans: &str, publish: &str, force: bool, dry_run: bool) -> anyhow:
     println!("uploaded s3://{}/{key}", target.bucket);
 
     manifest.objects.push(published);
+
+    // retention: drop the dailies nobody needs, keeping month ends, and only after the new
+    // object is in place so a failure here never shortens what the manifest names
+    let drop = snap_export::plan_prune(&manifest.objects, keep_daily);
+    if !drop.is_empty() {
+        let mut doomed = Vec::with_capacity(drop.len());
+        for index in &drop {
+            doomed.push(manifest.objects[*index].key.clone());
+        }
+        for key in &doomed {
+            snap_export::delete_object(&target, key)?;
+            println!("pruned s3://{}/{key}", target.bucket);
+        }
+        let mut index = 0;
+        manifest.objects.retain(|_| {
+            let keep = !drop.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+
     manifest.source = snap_export::Source {
         parquet_sha256: source_sha,
         parquet_bytes,
@@ -300,6 +351,46 @@ fn snap_build(spans: &str, publish: &str, force: bool, dry_run: bool) -> anyhow:
     println!("manifest updated at {manifest_url}");
 
     if local != std::path::Path::new(spans) {
+        let _ = std::fs::remove_file(&local);
+    }
+    Ok(())
+}
+
+/// Compare a published object with PostgreSQL and report the differences.
+fn snap_check(pg_config: &str, object: &str, sample: usize) -> anyhow::Result<()> {
+    use wayback_rpki::snap_export;
+
+    // an S3 object is fetched first: the check reads it like a consumer would
+    let local = if object.starts_with("s3://") {
+        let temp = std::env::temp_dir().join(format!(
+            "wayback-snap-check-{}-{}.snap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        oneio::download(object, temp.to_str().unwrap())
+            .map_err(|e| anyhow::anyhow!("downloading {object}: {e}"))?;
+        temp
+    } else {
+        std::path::PathBuf::from(object)
+    };
+
+    let report = snap_export::check_against_pg(pg_config, &local, sample)?;
+    println!(
+        "object {} entries, PostgreSQL {} distinct prefixes, {} sampled",
+        report.object_entries, report.pg_entries, report.sampled
+    );
+    if report.mismatches.is_empty() {
+        println!("no differences in the sample");
+    } else {
+        for line in &report.mismatches {
+            println!("mismatch: {line}");
+        }
+        anyhow::bail!("{} difference(s) found", report.mismatches.len());
+    }
+
+    if local != std::path::Path::new(object) {
         let _ = std::fs::remove_file(&local);
     }
     Ok(())
