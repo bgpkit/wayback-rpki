@@ -88,7 +88,11 @@ wayback-rpki/
     time; validates input and reports physical line numbers on error. Peak memory is
     just the builder (~200 MB for the full dataset).
   - `RoasTrie::export_jsonl(path)` — Streams zero-copy from the mmap archive.
-- **`REMOTE_BOOTSTRAP_URL`** — `https://spaces.bgpkit.org/broker/roas_trie.jsonl.gz`.
+- **`REMOTE_BOOTSTRAP_URL`** — `https://spaces.bgpkit.org/broker/roas_trie.jsonl.gz`. This is
+  the 1.x compatibility path, used when the requested path ends in `.rkyv`. A `.snap` path
+  bootstraps from `REMOTE_SNAP_MANIFEST`
+  (`https://spaces.bgpkit.org/broker/snap/manifest.json`), which names the object to fetch and
+  the content id to check it against.
 
 ### `src/legacy.rs` — v1 Backend (transition only)
 
@@ -138,13 +142,22 @@ wayback-rpki/
 
 ## Bootstrap & Migration
 
-`check_bootstrap_and_download` precedence when the requested `.rkyv` is missing:
+The default `path` is `roas_trie.snap`, and bootstrap dispatches on the suffix:
 
-1. **Local sibling** `roas_trie.bin.gz` / `roas_trie.bin` → auto-convert to `.rkyv`.
-2. **Remote JSONL** `roas_trie.jsonl.gz` (`--bootstrap`) → stream-import → dump `.rkyv`.
-3. **Remote legacy** `roas_trie.bin.gz` (`--bootstrap`, fallback) → download → auto-convert.
+- **`.snap`** (default): `--bootstrap` reads `broker/snap/manifest.json`, downloads the newest
+  object, checks its content id, and serves it read-only. No local build, no updater.
+- **`.rkyv`**: `check_bootstrap_and_download` keeps the 1.x precedence when the file is
+  missing:
+  1. **Local sibling** `roas_trie.bin.gz` / `roas_trie.bin` → auto-convert to `.rkyv`.
+  2. **Remote JSONL** `roas_trie.jsonl.gz` (`--bootstrap`) → stream-import → dump `.rkyv`.
+  3. **Remote legacy** `roas_trie.bin.gz` (`--bootstrap`, fallback) → download → auto-convert.
 
 A `.bin`/`.bin.gz` `path` keeps working directly in legacy mode without conversion.
+
+The remote files are kept current by the daily `snap-build --legacy-jsonl
+s3://spaces/broker/roas_trie.jsonl.gz`, which derives the JSONL from the same grouped rows as
+the object. `roas_trie.bin.gz` is frozen at 2026-08-24: 2.x has no v1 writer, and that file
+exists only so a pre-v1-migration client does not see a 404.
 
 ## Architecture Notes
 

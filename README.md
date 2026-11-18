@@ -49,16 +49,21 @@ docker run -p 40065:40065 bgpkit/wayback-rpki:latest
 
 ## Quick Start
 
-Start the API with a one-command bootstrap (downloads pre-built trie from
+Start the API with a one-command bootstrap (downloads the published object from
 `spaces.bgpkit.org`):
 
 ```bash
 wayback-rpki serve --bootstrap
 ```
 
-This downloads the platform-agnostic JSONL.gz transport archive, streams it
-through a builder to produce a local `roas_trie.rkyv`, then memory-maps that
-file for the API on `0.0.0.0:40065`. The server updates every 8 hours.
+This reads `broker/snap/manifest.json`, downloads the newest object it names, checks the bytes
+against the content id, and serves that file on `0.0.0.0:40065`. Nothing is built locally: the
+object is the finished artifact. A snap object is immutable, so this mode serves a fixed
+coverage window; restart it on the next object to move forward.
+
+Naming a `.rkyv` path instead keeps the 1.x behaviour: the platform-agnostic
+`roas_trie.jsonl.gz` transport is streamed through a builder into a local `.rkyv`, memory
+mapped, and updated every 8 hours from the archive.
 
 ## CLI Usage
 
@@ -222,6 +227,18 @@ checked first), publish a table that lost more than one percent of its prefixes,
 a coverage window that moved backwards. Both of the latter are the shape of a broken export,
 and the previous object should keep serving. `--force` publishes anyway, for a deliberate
 rebuild.
+
+### What each bootstrap file is for
+
+| file | reader | state |
+|---|---|---|
+| `broker/snap/manifest.json` + `roas-*.snap` | 2.x, and anything that can read a snap object | current, published daily |
+| `broker/roas_trie.jsonl.gz` | 1.x binaries, `.rkyv` paths | current, published daily |
+| `broker/roas_trie.bin.gz` | v1 bincode binaries only | frozen at 2026-08-24 |
+
+The v1 bincode file stopped being produced when the v1 writer was removed; nothing in 2.x can
+write that format. It remains in the bucket so an old client does not get a 404, but it is a
+snapshot of August 2026. A client that old should be upgraded, not fed.
 
 ### A new user's first object
 
