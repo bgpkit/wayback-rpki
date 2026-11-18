@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+* The ROA history is published as a `bgpkit-snap` object alongside PostgreSQL:
+  one immutable file per build, addressed by content id, with a manifest as the
+  only mutable key. `wayback-pg snap-build --spans .. --publish ..` derives it
+  from the spans Parquet export, refuses to publish over an unchanged source, a
+  table that lost more than one percent of its prefixes, or a coverage window
+  that moved backwards, and leaves the previous object serving on failure.
+  `--keep-daily` (30 by default) plus the last object of each UTC month keeps a
+  history without keeping every daily copy.
+* `wayback-pg snap-check` compares a published object with PostgreSQL prefix by
+  prefix and exits non-zero on a difference. It decides the origin set per
+  prefix; it does not compare interval envelopes, because recomputing those
+  means repeating the export's own SQL and the value carries neither the TA nor
+  the version identity.
+* `serve` accepts a published object: `.snap` selects a v3 backend that answers
+  the same search, validate, counts and latest-date queries as the rkyv trie,
+  reading the archived bytes instead of decoding records. A v3 object is
+  immutable, so there is no updater; `current=true` is answered from the
+  coverage window the object declares.
+
 ### Fixed
 
 * `/validate` now applies RFC 6811 coverage correctly. Only records whose prefix
